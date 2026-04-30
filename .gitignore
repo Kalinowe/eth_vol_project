@@ -49,6 +49,10 @@ coverage.xml
 *.mo
 *.pot
 
+# Generated plots and data outputs
+plots/
+
+
 # Django stuff:
 *.log
 local_settings.py

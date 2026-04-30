@@ -1,7 +1,6 @@
 import os
 import requests
 from datetime import datetime, timedelta, timezone
-import argparse
 import zipfile
 import pandas as pd
 import numpy as np
@@ -67,64 +66,102 @@ def unzip_data(start_date, end_date):
             except Exception as e:
                 raise Exception(f"Error unzipping {date_str}: {e}")
 
-def aggregate_log_returns(csv_path, x_seconds):
+def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None):
     """
     Read a CSV file and aggregate log returns over X second intervals starting from midnight.
-    
+
     Args:
         csv_path: Path to the CSV file
         x_seconds: Interval length in seconds
-    
+        prev_log_last: Previous interval log price carried from an earlier day
+
     Returns:
-        DataFrame with 'timestamp' (start of interval in seconds) and 'log_return'
+        Tuple[DataFrame, float|None]: DataFrame with 'datetime', 'log_return',
+            'log_first_price', 'log_last_price' and the last log price from the file.
     """
     # Extract date from filename
     filename = os.path.basename(csv_path)
     date_parts = filename.split('-')
     date_str = f"{date_parts[-3]}-{date_parts[-2]}-{date_parts[-1].split('.')[0]}"
     dt = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-    midnight_microseconds = int(dt.timestamp() * 1e6)
-    midnight = midnight_microseconds / 1e6  # in seconds
-    
-    df = pd.read_csv(csv_path, header=None)
-    prices = df.iloc[:, 1].values  # second column, price
-    timestamps = df.iloc[:, 5].values  # sixth column, timestamp in microseconds
-    
-    # Convert timestamps to seconds
-    timestamps_sec = timestamps / 1e6
-    
-    # Number of intervals in a day
+    midnight = int(dt.timestamp())
+
+    df = pd.read_csv(csv_path, header=None, usecols=[1, 5])
+    df = df.rename(columns={1: 'price', 5: 'timestamp_us'})
+    df['price'] = pd.to_numeric(df['price'], errors='coerce')
+    df['timestamp_us'] = pd.to_numeric(df['timestamp_us'], errors='coerce')
+    df = df.dropna(subset=['price', 'timestamp_us'])
+
+    if df.empty:
+        day_seconds = 24 * 3600
+        num_intervals = int(day_seconds // x_seconds)
+        intervals = np.arange(midnight, midnight + day_seconds, x_seconds, dtype=np.int64)
+        result_df = pd.DataFrame({
+            'datetime': pd.to_datetime(intervals, unit='s'),
+            'log_return': np.nan,
+            'log_first_price': np.nan,
+            'log_last_price': np.nan
+        })
+        return result_df, prev_log_last
+
+    df['timestamp_us'] = df['timestamp_us'].astype(np.int64)
+    df['timestamp_s'] = df['timestamp_us'] // 1_000_000
+    df = df.sort_values('timestamp_s')
+
+    per_second = df.groupby('timestamp_s', sort=True)['price'].mean()
+    timestamps_sec = per_second.index.to_numpy(dtype=np.int64)
+    prices = per_second.to_numpy(dtype=np.float64)
+
     day_seconds = 24 * 3600
     num_intervals = int(day_seconds // x_seconds)
-    
+
     intervals = []
     log_returns = []
-    
+    log_first_prices = []
+    log_last_prices = []
+
     for i in range(num_intervals):
         start_sec = midnight + i * x_seconds
         end_sec = start_sec + x_seconds
-        
-        mask = (timestamps_sec >= start_sec) & (timestamps_sec < end_sec)
-        
-        if np.any(mask):
-            first_price = prices[mask][0]
-            last_price = prices[mask][-1]
-            if first_price > 0:
-                log_ret = np.log(last_price / first_price)
+
+        left = np.searchsorted(timestamps_sec, start_sec, side='left')
+        right = np.searchsorted(timestamps_sec, end_sec, side='left')
+
+        if left < right:
+            first_price = prices[left]
+            last_price = prices[right - 1]
+            if first_price > 0 and last_price > 0:
+                log_first = np.log(first_price)
+                log_last = np.log(last_price)
+                log_ret = log_last - log_first
+                prev_log_last = log_last
             else:
-                log_ret = 0.0
+                log_first = np.nan
+                log_last = np.nan
+                log_ret = np.nan
         else:
-            log_ret = 0.0
-        
+            if prev_log_last is not None:
+                log_first = prev_log_last
+                log_last = prev_log_last
+                log_ret = 0.0
+            else:
+                log_first = np.nan
+                log_last = np.nan
+                log_ret = np.nan
+
         intervals.append(start_sec)
         log_returns.append(log_ret)
-    
+        log_first_prices.append(log_first)
+        log_last_prices.append(log_last)
+
     result_df = pd.DataFrame({
         'datetime': pd.to_datetime(intervals, unit='s'),
-        'log_return': log_returns
+        'log_return': log_returns,
+        'log_first_price': log_first_prices,
+        'log_last_price': log_last_prices
     })
-    
-    return result_df
+
+    return result_df, prev_log_last
 
 
 def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='data'):
@@ -157,13 +194,14 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
     current = start_dt
     combined_frames = []
 
+    prev_log_last = None
     while current <= end_dt:
         date_str = current.strftime('%Y-%m-%d')
         csv_path = os.path.join(output_dir, f'ETHUSDT-aggTrades-{date_str}.csv')
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f'Missing required CSV file: {csv_path}')
 
-        daily_df = aggregate_log_returns(csv_path, x_seconds)
+        daily_df, prev_log_last = aggregate_log_returns(csv_path, x_seconds, prev_log_last=prev_log_last)
         combined_frames.append(daily_df)
         current += timedelta(days=1)
 
