@@ -127,4 +127,73 @@ def aggregate_log_returns(csv_path, x_seconds):
     return result_df
 
 
+def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='data'):
+    """
+    Aggregate log returns for each CSV in a date range and export the combined results.
+
+    Args:
+        start_date: datetime or string in YYYY-MM-DD format
+        end_date: datetime or string in YYYY-MM-DD format
+        x_seconds: Interval length in seconds
+        output_dir: Directory to write the combined CSV file
+
+    Returns:
+        The combined DataFrame of aggregated log returns for the range.
+    """
+    def _to_datetime(dt_obj):
+        if isinstance(dt_obj, str):
+            return datetime.strptime(dt_obj, '%Y-%m-%d')
+        if isinstance(dt_obj, datetime):
+            return dt_obj
+        raise TypeError('start_date and end_date must be datetime or YYYY-MM-DD string')
+
+    start_dt = _to_datetime(start_date)
+    end_dt = _to_datetime(end_date)
+
+    if start_dt > end_dt:
+        raise ValueError('start_date must be less than or equal to end_date')
+
+    os.makedirs(output_dir, exist_ok=True)
+    current = start_dt
+    combined_frames = []
+
+    while current <= end_dt:
+        date_str = current.strftime('%Y-%m-%d')
+        csv_path = os.path.join(output_dir, f'ETHUSDT-aggTrades-{date_str}.csv')
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f'Missing required CSV file: {csv_path}')
+
+        daily_df = aggregate_log_returns(csv_path, x_seconds)
+        combined_frames.append(daily_df)
+        current += timedelta(days=1)
+
+    if combined_frames:
+        combined_df = pd.concat(combined_frames, ignore_index=True)
+    else:
+        combined_df = pd.DataFrame(columns=['datetime', 'log_return'])
+
+    # Validate evenly spaced intervals across the full stacked range
+    if not combined_df.empty:
+        if not combined_df['datetime'].is_monotonic_increasing:
+            raise ValueError('Combined datetime values are not strictly increasing.')
+
+        interval_seconds = combined_df['datetime'].diff().dt.total_seconds().iloc[1:]
+        if not np.allclose(interval_seconds, x_seconds, atol=1e-6):
+            bad_index = interval_seconds[~np.isclose(interval_seconds, x_seconds, atol=1e-6)].index[0]
+            bad_start = combined_df.loc[bad_index - 1, 'datetime']
+            bad_end = combined_df.loc[bad_index, 'datetime']
+            raise ValueError(
+                f'Uneven interval spacing detected between {bad_start} and {bad_end}: '
+                f'{interval_seconds.iloc[bad_index-1]} seconds (expected {x_seconds})'
+            )
+
+    output_file = os.path.join(
+        output_dir,
+        f'ETHUSDT-aggReturns-{start_dt.strftime("%Y-%m-%d")}_to_{end_dt.strftime("%Y-%m-%d")}-{x_seconds}sec.csv'
+    )
+    combined_df.to_csv(output_file, index=False)
+
+    return combined_df
+
+
 
