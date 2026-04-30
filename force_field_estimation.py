@@ -15,17 +15,18 @@ def integrate_drift_to_potential(drift_df):
     Returns:
         DataFrame with columns 'bin_center', 'drift', and 'potential'
     """
-    x = drift_df['bin_center'].values
-    f = drift_df['drift'].values
+    # Filter out bins where drift is NaN (low weight bins).
+    # By removing the rows, we allow the integrator and plotter to 
+    # interpolate across the gap rather than leaving a "hole".
+    valid_df = drift_df.dropna(subset=['drift']).copy()
     
-    # Use cumulative trapezoidal integration
-    # cumulative_trapezoid returns values at the bin centers, with the first value implicitly 0
-    potential = np.concatenate([[0.0], cumulative_trapezoid(f, x)])
+    x = valid_df['bin_center'].values
+    f = valid_df['drift'].values
     
-    result_df = pd.DataFrame({
-        'bin_center': x,
-        'drift': f,
-        'potential': potential
-    })
+    # Potential U(x) is defined such that drift = -dU/dx
+    # Therefore U(x) = - integral(drift dx)
+    potential = -np.concatenate([[0.0], cumulative_trapezoid(f, x)])
     
-    return result_df
+    valid_df.loc[:, 'potential'] = potential
+    
+    return valid_df

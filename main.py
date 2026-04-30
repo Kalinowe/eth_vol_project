@@ -10,13 +10,13 @@ from rich.table import Table
 
 console = Console()
 
-start_date = datetime(2025, 1, 1)
-end_date = datetime(2025, 1, 2)
+start_date = datetime(2025, 9, 1)
+end_date = datetime(2025, 9, 15)
 dt.download_data(start_date, end_date)
 dt.unzip_data(start_date, end_date)
 
 # Test with 3 different time intervals
-time_intervals = [5, 10, 20]
+time_intervals = [5, 10, 60]
 results_by_interval = {}
 
 for seconds_interval in time_intervals:
@@ -28,13 +28,16 @@ for seconds_interval in time_intervals:
     print(df.head())
     
     # Library implementation
-    x_series = df['log_first_price'].dropna().values.reshape(-1, 1)
+    x_series = np.asarray(df['log_first_price'].dropna().values, dtype=np.float64).reshape(-1, 1)
     lib_kmc, lib_edges = kmc_lib(x_series, bins=100, full=False)
     
     # Extract coefficients
     lib_weights = lib_kmc[0, :]
-    lib_drift = np.where(lib_weights > 0, lib_kmc[1, :] / seconds_interval, np.nan)
-    lib_diffusion = np.where(lib_weights > 0, lib_kmc[2, :] / seconds_interval, np.nan)
+    # Threshold > 5 or 10 is recommended to filter out statistically insignificant noise
+    # D1 = M1 / dt
+    lib_drift = np.where(lib_weights > 5, lib_kmc[1, :] / seconds_interval, np.nan)
+    # D2 = M2 / (2 * dt)
+    lib_diffusion = np.where(lib_weights > 5, lib_kmc[2, :] / (2 * seconds_interval), np.nan)
     lib_centers = lib_edges[0]
     
     # Store results in DataFrame
@@ -75,7 +78,7 @@ print(f"\n{'='*60}")
 print('Generating potential plots from precomputed KM results')
 print(f"{'='*60}\n")
 
-range_label = f'{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}'
+range_label = f"{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}"
 output_dir = os.path.join('plots', range_label)
 plots.plot_potentials_from_km_results(results_by_interval, output_dir=output_dir, range_label=range_label)
 
