@@ -164,7 +164,7 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_w
     return result_df, prev_log_last
 
 
-def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='data', kernel_half_width=0, trim_quantile=0.0):
+def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='data', kernel_half_width=0, trim_quantile=0.0, detrend=0):
     """
     Aggregate log returns for each CSV in a date range and export the combined results.
 
@@ -175,6 +175,7 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
         output_dir: Directory to write the combined CSV file
         kernel_half_width: Kernel width parameter
         trim_quantile: Fraction of data to trim from extremes (e.g., 0.01 for 1%)
+        detrend: 1 to remove a linear trend from log-prices before returning, 0 to leave raw
 
     Returns:
         The combined DataFrame of aggregated log returns for the range.
@@ -232,6 +233,16 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
                 f'{interval_seconds.iloc[bad_index-1]} seconds (expected {x_seconds})'
             )
             
+    # Remove linear trend from log-prices if requested
+    if detrend and not combined_df.empty:
+        t = np.arange(len(combined_df), dtype=np.float64)
+        for col in ('log_first_price', 'log_last_price'):
+            valid = combined_df[col].notna()
+            coeffs = np.polyfit(t[valid], combined_df.loc[valid, col], 1)
+            trend = np.polyval(coeffs, t)
+            combined_df[col] = combined_df[col] - trend
+        combined_df['log_return'] = combined_df['log_last_price'] - combined_df['log_first_price']
+
     # Trim extreme log prices if requested
     if trim_quantile > 0 and not combined_df.empty:
         lower_q = combined_df['log_first_price'].quantile(trim_quantile / 2)

@@ -75,5 +75,40 @@ def plot_potentials_from_km_results(results_by_interval, output_dir='plots', ran
     print(f'Saved {output_path_vol}')
     
 
+def plot_price_series(df, output_dir='plots', range_label=None, smooth_window=20):
+    """
+    Plot ETH price (not log-price) over time with a rolling-mean smoothing overlay.
+
+    Args:
+        df: DataFrame with columns ['datetime', 'log_first_price']
+        output_dir: Directory where the PNG is saved
+        range_label: Label used in the title and filename
+        smooth_window: Rolling mean window in number of bars
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    prices = np.exp(df['log_first_price'])
+    times = pd.to_datetime(df['datetime'])
+
+    smoothed = prices.rolling(window=smooth_window, center=True, min_periods=1).mean()
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(times, prices, color='steelblue', alpha=0.35, linewidth=0.6, label='Price')
+    ax.plot(times, smoothed, color='firebrick', linewidth=1.4,
+            label=f'Rolling mean (window={smooth_window})')
+
+    ax.set_title(f'ETH/USDT Price - {range_label}')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Price (USDT)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+
+    output_path = os.path.join(output_dir, f'price_series_{range_label}.png')
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved {output_path}')
+
+
 if __name__ == '__main__':
     print('This module expects precomputed KM results to be passed in from main.')
