@@ -10,17 +10,29 @@ from rich.table import Table
 
 console = Console()
 
-start_date = datetime(2025, 9, 1)
-end_date = datetime(2025, 9, 15)
+start_date = datetime(2025, 4, 1)
+end_date = datetime(2025, 4, 30)
 dt.download_data(start_date, end_date)
 dt.unzip_data(start_date, end_date)
 
 # Test with 3 different time intervals
-time_intervals = [5, 10, 60]
+time_intervals = [30, 60, 240]
 results_by_interval = {}
+# Kernel half-width: e.g., 5 means a 11-second window (5+1+5)
+kernel_half_width = 5 
+# Trim the top and bottom 0.5% of prices to avoid edge noise (total 1%)
+trim_quantile = 0.01
+# Number of bins for KMC estimation. Adjust based on data size and desired resolution.
+n_bins = 200  
 
 for seconds_interval in time_intervals:
-    df = dt.aggregate_log_returns_range(start_date, end_date, seconds_interval)
+    df = dt.aggregate_log_returns_range(
+        start_date, 
+        end_date, 
+        seconds_interval, 
+        kernel_half_width=kernel_half_width,
+        trim_quantile=trim_quantile
+    )
     print(f"\n{'='*60}")
     print(f"Processing interval: {seconds_interval} seconds")
     print(f"{'='*60}")
@@ -29,14 +41,14 @@ for seconds_interval in time_intervals:
     
     # Library implementation
     x_series = np.asarray(df['log_first_price'].dropna().values, dtype=np.float64).reshape(-1, 1)
-    lib_kmc, lib_edges = kmc_lib(x_series, bins=100, full=False)
+    lib_kmc, lib_edges = kmc_lib(x_series, bins= n_bins, full=False)
     
     # Extract coefficients
     lib_weights = lib_kmc[0, :]
     # Threshold > 5 or 10 is recommended to filter out statistically insignificant noise
-    # D1 = M1 / dt
+    # D1 = M1 / dt. Divergence is often fixed by higher weight thresholds.
     lib_drift = np.where(lib_weights > 5, lib_kmc[1, :] / seconds_interval, np.nan)
-    # D2 = M2 / (2 * dt)
+    # D2 = M2 / (2 * dt). 
     lib_diffusion = np.where(lib_weights > 5, lib_kmc[2, :] / (2 * seconds_interval), np.nan)
     lib_centers = lib_edges[0]
     
@@ -53,25 +65,6 @@ for seconds_interval in time_intervals:
     print(f"\nDrift mean: {np.nanmean(lib_drift):.8g}")
     print(f"Diffusion mean: {np.nanmean(lib_diffusion):.8g}")
 
-# Create comparison table for first 10 bins across intervals
-print(f"\n{'='*60}")
-print("Comparison across intervals (first 10 bins)")
-print(f"{'='*60}\n")
-
-table = Table(title="Kramers-Moyal Drift: 3 Time Intervals")
-table.add_column("Bin", style="cyan")
-
-for interval in time_intervals:
-    table.add_column(f"{interval}s Drift", justify="right", style="green")
-
-for i in range(10):
-    row = [str(i)]
-    for interval in time_intervals:
-        drift_val = results_by_interval[interval]['drift'].iloc[i]
-        row.append(f"{drift_val:.8g}")
-    table.add_row(*row)
-
-console.print(table)
 
 # Generate potential plots from the precomputed KM results
 print(f"\n{'='*60}")

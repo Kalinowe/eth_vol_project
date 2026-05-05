@@ -66,7 +66,7 @@ def unzip_data(start_date, end_date):
             except Exception as e:
                 raise Exception(f"Error unzipping {date_str}: {e}")
 
-def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None):
+def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_width=0):
     """
     Read a CSV file and aggregate log returns over X second intervals starting from midnight.
 
@@ -74,6 +74,7 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None):
         csv_path: Path to the CSV file
         x_seconds: Interval length in seconds
         prev_log_last: Previous interval log price carried from an earlier day
+        kernel_half_width: Number of seconds to each side for the rolling mean kernel
 
     Returns:
         Tuple[DataFrame, float|None]: DataFrame with 'datetime', 'log_return',
@@ -108,48 +109,47 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None):
     df['timestamp_s'] = df['timestamp_us'] // 1_000_000
     df = df.sort_values('timestamp_s')
 
-    per_second = df.groupby('timestamp_s', sort=True)['price'].mean()
-    timestamps_sec = per_second.index.to_numpy(dtype=np.int64)
-    prices = per_second.to_numpy(dtype=np.float64)
-
     day_seconds = 24 * 3600
-    num_intervals = int(day_seconds // x_seconds)
+    full_day_range = np.arange(midnight, midnight + day_seconds, dtype=np.int64)
+    
+    # Group by second and average
+    per_second_raw = df.groupby('timestamp_s')['price'].mean()
+    
+    # Reindex to include every second of the day and fill NaNs
+    per_second = per_second_raw.reindex(full_day_range)
+    
+    # Initial fill: if the very first second is NaN, use the previous day's last price
+    if pd.isna(per_second.iloc[0]) and prev_log_last is not None:
+        per_second.iloc[0] = np.exp(prev_log_last)
+        
+    per_second = per_second.ffill().bfill() # bfill handles cases with no prev_log_last
 
+    # Apply kernel rolling mean (Uniform Kernel / SMA)
+    if kernel_half_width > 0:
+        window_size = 2 * kernel_half_width + 1
+        per_second = per_second.rolling(window=window_size, center=False, min_periods=1).mean()
+
+    prices_array = per_second.values
+    
+    num_intervals = int(day_seconds // x_seconds)
     intervals = []
     log_returns = []
     log_first_prices = []
     log_last_prices = []
 
     for i in range(num_intervals):
-        start_sec = midnight + i * x_seconds
-        end_sec = start_sec + x_seconds
+        start_idx = i * x_seconds
+        end_idx = min((i + 1) * x_seconds, day_seconds - 1)
 
-        left = np.searchsorted(timestamps_sec, start_sec, side='left')
-        right = np.searchsorted(timestamps_sec, end_sec, side='left')
+        first_price = prices_array[start_idx]
+        last_price = prices_array[end_idx]
 
-        if left < right:
-            first_price = prices[left]
-            last_price = prices[right - 1]
-            if first_price > 0 and last_price > 0:
-                log_first = np.log(first_price)
-                log_last = np.log(last_price)
-                log_ret = log_last - log_first
-                prev_log_last = log_last
-            else:
-                log_first = np.nan
-                log_last = np.nan
-                log_ret = np.nan
-        else:
-            if prev_log_last is not None:
-                log_first = prev_log_last
-                log_last = prev_log_last
-                log_ret = 0.0
-            else:
-                log_first = np.nan
-                log_last = np.nan
-                log_ret = np.nan
+        log_first = np.log(first_price)
+        log_last = np.log(last_price)
+        log_ret = log_last - log_first
+        prev_log_last = log_last
 
-        intervals.append(start_sec)
+        intervals.append(midnight + start_idx)
         log_returns.append(log_ret)
         log_first_prices.append(log_first)
         log_last_prices.append(log_last)
@@ -164,7 +164,7 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None):
     return result_df, prev_log_last
 
 
-def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='data'):
+def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='data', kernel_half_width=0, trim_quantile=0.0):
     """
     Aggregate log returns for each CSV in a date range and export the combined results.
 
@@ -173,6 +173,8 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
         end_date: datetime or string in YYYY-MM-DD format
         x_seconds: Interval length in seconds
         output_dir: Directory to write the combined CSV file
+        kernel_half_width: Kernel width parameter
+        trim_quantile: Fraction of data to trim from extremes (e.g., 0.01 for 1%)
 
     Returns:
         The combined DataFrame of aggregated log returns for the range.
@@ -201,7 +203,12 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f'Missing required CSV file: {csv_path}')
 
-        daily_df, prev_log_last = aggregate_log_returns(csv_path, x_seconds, prev_log_last=prev_log_last)
+        daily_df, prev_log_last = aggregate_log_returns(
+            csv_path, 
+            x_seconds, 
+            prev_log_last=prev_log_last, 
+            kernel_half_width=kernel_half_width
+        )
         combined_frames.append(daily_df)
         current += timedelta(days=1)
 
@@ -224,6 +231,13 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
                 f'Uneven interval spacing detected between {bad_start} and {bad_end}: '
                 f'{interval_seconds.iloc[bad_index-1]} seconds (expected {x_seconds})'
             )
+            
+    # Trim extreme log prices if requested
+    if trim_quantile > 0 and not combined_df.empty:
+        lower_q = combined_df['log_first_price'].quantile(trim_quantile / 2)
+        upper_q = combined_df['log_first_price'].quantile(1 - trim_quantile / 2)
+        combined_df = combined_df[(combined_df['log_first_price'] >= lower_q) & 
+                                 (combined_df['log_first_price'] <= upper_q)].copy()
 
     output_file = os.path.join(
         output_dir,
@@ -232,6 +246,3 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
     combined_df.to_csv(output_file, index=False)
 
     return combined_df
-
-
-
