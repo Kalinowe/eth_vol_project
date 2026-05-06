@@ -15,7 +15,6 @@ the static potential plot.
 import os
 from datetime import datetime, timedelta
 
-import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
@@ -208,9 +207,8 @@ def analyze_window(
         f'-{seconds_interval}sec{kernel_tag}{trim_tag}{detrend_tag}.csv',
     )
     if not os.path.exists(agg_file):
-        dc.download_data(window_start, window_end)
         try:
-            dc.unzip_data(window_start, window_end)
+            dc.ensure_data(window_start, window_end)
         except FileNotFoundError as exc:
             print(f"[skip] {window_start.date()}..{window_end.date()}: {exc}")
             return None

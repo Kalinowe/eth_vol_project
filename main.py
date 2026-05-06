@@ -1,7 +1,6 @@
 import os
 import numpy as np
 import data_collection as dt
-import pandas as pd
 import plots
 from datetime import datetime
 from force_field_estimation import estimate_km
@@ -12,8 +11,7 @@ console = Console()
 
 start_date = datetime(2024, 6, 1)
 end_date = datetime(2024, 6, 30)
-dt.download_data(start_date, end_date)
-dt.unzip_data(start_date, end_date)
+dt.ensure_data(start_date, end_date)
 
 # Test with 3 different time intervals
 time_intervals = [10,30,60]

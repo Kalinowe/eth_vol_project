@@ -5,7 +5,24 @@ import zipfile
 import pandas as pd
 import numpy as np
 
-def download_data(start_date, end_date):
+def ensure_data(start_date, end_date):
+    """
+    Ensure that extracted CSV files exist for every day in [start_date, end_date].
+
+    For each day:
+      - If the CSV already exists, nothing is done.
+      - If a zip exists but no CSV, the zip is extracted.
+      - If neither exists, the zip is downloaded then extracted.
+      - After extraction the zip is deleted regardless.
+
+    Args:
+        start_date: datetime object for start date
+        end_date: datetime object for end date
+
+    Raises:
+        FileNotFoundError: If a day's CSV cannot be obtained (download failed
+            and no existing zip or CSV was found).
+    """
     os.makedirs('data', exist_ok=True)
     current = start_date
     while current <= end_date:
@@ -13,63 +30,40 @@ def download_data(start_date, end_date):
         zip_path = f"data/ETHUSDT-aggTrades-{date_str}.zip"
         csv_path = f"data/ETHUSDT-aggTrades-{date_str}.csv"
 
-        # Skip if we already have either the zip or the extracted CSV
-        if os.path.exists(zip_path) or os.path.exists(csv_path):
-            current += timedelta(days=1)
-            continue
+        if not os.path.exists(csv_path):
+            if not os.path.exists(zip_path):
+                url = (
+                    f"https://data.binance.vision/data/spot/daily/aggTrades/ETHUSDT/"
+                    f"ETHUSDT-aggTrades-{date_str}.zip"
+                )
+                try:
+                    response = requests.get(url)
+                    if response.status_code == 200:
+                        with open(zip_path, 'wb') as f:
+                            f.write(response.content)
+                        print(f"Downloaded {date_str}")
+                    else:
+                        print(f"Failed to download {date_str}: {response.status_code}")
+                except Exception as e:
+                    print(f"Error downloading {date_str}: {e}")
 
-        url = f"https://data.binance.vision/data/spot/daily/aggTrades/ETHUSDT/ETHUSDT-aggTrades-{date_str}.zip"
-        try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                with open(zip_path, 'wb') as f:
-                    f.write(response.content)
-                print(f"Downloaded {date_str}")
-            else:
-                print(f"Failed to download {date_str}: {response.status_code}")
-        except Exception as e:
-            print(f"Error downloading {date_str}: {e}")
+            if os.path.exists(zip_path):
+                try:
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall('data')
+                    print(f"Extracted {date_str}")
+                except Exception as e:
+                    raise Exception(f"Error unzipping {date_str}: {e}")
+
+            if not os.path.exists(csv_path):
+                raise FileNotFoundError(
+                    f"Missing data for {date_str}: download failed and no CSV found"
+                )
+
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
         current += timedelta(days=1)
-
-def unzip_data(start_date, end_date):
-    """
-    Unzip aggregated trades data for a date range.
-
-    Each day requires either a zip file or an already-extracted CSV.
-    Zip files are deleted after successful extraction to save disk space.
-
-    Args:
-        start_date: datetime object for start date
-        end_date: datetime object for end date
-
-    Raises:
-        FileNotFoundError: If a day has neither a zip nor an extracted CSV.
-    """
-    # Pre-flight: every day must have zip OR csv
-    current = start_date
-    date_list = []
-    while current <= end_date:
-        date_str = current.strftime('%Y-%m-%d')
-        zip_file = f"data/ETHUSDT-aggTrades-{date_str}.zip"
-        csv_file = f"data/ETHUSDT-aggTrades-{date_str}.csv"
-        if not os.path.exists(zip_file) and not os.path.exists(csv_file):
-            raise FileNotFoundError(
-                f"Missing data for {date_str}: neither zip nor csv found"
-            )
-        date_list.append((date_str, zip_file, csv_file))
-        current += timedelta(days=1)
-
-    # For each day: extract if needed, then delete the zip regardless
-    for date_str, zip_file, csv_file in date_list:
-        if not os.path.exists(csv_file):
-            try:
-                with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                    zip_ref.extractall('data')
-                print(f"Extracted {date_str}")
-            except Exception as e:
-                raise Exception(f"Error unzipping {date_str}: {e}")
-        if os.path.exists(zip_file):
-            os.remove(zip_file)
 
 def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_width=0):
     """
