@@ -2,6 +2,10 @@
 .venv/
 venv/
 
+# Claude
+.claude/
+claude/
+
 # Python bytecode
 __pycache__/
 *.py[cod]

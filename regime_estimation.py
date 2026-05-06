@@ -53,87 +53,107 @@ def iter_month_windows(start_date, end_date):
 # Topological classifier
 # ---------------------------------------------------------------------------
 
-def classify_potential_topology(km_result_df, min_well_separation=0.0, min_barrier_height=0.0):
+def classify_potential_topology(
+    km_result_df,
+    min_barrier_fraction=0.1,
+    min_well_separation=0.0,
+    annualize_drift=True,
+):
     """
-    Identify stable equilibria from a non-parametric drift estimate.
+    Classify the topology of the potential U(x) estimated from KM coefficients.
 
-    A stable equilibrium is a zero-crossing of mu(x) with negative slope:
-    mu = -dU/dx implies dmu/dx = -d^2U/dx^2, so dmu/dx < 0 <=> d^2U/dx^2 > 0
-    which is exactly the condition for a local minimum of the potential.
+    Strategy: integrate the drift to get U(x), find all local minima, then keep
+    only those whose barrier height is >= min_barrier_fraction × total U range.
+    Working on the integrated potential is more robust than detecting zero
+    crossings of the raw drift, because integration smooths bin-level noise.
 
     Args:
-        km_result_df: output of estimate_km, with columns
+        km_result_df: output of estimate_km — columns
             ['bin_center', 'drift', 'diffusion', 'weight'].
-        min_well_separation: drop a candidate well if it is closer than this
-            (in log-price units) to the previously kept well.
-        min_barrier_height: drop a candidate well if the U-barrier separating
-            it from the previously kept well is below this threshold. Useful
-            for filtering numerical wiggles.
+        min_barrier_fraction: a candidate well is kept only if the U-barrier
+            separating it from the nearest kept well is at least this fraction
+            of the full potential range. Default 0.1 (10%). Increase toward
+            0.2–0.3 to suppress minor wiggles; set to 0 to keep every minimum.
+        min_well_separation: additional filter — drop a well if it is closer
+            than this many log-price units to the previously kept well.
+        annualize_drift: if True, multiply drift by seconds-per-year before
+            integrating. The topology is unchanged, but barrier heights and
+            potential range are in annualised units that are easier to reason
+            about (same scale as the drift plots in main.py).
 
     Returns:
         dict with keys:
-            n_wells          -- count of stable equilibria after filtering
-            well_locations   -- list of x positions
+            n_wells          -- count of stable wells after filtering
+            well_locations   -- list of x positions of local U minima
             barriers         -- list of U-barriers between adjacent wells
-                                (length n_wells - 1, may be empty)
+                                (length n_wells - 1)
+            u_range          -- total potential range (max - min of U)
             regime           -- 'no-equilibrium' | 'single-well' |
                                 'double-well' | '<n>-well'
     """
+    from scipy.signal import argrelmin
+
     df = km_result_df.dropna(subset=['drift']).reset_index(drop=True)
-    if len(df) < 3:
-        return {'n_wells': 0, 'well_locations': [], 'barriers': [], 'regime': 'no-equilibrium'}
+    if len(df) < 5:
+        return {
+            'n_wells': 0, 'well_locations': [], 'barriers': [],
+            'u_range': 0.0, 'regime': 'no-equilibrium',
+        }
 
-    x = df['bin_center'].values
-    mu = df['drift'].values
+    km_for_pot = df[['bin_center', 'drift']].copy()
+    if annualize_drift:
+        sec_per_year = 365.25 * 24 * 3600
+        km_for_pot['drift'] = km_for_pot['drift'] * sec_per_year
 
-    # zero crossings of mu
-    sign = np.sign(mu)
-    sign_changes = np.where(np.diff(sign) != 0)[0]
+    pot_df = integrate_drift_to_potential(km_for_pot)
+    x = pot_df['bin_center'].values
+    U = pot_df['potential'].values
+    # Shift so global minimum = 0
+    U = U - U.min()
+    u_range = float(U.max())
 
-    candidate_xs = []
-    for idx in sign_changes:
-        x0, x1 = x[idx], x[idx + 1]
-        m0, m1 = mu[idx], mu[idx + 1]
-        if m1 != m0:
-            x_cross = x0 - m0 * (x1 - x0) / (m1 - m0)  # linear interp
-        else:
-            x_cross = 0.5 * (x0 + x1)
-        slope = (m1 - m0) / (x1 - x0) if x1 != x0 else 0.0
-        if slope < 0:  # stable
-            candidate_xs.append(x_cross)
+    if u_range == 0:
+        return {
+            'n_wells': 0, 'well_locations': [], 'barriers': [],
+            'u_range': 0.0, 'regime': 'no-equilibrium',
+        }
 
-    # Compute the potential once, used for barrier heights
-    pot_df = integrate_drift_to_potential(km_result_df[['bin_center', 'drift']])
-    x_pot = pot_df['bin_center'].values
-    U_pot = pot_df['potential'].values
+    threshold = min_barrier_fraction * u_range
 
-    def barrier_between(xa, xb):
-        if xa == xb:
-            return 0.0
-        lo, hi = sorted([xa, xb])
-        mask = (x_pot >= lo) & (x_pot <= hi)
-        if not mask.any():
-            return 0.0
-        U_max = U_pot[mask].max()
-        Ua = float(np.interp(xa, x_pot, U_pot))
-        Ub = float(np.interp(xb, x_pot, U_pot))
-        return float(U_max - min(Ua, Ub))
+    # Local minima of U: point must be smaller than neighbours within `order` bins.
+    # order=5 means a minimum must be lower than 5 bins on each side; this already
+    # rejects very narrow wiggles without needing extra smoothing.
+    min_idx = argrelmin(U, order=5)[0]
 
-    # Apply separation/barrier filters greedily, keeping the leftmost in any group
-    kept = []
-    for cand in candidate_xs:
-        if not kept:
-            kept.append(cand)
-            continue
-        sep = abs(cand - kept[-1])
-        bh = barrier_between(kept[-1], cand)
-        if sep >= min_well_separation and bh >= min_barrier_height:
-            kept.append(cand)
-        # else: merge by skipping this candidate
+    if len(min_idx) == 0:
+        return {
+            'n_wells': 0, 'well_locations': [], 'barriers': [],
+            'u_range': round(u_range, 4), 'regime': 'no-equilibrium',
+        }
 
-    barriers = [barrier_between(kept[i], kept[i + 1]) for i in range(len(kept) - 1)]
+    # For each pair of consecutive candidate minima, compute the barrier height
+    # (max U between them minus the higher of the two minima values).
+    def barrier_between_indices(ia, ib):
+        lo, hi = min(ia, ib), max(ia, ib)
+        U_peak = U[lo:hi + 1].max()
+        return float(U_peak - max(U[ia], U[ib]))
 
-    n = len(kept)
+    # Greedy filter: accept the first minimum, then accept subsequent ones
+    # only if they clear both the barrier and separation thresholds.
+    kept_idx = [min_idx[0]]
+    for idx in min_idx[1:]:
+        bh = barrier_between_indices(kept_idx[-1], idx)
+        sep = abs(x[idx] - x[kept_idx[-1]])
+        if bh >= threshold and sep >= min_well_separation:
+            kept_idx.append(idx)
+
+    barriers = [
+        round(barrier_between_indices(kept_idx[i], kept_idx[i + 1]), 6)
+        for i in range(len(kept_idx) - 1)
+    ]
+    well_locations = [float(x[i]) for i in kept_idx]
+
+    n = len(kept_idx)
     if n == 0:
         regime = 'no-equilibrium'
     elif n == 1:
@@ -145,8 +165,9 @@ def classify_potential_topology(km_result_df, min_well_separation=0.0, min_barri
 
     return {
         'n_wells': n,
-        'well_locations': kept,
+        'well_locations': well_locations,
         'barriers': barriers,
+        'u_range': round(u_range, 4),
         'regime': regime,
     }
 
@@ -164,8 +185,8 @@ def analyze_window(
     n_bins=200,
     weight_threshold=5,
     detrend=0,
+    min_barrier_fraction=0.1,
     min_well_separation=0.0,
-    min_barrier_height=0.0,
     min_observations=100,
 ):
     """
@@ -177,10 +198,14 @@ def analyze_window(
     # If the aggregated CSV for this (window, interval) already exists we can
     # skip the download and unzip entirely — aggregate_log_returns_range will
     # load it from disk.
+    trim_tag = f'_trim{trim_quantile}' if trim_quantile > 0 else ''
+    kernel_tag = f'_k{kernel_half_width}' if kernel_half_width > 0 else ''
+    detrend_tag = '_detrended' if detrend else ''
     agg_file = os.path.join(
         'data',
         f'ETHUSDT-aggReturns-{window_start.strftime("%Y-%m-%d")}'
-        f'_to_{window_end.strftime("%Y-%m-%d")}-{seconds_interval}sec.csv',
+        f'_to_{window_end.strftime("%Y-%m-%d")}'
+        f'-{seconds_interval}sec{kernel_tag}{trim_tag}{detrend_tag}.csv',
     )
     if not os.path.exists(agg_file):
         dc.download_data(window_start, window_end)
@@ -213,8 +238,8 @@ def analyze_window(
     km_df = estimate_km(log_prices, seconds_interval, n_bins=n_bins, weight_threshold=weight_threshold)
     topo = classify_potential_topology(
         km_df,
+        min_barrier_fraction=min_barrier_fraction,
         min_well_separation=min_well_separation,
-        min_barrier_height=min_barrier_height,
     )
 
     return {
@@ -240,8 +265,8 @@ def run_phase_a(
     n_bins=200,
     weight_threshold=5,
     detrend=0,
+    min_barrier_fraction=0.1,
     min_well_separation=0.0,
-    min_barrier_height=0.0,
     output_dir='regime_results',
 ):
     """
@@ -264,8 +289,8 @@ def run_phase_a(
                 n_bins=n_bins,
                 weight_threshold=weight_threshold,
                 detrend=detrend,
+                min_barrier_fraction=min_barrier_fraction,
                 min_well_separation=min_well_separation,
-                min_barrier_height=min_barrier_height,
             )
             if result is None:
                 rows.append({
@@ -287,6 +312,7 @@ def run_phase_a(
                 'n_wells': result['n_wells'],
                 'well_locations': [round(x, 6) for x in result['well_locations']],
                 'barriers': [round(b, 6) for b in result['barriers']],
+                'u_range': result['u_range'],
                 'n_observations': result['n_observations'],
             })
 
@@ -302,20 +328,21 @@ def print_regime_table(labels_df, console=None):
     table.add_column('Start', style='cyan')
     table.add_column('End', style='cyan')
     table.add_column(u'Δt (s)', justify='right')
-    table.add_column('Wells', justify='right', style='magenta')
     table.add_column('Regime', style='green')
-    table.add_column('Well locations', style='yellow')
+    table.add_column('Wells', justify='right', style='magenta')
+    table.add_column('U range (ann.)', justify='right', style='yellow')
     table.add_column('Barriers', style='yellow')
     table.add_column('# obs', justify='right')
 
     for _, r in labels_df.iterrows():
+        u_range_str = f"{r['u_range']:.2f}" if pd.notna(r.get('u_range')) else ''
         table.add_row(
             str(r['window_start']),
             str(r['window_end']),
             str(r['seconds_interval']),
-            '' if pd.isna(r['n_wells']) else str(int(r['n_wells'])),
             str(r['regime']),
-            str(r['well_locations']) if r['well_locations'] is not None else '',
+            '' if pd.isna(r['n_wells']) else str(int(r['n_wells'])),
+            u_range_str,
             str(r['barriers']) if r['barriers'] is not None else '',
             str(r['n_observations']),
         )
@@ -338,9 +365,11 @@ if __name__ == '__main__':
     weight_threshold = 5
     detrend = 0  # leave the trend in; let mu(x) absorb it
 
-    # Topology filters: 0 = no filter. Tune after eyeballing the first run.
+    # Topology filters. min_barrier_fraction: keep a well only if its barrier
+    # height is >= this fraction of the total U range. 0.1 = 10%.
+    # Increase toward 0.2-0.3 to suppress minor wiggles.
+    min_barrier_fraction = 0.1
     min_well_separation = 0.0
-    min_barrier_height = 0.0
 
     labels = run_phase_a(
         start_date,
@@ -351,8 +380,8 @@ if __name__ == '__main__':
         n_bins=n_bins,
         weight_threshold=weight_threshold,
         detrend=detrend,
+        min_barrier_fraction=min_barrier_fraction,
         min_well_separation=min_well_separation,
-        min_barrier_height=min_barrier_height,
     )
 
     print_regime_table(labels)

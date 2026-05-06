@@ -111,7 +111,13 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_w
         return result_df, prev_log_last
 
     df['timestamp_us'] = df['timestamp_us'].astype(np.int64)
-    df['timestamp_s'] = df['timestamp_us'] // 1_000_000
+    # Binance uses μs in recent data (~1.7e15) and ms in older data (~1.7e12).
+    # Divide accordingly so timestamp_s is always Unix seconds.
+    sample_ts = int(df['timestamp_us'].iloc[0])
+    if sample_ts > 1e15:
+        df['timestamp_s'] = df['timestamp_us'] // 1_000_000  # microseconds
+    else:
+        df['timestamp_s'] = df['timestamp_us'] // 1_000      # milliseconds
     df = df.sort_values('timestamp_s')
 
     day_seconds = 24 * 3600
@@ -200,12 +206,19 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
 
     os.makedirs(output_dir, exist_ok=True)
 
+    trim_tag = f'_trim{trim_quantile}' if trim_quantile > 0 else ''
+    kernel_tag = f'_k{kernel_half_width}' if kernel_half_width > 0 else ''
+    detrend_tag = '_detrended' if detrend else ''
     output_file = os.path.join(
         output_dir,
-        f'ETHUSDT-aggReturns-{start_dt.strftime("%Y-%m-%d")}_to_{end_dt.strftime("%Y-%m-%d")}-{x_seconds}sec.csv',
+        f'ETHUSDT-aggReturns-{start_dt.strftime("%Y-%m-%d")}_to_{end_dt.strftime("%Y-%m-%d")}'
+        f'-{x_seconds}sec{kernel_tag}{trim_tag}{detrend_tag}.csv',
     )
     if os.path.exists(output_file):
-        return pd.read_csv(output_file, parse_dates=['datetime'])
+        cached = pd.read_csv(output_file, parse_dates=['datetime'])
+        if not cached.empty:
+            return cached
+        os.remove(output_file)  # stale empty file — fall through and re-aggregate
 
     current = start_dt
     combined_frames = []
