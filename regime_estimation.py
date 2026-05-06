@@ -174,15 +174,21 @@ def analyze_window(
     Returns a dict on success, or None if the window is unusable (data missing,
     too few observations, etc.).
     """
-    # Make sure we have the daily files. download_data is best-effort and won't
-    # raise on individual failures; unzip_data will raise FileNotFoundError if
-    # any required file is missing.
-    dc.download_data(window_start, window_end)
-    try:
-        dc.unzip_data(window_start, window_end)
-    except FileNotFoundError as exc:
-        print(f"[skip] {window_start.date()}..{window_end.date()}: {exc}")
-        return None
+    # If the aggregated CSV for this (window, interval) already exists we can
+    # skip the download and unzip entirely — aggregate_log_returns_range will
+    # load it from disk.
+    agg_file = os.path.join(
+        'data',
+        f'ETHUSDT-aggReturns-{window_start.strftime("%Y-%m-%d")}'
+        f'_to_{window_end.strftime("%Y-%m-%d")}-{seconds_interval}sec.csv',
+    )
+    if not os.path.exists(agg_file):
+        dc.download_data(window_start, window_end)
+        try:
+            dc.unzip_data(window_start, window_end)
+        except FileNotFoundError as exc:
+            print(f"[skip] {window_start.date()}..{window_end.date()}: {exc}")
+            return None
 
     try:
         df = dc.aggregate_log_returns_range(

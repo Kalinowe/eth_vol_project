@@ -10,19 +10,19 @@ def download_data(start_date, end_date):
     current = start_date
     while current <= end_date:
         date_str = current.strftime('%Y-%m-%d')
-        file_path = f"data/ETHUSDT-aggTrades-{date_str}.zip"
-        
-        # Skip if file already exists
-        if os.path.exists(file_path):
-            print(f"File already exists for {date_str}, skipping")
+        zip_path = f"data/ETHUSDT-aggTrades-{date_str}.zip"
+        csv_path = f"data/ETHUSDT-aggTrades-{date_str}.csv"
+
+        # Skip if we already have either the zip or the extracted CSV
+        if os.path.exists(zip_path) or os.path.exists(csv_path):
             current += timedelta(days=1)
             continue
-        
+
         url = f"https://data.binance.vision/data/spot/daily/aggTrades/ETHUSDT/ETHUSDT-aggTrades-{date_str}.zip"
         try:
             response = requests.get(url)
             if response.status_code == 200:
-                with open(file_path, 'wb') as f:
+                with open(zip_path, 'wb') as f:
                     f.write(response.content)
                 print(f"Downloaded {date_str}")
             else:
@@ -34,37 +34,42 @@ def download_data(start_date, end_date):
 def unzip_data(start_date, end_date):
     """
     Unzip aggregated trades data for a date range.
-    
+
+    Each day requires either a zip file or an already-extracted CSV.
+    Zip files are deleted after successful extraction to save disk space.
+
     Args:
         start_date: datetime object for start date
         end_date: datetime object for end date
-    
+
     Raises:
-        FileNotFoundError: If any required zip file is missing for dates in range
+        FileNotFoundError: If a day has neither a zip nor an extracted CSV.
     """
-    # First, check that all required files exist
+    # Pre-flight: every day must have zip OR csv
     current = start_date
     date_list = []
     while current <= end_date:
         date_str = current.strftime('%Y-%m-%d')
         zip_file = f"data/ETHUSDT-aggTrades-{date_str}.zip"
-        if not os.path.exists(zip_file):
-            raise FileNotFoundError(f"Missing required file: {zip_file}")
-        date_list.append((current, date_str, zip_file))
-        current += timedelta(days=1)
-    
-    # Unzip files
-    for date_obj, date_str, zip_file in date_list:
         csv_file = f"data/ETHUSDT-aggTrades-{date_str}.csv"
-        
-        # Unzip if CSV doesn't already exist
+        if not os.path.exists(zip_file) and not os.path.exists(csv_file):
+            raise FileNotFoundError(
+                f"Missing data for {date_str}: neither zip nor csv found"
+            )
+        date_list.append((date_str, zip_file, csv_file))
+        current += timedelta(days=1)
+
+    # For each day: extract if needed, then delete the zip regardless
+    for date_str, zip_file, csv_file in date_list:
         if not os.path.exists(csv_file):
             try:
                 with zipfile.ZipFile(zip_file, 'r') as zip_ref:
                     zip_ref.extractall('data')
-                print(f"Unzipped {date_str}")
+                print(f"Extracted {date_str}")
             except Exception as e:
                 raise Exception(f"Error unzipping {date_str}: {e}")
+        if os.path.exists(zip_file):
+            os.remove(zip_file)
 
 def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_width=0):
     """
@@ -194,6 +199,14 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
         raise ValueError('start_date must be less than or equal to end_date')
 
     os.makedirs(output_dir, exist_ok=True)
+
+    output_file = os.path.join(
+        output_dir,
+        f'ETHUSDT-aggReturns-{start_dt.strftime("%Y-%m-%d")}_to_{end_dt.strftime("%Y-%m-%d")}-{x_seconds}sec.csv',
+    )
+    if os.path.exists(output_file):
+        return pd.read_csv(output_file, parse_dates=['datetime'])
+
     current = start_dt
     combined_frames = []
 
@@ -250,10 +263,5 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
         combined_df = combined_df[(combined_df['log_first_price'] >= lower_q) & 
                                  (combined_df['log_first_price'] <= upper_q)].copy()
 
-    output_file = os.path.join(
-        output_dir,
-        f'ETHUSDT-aggReturns-{start_dt.strftime("%Y-%m-%d")}_to_{end_dt.strftime("%Y-%m-%d")}-{x_seconds}sec.csv'
-    )
     combined_df.to_csv(output_file, index=False)
-
     return combined_df
