@@ -8,10 +8,23 @@ Only two states are modelled:
     'single-well'  ->  state 0
     'double-well'  ->  state 1
 
-Any other label (no-equilibrium, n-well for n>2, unavailable) is dropped
-with a warning.  Transitions that cross a dropped window are NOT counted
-(gap-aware: two windows must be temporally adjacent to contribute a
-transition).
+Vote aggregation
+----------------
+The regime labels CSV contains one row per (window, seconds_interval).
+Before chain estimation, all intervals for each window are collapsed into a
+single regime via majority vote:
+
+    - 'X/N' confidence when a STATES regime wins the plurality
+      (e.g. '2/3' or '3/3' with three intervals)
+    - 'invalid regimes' when the plurality winner is not in STATES or when
+      there is a tie
+
+Windows whose aggregated regime is not in STATES are dropped with a warning;
+transitions that cross such gaps are NOT counted (gap-aware adjacency check).
+
+The seconds_interval argument selects which interval's metadata columns
+(n_wells, well_locations, barriers, u_range, n_observations) are attached
+to each window row and included in the return dict.
 
 Ergodicity check
 ----------------
@@ -61,34 +74,71 @@ class MarkovChainError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Data loading
+# Data loading and aggregation
 # ---------------------------------------------------------------------------
 
-def load_label_sequence(labels_csv: str, seconds_interval: int) -> pd.DataFrame:
-    """
-    Load the regime labels CSV and return only the rows for `seconds_interval`
-    whose regime is in STATES, sorted chronologically.
-
-    Rows with any other regime are dropped and a warning is emitted.
-    Returns DataFrame with columns ['window_start', 'window_end', 'regime'].
-    """
+def load_labels_csv(labels_csv: str) -> pd.DataFrame:
+    """Load the full regime labels CSV (all intervals), sorted by window then interval."""
     df = pd.read_csv(labels_csv, parse_dates=['window_start', 'window_end'])
-    df = df[df['seconds_interval'] == seconds_interval].copy()
-    df = df.sort_values('window_start').reset_index(drop=True)
+    return df.sort_values(['window_start', 'seconds_interval']).reset_index(drop=True)
 
-    mask_valid = df['regime'].isin(STATES)
-    n_dropped = int((~mask_valid).sum())
-    if n_dropped > 0:
-        dropped_counts = df.loc[~mask_valid, 'regime'].value_counts().to_dict()
+
+def aggregate_label_votes(full_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse multiple seconds_interval rows per window into a single row via
+    majority vote.
+
+    Assumes an odd number of intervals so ties cannot occur among valid states,
+    but a tie guard is included regardless.
+
+    Returns DataFrame with columns ['window_start', 'window_end', 'regime',
+    'confidence'] where confidence is 'X/N' when a STATES regime wins (X votes
+    out of N intervals) or 'invalid regimes' otherwise.
+    """
+    rows = []
+    for (ws, we), grp in full_df.groupby(['window_start', 'window_end'], sort=True):
+        counts = grp['regime'].value_counts()
+        total = int(counts.sum())
+        top_regime = counts.index[0]
+        top_count = int(counts.iloc[0])
+
+        tie = len(counts) > 1 and counts.iloc[0] == counts.iloc[1]
+        if tie or top_regime not in STATE_IDX:
+            regime = top_regime
+            confidence = 'invalid regimes'
+        else:
+            regime = top_regime
+            confidence = f'{top_count}/{total}'
+
+        rows.append({'window_start': ws, 'window_end': we,
+                     'regime': regime, 'confidence': confidence})
+
+    return pd.DataFrame(rows)
+
+
+def attach_interval_metadata(
+    agg_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    seconds_interval: int,
+) -> pd.DataFrame:
+    """
+    Left-join per-window metadata from the specified seconds_interval onto
+    the aggregated DataFrame.
+
+    Metadata columns joined: n_wells, well_locations, barriers, u_range,
+    n_observations (whichever are present in full_df).
+    """
+    meta_cols = ['window_start', 'window_end', 'n_wells', 'well_locations',
+                 'barriers', 'u_range', 'n_observations']
+    available = [c for c in meta_cols if c in full_df.columns]
+    sub = full_df[full_df['seconds_interval'] == seconds_interval][available].copy()
+    if sub.empty:
         warnings.warn(
-            f"{n_dropped} window(s) dropped (non-binary regime): {dropped_counts}",
-            stacklevel=2,
+            f'No rows found for seconds_interval={seconds_interval}; '
+            'metadata columns will be NaN.',
+            stacklevel=3,
         )
-
-    return (
-        df[mask_valid][['window_start', 'window_end', 'regime']]
-        .reset_index(drop=True)
-    )
+    return agg_df.merge(sub, on=['window_start', 'window_end'], how='left')
 
 
 # ---------------------------------------------------------------------------
@@ -274,22 +324,40 @@ def run_markov_chain(
     Parameters
     ----------
     labels_csv       : path to CSV produced by regime_estimation.run_phase_a()
-    seconds_interval : which sampling interval row to use (must exist in CSV)
+    seconds_interval : interval whose metadata (n_wells, barriers, etc.) is
+                       attached to each window row; does not filter the vote
     output_dir       : directory for plots and CSV results
 
     Returns
     -------
     dict with keys {N, A, pi, dwells, seq_df} or None if data is insufficient.
+    seq_df has one row per window with regime, confidence, and metadata columns
+    from seconds_interval.
     Raises MarkovChainError if ergodicity / stationarity checks fail.
     """
     os.makedirs(output_dir, exist_ok=True)
     console = console or Console()
 
-    seq_df = load_label_sequence(labels_csv, seconds_interval)
+    # --- Aggregate all intervals into one regime per window ---
+    full_df = load_labels_csv(labels_csv)
+    agg_df = aggregate_label_votes(full_df)
+    seq_df = attach_interval_metadata(agg_df, full_df, seconds_interval)
+
+    # Drop windows where the majority vote did not resolve to a modelled state
+    mask_valid = seq_df['regime'].isin(STATES)
+    n_dropped = int((~mask_valid).sum())
+    if n_dropped > 0:
+        dropped = seq_df.loc[~mask_valid, ['window_start', 'window_end', 'regime', 'confidence']]
+        warnings.warn(
+            f"{n_dropped} window(s) dropped (no valid majority): "
+            f"{dropped[['regime', 'confidence']].value_counts().to_dict()}",
+            stacklevel=2,
+        )
+    seq_df = seq_df[mask_valid].reset_index(drop=True)
 
     if len(seq_df) < 2:
         console.print(
-            f'[red]Only {len(seq_df)} valid window(s) at {seconds_interval}s — '
+            f'[red]Only {len(seq_df)} valid window(s) after vote aggregation — '
             'need at least 2 to estimate transitions.[/red]'
         )
         return None
