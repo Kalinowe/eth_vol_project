@@ -371,51 +371,56 @@ def run_phase_a(
         start_date, end_date, window_type, console=console
     )
 
-    rows = []
-    for window_start, window_end in iter_windows(start_date, end_date, window_type):
-        for seconds_interval in seconds_intervals:
-            result = analyze_window(
-                window_start,
-                window_end,
-                seconds_interval,
-                kernel_half_width=kernel_half_width,
-                trim_quantile=trim_quantile,
-                n_bins=n_bins,
-                weight_threshold=weight_threshold,
-                detrend=detrend,
-                min_barrier_fraction=min_barrier_fraction,
-                min_well_separation=min_well_separation,
-            )
-            if result is None:
-                rows.append({
-                    'window_start': window_start.strftime('%Y-%m-%d'),
-                    'window_end': window_end.strftime('%Y-%m-%d'),
-                    'seconds_interval': seconds_interval,
-                    'regime': 'unavailable',
-                    'n_wells': None,
-                    'well_locations': None,
-                    'barriers': None,
-                    'n_observations': 0,
-                })
-                continue
-            rows.append({
-                'window_start': result['window_start'].strftime('%Y-%m-%d'),
-                'window_end': result['window_end'].strftime('%Y-%m-%d'),
-                'seconds_interval': result['seconds_interval'],
-                'regime': result['regime'],
-                'n_wells': result['n_wells'],
-                'well_locations': [round(x, 6) for x in result['well_locations']],
-                'barriers': [round(b, 6) for b in result['barriers']],
-                'u_range': result['u_range'],
-                'n_observations': result['n_observations'],
-            })
-
-    out_df = pd.DataFrame(rows)
     fname = (
-        f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}"
-        f"_{window_type}.csv"
-    )
-    out_df.to_csv(os.path.join(output_dir, fname), index=False)
+    f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}"
+    f"_{window_type}.csv")
+
+    if not os.path.exists(os.path.join(output_dir, fname)): 
+        rows = []
+        for window_start, window_end in iter_windows(start_date, end_date, window_type):
+            for seconds_interval in seconds_intervals:
+                result = analyze_window(
+                    window_start,
+                    window_end,
+                    seconds_interval,
+                    kernel_half_width=kernel_half_width,
+                    trim_quantile=trim_quantile,
+                    n_bins=n_bins,
+                    weight_threshold=weight_threshold,
+                    detrend=detrend,
+                    min_barrier_fraction=min_barrier_fraction,
+                    min_well_separation=min_well_separation,
+                )
+                if result is None:
+                    rows.append({
+                        'window_start': window_start.strftime('%Y-%m-%d'),
+                        'window_end': window_end.strftime('%Y-%m-%d'),
+                        'seconds_interval': seconds_interval,
+                        'regime': 'unavailable',
+                        'n_wells': None,
+                        'well_locations': None,
+                        'barriers': None,
+                        'n_observations': 0,
+                    })
+                    continue
+                rows.append({
+                    'window_start': result['window_start'].strftime('%Y-%m-%d'),
+                    'window_end': result['window_end'].strftime('%Y-%m-%d'),
+                    'seconds_interval': result['seconds_interval'],
+                    'regime': result['regime'],
+                    'n_wells': result['n_wells'],
+                    'well_locations': [round(x, 6) for x in result['well_locations']],
+                    'barriers': [round(b, 6) for b in result['barriers']],
+                    'u_range': result['u_range'],
+                    'n_observations': result['n_observations'],
+                })
+        out_df = pd.DataFrame(rows)
+        out_df.to_csv(os.path.join(output_dir, fname), index=False)        
+    else: 
+        print(f"Labels CSV already exists at {os.path.join(output_dir, fname)}, loading from disk.")
+        rows = pd.read_csv(os.path.join(output_dir, fname)).to_dict(orient='records')   
+        out_df = pd.DataFrame(rows)
+
     return out_df
 
 
@@ -452,8 +457,8 @@ def print_regime_table(labels_df, console=None):
 
 if __name__ == '__main__':
     # --- Configuration (mirrors main.py defaults so windows can be cross-checked) ---
-    start_date = datetime(2025, 1, 1)
-    end_date = datetime(2025, 12, 31)
+    start_date = datetime(2024, 1, 1)
+    end_date = datetime(2024, 12, 31)
 
     seconds_intervals = [30, 60, 120]
     kernel_half_width = 5

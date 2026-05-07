@@ -44,6 +44,7 @@ Outputs (written to output_dir)
     mc_<stem>_<interval>s_results.csv
 """
 
+from datetime import datetime
 import glob
 import os
 import warnings
@@ -54,14 +55,14 @@ from rich.console import Console
 from rich.table import Table
 
 import plots
-
+from regime_estimation import normalize_window_boundaries
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-STATES = ['single-well', 'double-well']
+STATES = ['single-well', 'multi-well']
 STATE_IDX = {s: i for i, s in enumerate(STATES)}
-COLORS = ['#2196F3', '#F44336']    # blue = single-well, red = double-well
+COLORS = ['#2196F3', '#F44336']    # blue = single-well, red = multi-well
 STATIONARITY_TOL = 1e-6
 
 
@@ -80,6 +81,7 @@ class MarkovChainError(RuntimeError):
 def load_labels_csv(labels_csv: str) -> pd.DataFrame:
     """Load the full regime labels CSV (all intervals), sorted by window then interval."""
     df = pd.read_csv(labels_csv, parse_dates=['window_start', 'window_end'])
+    print(f'Loaded {len(df)} rows from {labels_csv}')
     return df.sort_values(['window_start', 'seconds_interval']).reset_index(drop=True)
 
 
@@ -390,14 +392,19 @@ def run_markov_chain(
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    csvs = sorted(glob.glob(os.path.join('regime_results', 'regime_labels_*.csv')))
-    if not csvs:
-        raise FileNotFoundError(
-            'No regime_labels_*.csv found in regime_results/. '
-            'Run regime_estimation.py first.'
-        )
-    labels_csv = csvs[-1]
+    
+    start_date = datetime(2024, 1, 1)
+    end_date = datetime(2024, 12, 31)
+    window_type = 'weekly'
+
+    start_date, end_date = normalize_window_boundaries(start_date,end_date,window_type)
     seconds_interval = 30
+
+    fname = (
+    f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}"
+    f"_{window_type}.csv")
+
+    labels_csv = os.path.join('regime_results', fname)
 
     _console = Console()
     _console.print(f'[cyan]Labels file : {labels_csv}[/cyan]')

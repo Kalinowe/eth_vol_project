@@ -6,6 +6,10 @@ venv/
 .claude/
 claude/
 
+# Regime results data and plots
+regime_results/
+
+
 # Python bytecode
 __pycache__/
 *.py[cod]
