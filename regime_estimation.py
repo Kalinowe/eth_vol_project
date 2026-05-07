@@ -29,9 +29,8 @@ from force_field_estimation import estimate_km, integrate_drift_to_potential
 
 def iter_month_windows(start_date, end_date):
     """
-    Yield (window_start, window_end) tuples for each calendar month overlapping
-    [start_date, end_date]. Windows are clipped to the user-supplied range, so
-    partial months at either end are returned as partial windows.
+    Yield (window_start, window_end) for each calendar month overlapping
+    [start_date, end_date]. Partial months at either end are clipped.
     """
     current = datetime(start_date.year, start_date.month, 1)
     while current <= end_date:
@@ -46,6 +45,36 @@ def iter_month_windows(start_date, end_date):
         yield window_start, window_end
 
         current = next_month_start
+
+
+def iter_fixed_windows(start_date, end_date, days):
+    """
+    Yield (window_start, window_end) for non-overlapping fixed-length windows of
+    `days` days starting from start_date. The last window is clipped to end_date.
+    """
+    current = start_date
+    while current <= end_date:
+        window_end = min(current + timedelta(days=days - 1), end_date)
+        yield current, window_end
+        current = window_end + timedelta(days=1)
+
+
+def iter_windows(start_date, end_date, window_type='monthly'):
+    """
+    Dispatch to the appropriate window iterator.
+
+    Args:
+        window_type: 'weekly' (7 days), 'biweekly' (14 days), or 'monthly'
+                     (calendar-aligned).
+    """
+    if window_type == 'weekly':
+        return iter_fixed_windows(start_date, end_date, 7)
+    elif window_type == 'biweekly':
+        return iter_fixed_windows(start_date, end_date, 14)
+    elif window_type == 'monthly':
+        return iter_month_windows(start_date, end_date)
+    else:
+        raise ValueError(f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'.")
 
 
 # ---------------------------------------------------------------------------
@@ -266,17 +295,21 @@ def run_phase_a(
     min_barrier_fraction=0.1,
     min_well_separation=0.0,
     output_dir='regime_results',
+    window_type='monthly',
 ):
     """
-    Loop over month windows x sampling intervals and assemble a label table.
+    Loop over windows x sampling intervals and assemble a label table.
+
+    Args:
+        window_type: 'weekly', 'biweekly', or 'monthly' (default).
 
     Returns the assembled DataFrame and writes it to
-    `<output_dir>/regime_labels_<start>_to_<end>.csv`.
+    `<output_dir>/regime_labels_<start>_to_<end>_<window_type>.csv`.
     """
     os.makedirs(output_dir, exist_ok=True)
 
     rows = []
-    for window_start, window_end in iter_month_windows(start_date, end_date):
+    for window_start, window_end in iter_windows(start_date, end_date, window_type):
         for seconds_interval in seconds_intervals:
             result = analyze_window(
                 window_start,
@@ -315,7 +348,10 @@ def run_phase_a(
             })
 
     out_df = pd.DataFrame(rows)
-    fname = f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}.csv"
+    fname = (
+        f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}"
+        f"_{window_type}.csv"
+    )
     out_df.to_csv(os.path.join(output_dir, fname), index=False)
     return out_df
 
@@ -353,15 +389,18 @@ def print_regime_table(labels_df, console=None):
 
 if __name__ == '__main__':
     # --- Configuration (mirrors main.py defaults so windows can be cross-checked) ---
-    start_date = datetime(2024, 1, 1)
-    end_date = datetime(2024, 6, 30)
+    start_date = datetime(2025, 1, 1)
+    end_date = datetime(2025, 12, 31)
 
-    seconds_intervals = [30, 60, 240]
+    seconds_intervals = [30, 60, 120]
     kernel_half_width = 5
     trim_quantile = 0.01
-    n_bins = 200
+    n_bins = 100
     weight_threshold = 5
-    detrend = 0  # leave the trend in; let mu(x) absorb it
+    detrend = 1  # leave the trend in; let mu(x) absorb it
+
+    # Window granularity: 'weekly', 'biweekly', or 'monthly'
+    window_type = 'weekly'
 
     # Topology filters. min_barrier_fraction: keep a well only if its barrier
     # height is >= this fraction of the total U range. 0.1 = 10%.
@@ -380,6 +419,7 @@ if __name__ == '__main__':
         detrend=detrend,
         min_barrier_fraction=min_barrier_fraction,
         min_well_separation=min_well_separation,
+        window_type=window_type,
     )
 
     print_regime_table(labels)
