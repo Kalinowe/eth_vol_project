@@ -186,10 +186,8 @@ def classify_potential_topology(
         regime = 'no-equilibrium'
     elif n == 1:
         regime = 'single-well'
-    elif n == 2:
-        regime = 'double-well'
     else:
-        regime = f'{n}-well'
+        regime = 'multi-well'
 
     return {
         'n_wells': n,
