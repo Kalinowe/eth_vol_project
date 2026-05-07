@@ -12,6 +12,7 @@ sanity-checked by setting main.py to that exact window and visually inspecting
 the static potential plot.
 """
 
+import glob
 import os
 from datetime import datetime, timedelta
 
@@ -333,6 +334,63 @@ def analyze_window(
 
 
 # ---------------------------------------------------------------------------
+# Partial-cache helper
+# ---------------------------------------------------------------------------
+
+def _load_cached_windows(
+    output_dir: str,
+    window_type: str,
+    start_date: datetime,
+    end_date: datetime,
+    seconds_intervals: list,
+) -> tuple[pd.DataFrame, set]:
+    """
+    Scan output_dir for regime_labels_*_{window_type}.csv files.
+
+    Returns
+    -------
+    cached_df  : DataFrame of rows whose window falls entirely within
+                 [start_date, end_date]; dates stored as strings (YYYY-MM-DD).
+    covered    : set of (window_start_str, window_end_str) pairs where every
+                 requested seconds_interval is already present in cached_df.
+    """
+    pattern = os.path.join(output_dir, f'regime_labels_*_{window_type}.csv')
+    csv_files = glob.glob(pattern)
+    if not csv_files:
+        return pd.DataFrame(), set()
+
+    start_str = start_date.strftime('%Y-%m-%d')
+    end_str = end_date.strftime('%Y-%m-%d')
+
+    frames = []
+    for path in csv_files:
+        try:
+            df = pd.read_csv(path, dtype={'window_start': str, 'window_end': str})
+            mask = (df['window_start'] >= start_str) & (df['window_end'] <= end_str)
+            sub = df[mask]
+            if not sub.empty:
+                frames.append(sub)
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame(), set()
+
+    cached_df = pd.concat(frames, ignore_index=True)
+    cached_df = cached_df.drop_duplicates(
+        subset=['window_start', 'window_end', 'seconds_interval'], keep='first'
+    )
+
+    intervals_set = set(seconds_intervals)
+    covered = set()
+    for (ws, we), grp in cached_df.groupby(['window_start', 'window_end']):
+        if intervals_set.issubset(set(grp['seconds_interval'].values)):
+            covered.add((ws, we))
+
+    return cached_df, covered
+
+
+# ---------------------------------------------------------------------------
 # Phase A driver
 # ---------------------------------------------------------------------------
 
@@ -372,55 +430,98 @@ def run_phase_a(
     )
 
     fname = (
-    f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}"
-    f"_{window_type}.csv")
+        f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}"
+        f"_{window_type}.csv"
+    )
+    out_path = os.path.join(output_dir, fname)
 
-    if not os.path.exists(os.path.join(output_dir, fname)): 
-        rows = []
-        for window_start, window_end in iter_windows(start_date, end_date, window_type):
-            for seconds_interval in seconds_intervals:
-                result = analyze_window(
-                    window_start,
-                    window_end,
-                    seconds_interval,
-                    kernel_half_width=kernel_half_width,
-                    trim_quantile=trim_quantile,
-                    n_bins=n_bins,
-                    weight_threshold=weight_threshold,
-                    detrend=detrend,
-                    min_barrier_fraction=min_barrier_fraction,
-                    min_well_separation=min_well_separation,
-                )
-                if result is None:
-                    rows.append({
-                        'window_start': window_start.strftime('%Y-%m-%d'),
-                        'window_end': window_end.strftime('%Y-%m-%d'),
-                        'seconds_interval': seconds_interval,
-                        'regime': 'unavailable',
-                        'n_wells': None,
-                        'well_locations': None,
-                        'barriers': None,
-                        'n_observations': 0,
-                    })
-                    continue
+    # Fast path: exact output file already on disk
+    if os.path.exists(out_path):
+        console.print(f'[green]Labels CSV already exists:[/green] {fname} — loading from disk.')
+        return pd.read_csv(out_path)
+
+    # Partial cache: collect rows already computed in other files
+    cached_df, covered_windows = _load_cached_windows(
+        output_dir, window_type, start_date, end_date, seconds_intervals
+    )
+
+    all_windows = list(iter_windows(start_date, end_date, window_type))
+    missing_windows = [
+        (ws, we) for ws, we in all_windows
+        if (ws.strftime('%Y-%m-%d'), we.strftime('%Y-%m-%d')) not in covered_windows
+    ]
+
+    if covered_windows:
+        console.print(
+            f'[green]Partial cache:[/green] {len(covered_windows)} window(s) reused from existing files, '
+            f'[yellow]{len(missing_windows)}[/yellow] window(s) to compute.'
+        )
+
+    km_dir = os.path.join(output_dir, 'km')
+    os.makedirs(km_dir, exist_ok=True)
+
+    rows = []
+    for window_start, window_end in missing_windows:
+        for seconds_interval in seconds_intervals:
+            result = analyze_window(
+                window_start,
+                window_end,
+                seconds_interval,
+                kernel_half_width=kernel_half_width,
+                trim_quantile=trim_quantile,
+                n_bins=n_bins,
+                weight_threshold=weight_threshold,
+                detrend=detrend,
+                min_barrier_fraction=min_barrier_fraction,
+                min_well_separation=min_well_separation,
+            )
+            if result is None:
                 rows.append({
-                    'window_start': result['window_start'].strftime('%Y-%m-%d'),
-                    'window_end': result['window_end'].strftime('%Y-%m-%d'),
-                    'seconds_interval': result['seconds_interval'],
-                    'regime': result['regime'],
-                    'n_wells': result['n_wells'],
-                    'well_locations': [round(x, 6) for x in result['well_locations']],
-                    'barriers': [round(b, 6) for b in result['barriers']],
-                    'u_range': result['u_range'],
-                    'n_observations': result['n_observations'],
+                    'window_start': window_start.strftime('%Y-%m-%d'),
+                    'window_end': window_end.strftime('%Y-%m-%d'),
+                    'seconds_interval': seconds_interval,
+                    'regime': 'unavailable',
+                    'n_wells': None,
+                    'well_locations': None,
+                    'barriers': None,
+                    'n_observations': 0,
                 })
-        out_df = pd.DataFrame(rows)
-        out_df.to_csv(os.path.join(output_dir, fname), index=False)        
-    else: 
-        print(f"Labels CSV already exists at {os.path.join(output_dir, fname)}, loading from disk.")
-        rows = pd.read_csv(os.path.join(output_dir, fname)).to_dict(orient='records')   
-        out_df = pd.DataFrame(rows)
+                continue
+            km_path = os.path.join(
+                km_dir,
+                f"km_{result['window_start'].strftime('%Y-%m-%d')}_to_"
+                f"{result['window_end'].strftime('%Y-%m-%d')}_{seconds_interval}s.csv",
+            )
+            result['km_df'].to_csv(km_path, index=False)
+            rows.append({
+                'window_start': result['window_start'].strftime('%Y-%m-%d'),
+                'window_end': result['window_end'].strftime('%Y-%m-%d'),
+                'seconds_interval': result['seconds_interval'],
+                'regime': result['regime'],
+                'n_wells': result['n_wells'],
+                'well_locations': [round(x, 6) for x in result['well_locations']],
+                'barriers': [round(b, 6) for b in result['barriers']],
+                'u_range': result['u_range'],
+                'n_observations': result['n_observations'],
+            })
 
+    # Merge cached and newly computed rows
+    parts = []
+    if not cached_df.empty:
+        parts.append(cached_df)
+    if rows:
+        parts.append(pd.DataFrame(rows))
+
+    out_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+    # Deduplicate (prefer cached rows) and sort chronologically
+    out_df = out_df.drop_duplicates(
+        subset=['window_start', 'window_end', 'seconds_interval'], keep='first'
+    )
+    out_df = out_df.sort_values(
+        ['window_start', 'seconds_interval']
+    ).reset_index(drop=True)
+     out_df.to_csv(out_path, index=False)
     return out_df
 
 

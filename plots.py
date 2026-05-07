@@ -249,5 +249,62 @@ def plot_mc_timeline(
     print(f'Saved {output_path}')
 
 
+def plot_phase_c_gamma_timeline(gamma, output_path, datetimes=None):
+    """
+    Smoothed double-well probability gamma_t over the full series.
+    """
+    fig, ax = plt.subplots(figsize=(12, 4))
+    if datetimes is not None:
+        ax.plot(datetimes, gamma[:, 1], color='#F44336', lw=0.6)
+        ax.set_xlabel('time')
+    else:
+        ax.plot(gamma[:, 1], color='#F44336', lw=0.6)
+        ax.set_xlabel('step index')
+    ax.set_ylim(0, 1)
+    ax.set_ylabel(r'$\gamma_t$(double-well)')
+    ax.set_title('Phase C — smoothed regime probability')
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+    print(f'Saved {output_path}')
+
+
+def plot_phase_c_drifts(x_prev, theta, output_path):
+    """
+    Fitted parametric drifts mu_1 (OU) and mu_2 (cubic) on a common x grid,
+    plus a histogram of x_prev for context.
+    """
+    x_lo, x_hi = float(np.min(x_prev)), float(np.max(x_prev))
+    x_grid = np.linspace(x_lo, x_hi, 400)
+    mu1 = -theta['kappa'] * (x_grid - theta['m'])
+    u = x_grid - theta['c']
+    mu2 = -theta['alpha'] * u ** 3 + theta['beta'] * u
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(10, 7), sharex=True,
+        gridspec_kw={'height_ratios': [3, 1]},
+    )
+    ax1.plot(x_grid, mu1, color='#2196F3',
+             label=r'state 0  $-\kappa(x-m)$')
+    ax1.plot(x_grid, mu2, color='#F44336',
+             label=r'state 1  $-\alpha(x-c)^3+\beta(x-c)$')
+    ax1.axhline(0, color='gray', alpha=0.4, lw=0.5)
+    ax1.set_ylabel('drift')
+    ax1.set_title('Phase C — fitted parametric drifts')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    ax2.hist(x_prev, bins=80, color='gray', alpha=0.6)
+    ax2.set_ylabel('counts')
+    ax2.set_xlabel('log-price x')
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+    print(f'Saved {output_path}')
+
+
 if __name__ == '__main__':
     print('This module expects precomputed KM results to be passed in from main.')
