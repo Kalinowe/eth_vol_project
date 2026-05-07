@@ -77,6 +77,61 @@ def iter_windows(start_date, end_date, window_type='monthly'):
         raise ValueError(f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'.")
 
 
+def normalize_window_boundaries(
+    start_date: datetime,
+    end_date: datetime,
+    window_type: str,
+    console=None,
+) -> tuple[datetime, datetime]:
+    """
+    Snap start_date and end_date to exact window boundaries so that every
+    window yielded by iter_windows is complete.
+
+      weekly   : start → preceding Monday (inclusive), end → following Sunday
+      biweekly : start → preceding Monday, end → the Sunday that closes the
+                 biweekly cycle containing end_date (counting from snapped start)
+      monthly  : start → 1st of the month, end → last day of the month
+
+    Prints a notice when either date is adjusted.
+    """
+    orig_start, orig_end = start_date, end_date
+
+    if window_type in ('weekly', 'biweekly'):
+        # floor start to Monday (weekday() == 0)
+        start_date = start_date - timedelta(days=start_date.weekday())
+        if window_type == 'weekly':
+            # ceil end to Sunday (weekday() == 6)
+            end_date = end_date + timedelta(days=(6 - end_date.weekday()) % 7)
+        else:
+            # ceil end to the Sunday that closes the biweekly period from snapped start
+            days_span = (end_date - start_date).days + 1
+            n_windows = (days_span + 13) // 14   # ceiling division
+            end_date = start_date + timedelta(days=14 * n_windows - 1)
+    elif window_type == 'monthly':
+        start_date = start_date.replace(day=1)
+        if end_date.month == 12:
+            end_date = datetime(end_date.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end_date = datetime(end_date.year, end_date.month + 1, 1) - timedelta(days=1)
+    else:
+        raise ValueError(
+            f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'."
+        )
+
+    if start_date != orig_start or end_date != orig_end:
+        _console = console or Console()
+        parts = []
+        if start_date != orig_start:
+            parts.append(f"start [cyan]{orig_start.date()}[/cyan] → [cyan]{start_date.date()}[/cyan]")
+        if end_date != orig_end:
+            parts.append(f"end [cyan]{orig_end.date()}[/cyan] → [cyan]{end_date.date()}[/cyan]")
+        _console.print(
+            f"[yellow]Window boundary correction ({window_type}):[/yellow] " + "  |  ".join(parts)
+        )
+
+    return start_date, end_date
+
+
 # ---------------------------------------------------------------------------
 # Topological classifier
 # ---------------------------------------------------------------------------
@@ -294,17 +349,27 @@ def run_phase_a(
     min_well_separation=0.0,
     output_dir='regime_results',
     window_type='monthly',
+    console=None,
 ):
     """
     Loop over windows x sampling intervals and assemble a label table.
+
+    start_date and end_date are snapped to exact window boundaries before
+    execution (see normalize_window_boundaries).  A notice is printed when
+    either date is adjusted.
 
     Args:
         window_type: 'weekly', 'biweekly', or 'monthly' (default).
 
     Returns the assembled DataFrame and writes it to
-    `<output_dir>/regime_labels_<start>_to_<end>_<window_type>.csv`.
+    `<output_dir>/regime_labels_<snapped_start>_to_<snapped_end>_<window_type>.csv`.
     """
     os.makedirs(output_dir, exist_ok=True)
+    console = console or Console()
+
+    start_date, end_date = normalize_window_boundaries(
+        start_date, end_date, window_type, console=console
+    )
 
     rows = []
     for window_start, window_end in iter_windows(start_date, end_date, window_type):
@@ -406,6 +471,7 @@ if __name__ == '__main__':
     min_barrier_fraction = 0.1
     min_well_separation = 0.0
 
+    _console = Console()
     labels = run_phase_a(
         start_date,
         end_date,
@@ -418,6 +484,7 @@ if __name__ == '__main__':
         min_barrier_fraction=min_barrier_fraction,
         min_well_separation=min_well_separation,
         window_type=window_type,
+        console=_console,
     )
 
     print_regime_table(labels)
