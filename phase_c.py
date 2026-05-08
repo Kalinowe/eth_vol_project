@@ -35,12 +35,15 @@ Outputs (under output_dir):
 import glob
 import os
 import warnings
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
 from scipy.optimize import least_squares, minimize_scalar
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 import data_collection as dc
 import plots
@@ -67,6 +70,30 @@ def mu_double(x, alpha, beta, c):
 # Data loading
 # ---------------------------------------------------------------------------
 
+def _aggregated_returns_path(
+    start_date, end_date, seconds_interval,
+    kernel_half_width, trim_quantile, detrend,
+    data_dir='data',
+):
+    """Path of the cached aggregated-returns CSV per data_collection naming."""
+    def _to_dt(d):
+        if isinstance(d, str):
+            return datetime.strptime(d, '%Y-%m-%d')
+        return d
+
+    start_dt = _to_dt(start_date)
+    end_dt = _to_dt(end_date)
+    kernel_tag = f'_k{kernel_half_width}' if kernel_half_width > 0 else ''
+    trim_tag = f'_trim{trim_quantile}' if trim_quantile > 0 else ''
+    detrend_tag = '_detrended' if detrend else ''
+    return os.path.join(
+        data_dir,
+        f'ETHUSDT-aggReturns-{start_dt.strftime("%Y-%m-%d")}_to_'
+        f'{end_dt.strftime("%Y-%m-%d")}-{seconds_interval}sec'
+        f'{kernel_tag}{trim_tag}{detrend_tag}.csv',
+    )
+
+
 def load_series(
     start_date,
     end_date,
@@ -80,6 +107,9 @@ def load_series(
     interval and emit (x_prev, dx, dt, datetimes) with cross-gap increments
     dropped.
 
+    If a cached CSV matching the data_collection naming convention exists in
+    ./data, it is read directly; otherwise the aggregation is run.
+
     Returns
     -------
     x_prev    : (N,) log-price at t-1
@@ -87,14 +117,26 @@ def load_series(
     dt        : float, nominal step in seconds
     dt_t      : (N,) datetime of x_t (for plotting), aligned with dx
     """
-    df = dc.aggregate_log_returns_range(
-        start_date,
-        end_date,
-        seconds_interval,
-        kernel_half_width=kernel_half_width,
-        trim_quantile=trim_quantile,
-        detrend=detrend,
+    cached_path = _aggregated_returns_path(
+        start_date, end_date, seconds_interval,
+        kernel_half_width, trim_quantile, detrend,
     )
+    if os.path.exists(cached_path):
+        df = pd.read_csv(cached_path, parse_dates=['datetime'])
+        if df.empty:
+            df = dc.aggregate_log_returns_range(
+                start_date, end_date, seconds_interval,
+                kernel_half_width=kernel_half_width,
+                trim_quantile=trim_quantile,
+                detrend=detrend,
+            )
+    else:
+        df = dc.aggregate_log_returns_range(
+            start_date, end_date, seconds_interval,
+            kernel_half_width=kernel_half_width,
+            trim_quantile=trim_quantile,
+            detrend=detrend,
+        )
     if df.empty:
         raise ValueError('Empty aggregated returns dataframe.')
 
@@ -165,10 +207,14 @@ def pool_km_drift_curves(
     return x, mu
 
 
-def fit_initial_theta(labels_csv, seconds_interval, output_dir, console=None):
+def fit_initial_theta_from_km(labels_csv, seconds_interval, output_dir, console=None):
     """
     Fit OU and cubic drifts to pooled km drift curves. Falls back to heuristic
     defaults when no km files are available for one of the regimes.
+
+    Retained for comparison; the active initialiser is
+    ``fit_initial_theta_moments`` which fits to the Phase C observation pairs
+    directly and avoids the circular dependency on Phase A labels.
     """
     console = console or Console()
 
@@ -204,6 +250,64 @@ def fit_initial_theta(labels_csv, seconds_interval, output_dir, console=None):
 
     return {'kappa': float(kappa), 'm': float(m),
             'alpha': float(alpha), 'beta': float(beta), 'c': float(c)}
+
+
+def fit_initial_theta_moments(x_prev, dx, dt, console=None):
+    """
+    Initialise OU and cubic drift parameters directly from the Phase C
+    observation pairs (x_prev, dx/dt) using OLS + 2-means clustering.
+    No dependence on Phase A labels or KM curves.
+    """
+    console = console or Console()
+
+    r = dx / dt
+    N = len(r)
+    if N < 10:
+        warnings.warn(
+            f'Only {N} observation pairs available; falling back to defaults.'
+        )
+        return {'kappa': 1.0, 'm': float(np.mean(x_prev) if N else 0.0),
+                'alpha': 1.0, 'beta': 1.0, 'c': 0.0}
+
+    # Global OU fit -> state 0 init
+    slope, intercept = np.polyfit(x_prev, r, 1)
+    kappa_init = max(-slope, 1e-4)
+    if kappa_init > 0:
+        m_init = intercept / kappa_init
+    else:
+        m_init = float(np.mean(x_prev))
+
+    # K-means split on standardised (x_prev, r) -> state 1 candidate
+    Z = StandardScaler().fit_transform(np.column_stack([x_prev, r]))
+    labels = KMeans(n_clusters=2, random_state=0, n_init=10).fit_predict(Z)
+
+    r_hat = intercept + slope * x_prev
+    resid = np.abs(r - r_hat)
+    mean_resid = [resid[labels == k].mean() if (labels == k).any() else -np.inf
+                  for k in range(2)]
+    dw_cluster = int(np.argmax(mean_resid))
+    mask_dw = labels == dw_cluster
+
+    if mask_dw.sum() < 5:
+        warnings.warn(
+            'Double-well candidate cluster has <5 points; using cubic defaults.'
+        )
+        alpha_init, beta_init, c_init = 1.0, 1.0, float(np.mean(x_prev))
+    else:
+        c0 = float(np.mean(x_prev[mask_dw]))
+        alpha_init, beta_init, c_init = _wls_cubic(
+            x_prev[mask_dw], r[mask_dw],
+            w=np.ones(int(mask_dw.sum())),
+            theta_prev={'alpha': 1.0, 'beta': 1.0, 'c': c0},
+        )
+
+    return {
+        'kappa': float(kappa_init),
+        'm':     float(m_init),
+        'alpha': float(max(alpha_init, 1e-4)),
+        'beta':  float(beta_init),
+        'c':     float(c_init),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +545,80 @@ def run_em(
 
 
 # ---------------------------------------------------------------------------
+# Forward-looking diagnostics
+# ---------------------------------------------------------------------------
+
+def predict_k_steps(
+    p_filt: np.ndarray,
+    A: np.ndarray,
+    k_steps: list[int],
+) -> pd.DataFrame:
+    """
+    Compute k-step ahead regime probabilities for every time step t.
+
+        P(S_{t+k} = s | x_{1:t}) = [p_filt[t] @ A^k]_s
+
+    Returns a long-format DataFrame with columns
+    ['t', 'k', 'p_single_ahead', 'p_double_ahead'].
+    """
+    from numpy.linalg import matrix_power
+    rows = []
+    T = len(p_filt)
+    for k in k_steps:
+        Ak = matrix_power(A, int(k))
+        p_ahead = p_filt @ Ak
+        for t in range(T):
+            rows.append({
+                't': int(t),
+                'k': int(k),
+                'p_single_ahead': float(p_ahead[t, 0]),
+                'p_double_ahead': float(p_ahead[t, 1]),
+            })
+    return pd.DataFrame(rows)
+
+
+def estimate_kappa_series(
+    x_prev: np.ndarray,
+    dx: np.ndarray,
+    dt: float,
+    dt_t: np.ndarray,
+    window_size: int = 2000,
+    step: int = 200,
+) -> pd.DataFrame:
+    """
+    Estimate the OU mean-reversion rate kappa in a rolling window over the
+    Phase C observation pairs (x_prev, dx). A declining kappa(t) is the
+    critical-slowing-down signature that precedes a single->multi-well
+    transition.
+
+    Uses OLS of (dx/dt) on x_prev per window: intercept gives kappa*m,
+    slope gives -kappa.
+    """
+    r = dx / dt
+    T = len(r)
+    if T <= window_size:
+        return pd.DataFrame(columns=['datetime', 'kappa', 'kappa_m', 'n_obs'])
+
+    rows = []
+    idx = np.arange(0, T - window_size, step)
+    for i in idx:
+        sl = slice(i, i + window_size)
+        slope, intercept = np.polyfit(x_prev[sl], r[sl], 1)
+        kappa = max(-slope, 0.0)
+        if kappa > 1e-9:
+            m = intercept / kappa
+        else:
+            m = float(np.mean(x_prev[sl]))
+        rows.append({
+            'datetime': pd.Timestamp(dt_t[i + window_size // 2]),
+            'kappa': float(kappa),
+            'kappa_m': float(m),
+            'n_obs': int(window_size),
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Phase C entry point
 # ---------------------------------------------------------------------------
 
@@ -490,9 +668,7 @@ def run_phase_c(
         sigma2 = float(np.var(dx) / dt)
     console.print(f'  sigma^2 (held fixed) = {sigma2:.4e}')
 
-    theta = fit_initial_theta(
-        labels_csv, seconds_interval, output_dir, console=console,
-    )
+    theta = fit_initial_theta_moments(x_prev, dx, dt, console=console)
     console.print(
         f'  initial theta: kappa={theta["kappa"]:.4g}  m={theta["m"]:.4g}  '
         f'alpha={theta["alpha"]:.4g}  beta={theta["beta"]:.4g}  c={theta["c"]:.4g}'
@@ -556,6 +732,29 @@ def run_phase_c(
         os.path.join(output_dir, f'{stem}_drifts.png'),
     )
 
+    # k-step ahead regime forecast
+    k_steps = [1, 5, 20, 60]
+    df_forecast = predict_k_steps(out['p_filt'], out['P'], k_steps)
+    forecast_path = os.path.join(output_dir, f'{stem}_forecast.csv')
+    df_forecast.to_csv(forecast_path, index=False)
+    console.print(f'[green]Wrote[/green] {forecast_path}')
+
+    # rolling kappa(t) — critical-slowing-down signal
+    df_kappa = estimate_kappa_series(x_prev, dx, float(dt), dt_t)
+    kappa_path = os.path.join(output_dir, f'{stem}_kappa.csv')
+    df_kappa.to_csv(kappa_path, index=False)
+    console.print(f'[green]Wrote[/green] {kappa_path}')
+
+    if not df_kappa.empty:
+        plots.plot_kappa_series(
+            df_kappa, os.path.join(output_dir, f'{stem}_kappa.png'),
+        )
+    plots.plot_forecast(
+        df_forecast,
+        os.path.join(output_dir, f'{stem}_forecast_k5.png'),
+        k=5,
+    )
+
     summary = Table(title='Phase C — Final parameters')
     summary.add_column('Parameter', style='cyan')
     summary.add_column('Value', justify='right', style='green')
@@ -578,7 +777,11 @@ def run_phase_c(
         counts.add_row(s_from, *[f'{xi_sum[i, j]:.2f}' for j in range(2)])
     console.print(counts)
 
-    return out
+    return {
+        **out,
+        'df_forecast': df_forecast,
+        'df_kappa': df_kappa,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -607,11 +810,11 @@ if __name__ == '__main__':
     # mc = run_markov_chain(labels_csv, seconds_interval=seconds_interval)
     # pi_init = mc['pi'] if mc else None
     pi_init = None
-
+  
     run_phase_c(
         start_date, end_date, seconds_interval,
         labels_csv=labels_csv,
-        pi_init=pi_init,
+        pi_init=pi_init,   
         max_iter=30,
         tol=1e-4,
         console=_console,

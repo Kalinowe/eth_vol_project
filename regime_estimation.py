@@ -16,9 +16,14 @@ import glob
 import os
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
+from scipy.integrate import cumulative_trapezoid
+from scipy.signal import argrelmin
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
 import data_collection as dc
 from force_field_estimation import estimate_km, integrate_drift_to_potential
@@ -137,93 +142,21 @@ def normalize_window_boundaries(
 # Topological classifier
 # ---------------------------------------------------------------------------
 
-def classify_potential_topology(
-    km_result_df,
-    min_barrier_fraction=0.1,
-    min_well_separation=0.0,
-    annualize_drift=True,
-):
+def _greedy_well_filter(x, U, threshold, min_well_separation):
     """
-    Classify the topology of the potential U(x) estimated from KM coefficients.
-
-    Strategy: integrate the drift to get U(x), find all local minima, then keep
-    only those whose barrier height is >= min_barrier_fraction × total U range.
-    Working on the integrated potential is more robust than detecting zero
-    crossings of the raw drift, because integration smooths bin-level noise.
-
-    Args:
-        km_result_df: output of estimate_km — columns
-            ['bin_center', 'drift', 'diffusion', 'weight'].
-        min_barrier_fraction: a candidate well is kept only if the U-barrier
-            separating it from the nearest kept well is at least this fraction
-            of the full potential range. Default 0.1 (10%). Increase toward
-            0.2–0.3 to suppress minor wiggles; set to 0 to keep every minimum.
-        min_well_separation: additional filter — drop a well if it is closer
-            than this many log-price units to the previously kept well.
-        annualize_drift: if True, multiply drift by seconds-per-year before
-            integrating. The topology is unchanged, but barrier heights and
-            potential range are in annualised units that are easier to reason
-            about (same scale as the drift plots in main.py).
-
-    Returns:
-        dict with keys:
-            n_wells          -- count of stable wells after filtering
-            well_locations   -- list of x positions of local U minima
-            barriers         -- list of U-barriers between adjacent wells
-                                (length n_wells - 1)
-            u_range          -- total potential range (max - min of U)
-            regime           -- 'no-equilibrium' | 'single-well' |
-                                'double-well' | '<n>-well'
+    Apply the legacy argrelmin + barrier-height greedy filter to a single
+    potential curve. Returns (kept_idx, barriers) — barriers measured between
+    consecutive kept minima.
     """
-    from scipy.signal import argrelmin
-
-    df = km_result_df.dropna(subset=['drift']).reset_index(drop=True)
-    if len(df) < 5:
-        return {
-            'n_wells': 0, 'well_locations': [], 'barriers': [],
-            'u_range': 0.0, 'regime': 'no-equilibrium',
-        }
-
-    km_for_pot = df[['bin_center', 'drift']].copy()
-    if annualize_drift:
-        sec_per_year = 365.25 * 24 * 3600
-        km_for_pot['drift'] = km_for_pot['drift'] * sec_per_year
-
-    pot_df = integrate_drift_to_potential(km_for_pot)
-    x = pot_df['bin_center'].values
-    U = pot_df['potential'].values
-    # Shift so global minimum = 0
-    U = U - U.min()
-    u_range = float(U.max())
-
-    if u_range == 0:
-        return {
-            'n_wells': 0, 'well_locations': [], 'barriers': [],
-            'u_range': 0.0, 'regime': 'no-equilibrium',
-        }
-
-    threshold = min_barrier_fraction * u_range
-
-    # Local minima of U: point must be smaller than neighbours within `order` bins.
-    # order=5 means a minimum must be lower than 5 bins on each side; this already
-    # rejects very narrow wiggles without needing extra smoothing.
     min_idx = argrelmin(U, order=5)[0]
-
     if len(min_idx) == 0:
-        return {
-            'n_wells': 0, 'well_locations': [], 'barriers': [],
-            'u_range': round(u_range, 4), 'regime': 'no-equilibrium',
-        }
+        return [], []
 
-    # For each pair of consecutive candidate minima, compute the barrier height
-    # (max U between them minus the higher of the two minima values).
     def barrier_between_indices(ia, ib):
         lo, hi = min(ia, ib), max(ia, ib)
         U_peak = U[lo:hi + 1].max()
         return float(U_peak - max(U[ia], U[ib]))
 
-    # Greedy filter: accept the first minimum, then accept subsequent ones
-    # only if they clear both the barrier and separation thresholds.
     kept_idx = [min_idx[0]]
     for idx in min_idx[1:]:
         bh = barrier_between_indices(kept_idx[-1], idx)
@@ -232,24 +165,135 @@ def classify_potential_topology(
             kept_idx.append(idx)
 
     barriers = [
-        round(barrier_between_indices(kept_idx[i], kept_idx[i + 1]), 6)
+        barrier_between_indices(kept_idx[i], kept_idx[i + 1])
         for i in range(len(kept_idx) - 1)
     ]
-    well_locations = [float(x[i]) for i in kept_idx]
+    return kept_idx, barriers
 
-    n = len(kept_idx)
-    if n == 0:
-        regime = 'no-equilibrium'
-    elif n == 1:
+
+def classify_potential_topology(
+    km_result_df,
+    min_barrier_fraction=0.1,
+    min_well_separation=0.0,
+    annualize_drift=True,
+    n_restarts=3,
+    weight_threshold=5,
+    n_samples=200,
+    n_grid=300,
+    random_state=0,
+):
+    """
+    Classify the topology of U(x) by fitting a Gaussian process to the
+    Kramers–Moyal drift estimate and integrating posterior drift samples
+    into potential samples. Counting wells per posterior sample yields
+    P(n_wells >= 2 | data), so windows near the topological transition
+    receive a continuous probability rather than a hard label.
+
+    Returns the same keys as the previous version plus:
+        p_multiwell  -- P(n_wells >= 2 | data), used downstream as eta weight.
+    well_locations and barriers are computed from the *posterior mean*
+    potential rather than a single noisy estimate. n_wells is the posterior
+    mean well count (a float).
+
+    Args:
+        km_result_df: output of estimate_km — columns
+            ['bin_center', 'drift', 'diffusion', 'weight'].
+        weight_threshold: bin count threshold matching estimate_km; used to
+            scale per-bin GP noise as alpha = weight_threshold / weights
+            (capped at 10.0 for numerical stability in tail bins).
+    """
+    df = km_result_df.dropna(subset=['drift']).reset_index(drop=True)
+    if len(df) < 5:
+        return {
+            'n_wells': 0.0, 'p_multiwell': 0.0,
+            'well_locations': [], 'barriers': [],
+            'u_range': 0.0, 'regime': 'no-equilibrium',
+        }
+
+    sec_per_year = 365.25 * 24 * 3600
+    x = df['bin_center'].values.astype(float)
+    f = df['drift'].values.astype(float)
+    if annualize_drift:
+        f = f * sec_per_year
+
+    # Per-bin noise variance: bins with low counts get larger alpha. The
+    # weight column survives the dropna above because we only filtered on
+    # 'drift' (NaN where weight <= weight_threshold in estimate_km).
+    weights = df['weight'].values.astype(float)
+    weights = np.maximum(weights, 1.0)
+    alpha = np.minimum(weight_threshold / weights, 10.0)
+
+    x_std = float(np.std(x)) if np.std(x) > 0 else 1.0
+    kernel = (
+        RBF(length_scale=x_std * 0.3, length_scale_bounds=(1e-3, 10.0))
+        + WhiteKernel(noise_level=1.0)
+    )
+    gp = GaussianProcessRegressor(
+        kernel=kernel,
+        alpha=alpha,
+        n_restarts_optimizer=n_restarts,
+        normalize_y=True,
+    )
+    gp.fit(x.reshape(-1, 1), f)
+
+    x_grid = np.linspace(x.min(), x.max(), n_grid)
+    f_samples = gp.sample_y(
+        x_grid.reshape(-1, 1), n_samples=n_samples, random_state=random_state,
+    )  # shape (n_grid, n_samples)
+
+    # Integrate each drift sample into a potential and count wells.
+    # cumulative_trapezoid returns (n_grid - 1,); prepend 0 to align with x_grid.
+    U_samples = -cumulative_trapezoid(f_samples, x_grid, axis=0, initial=0.0)
+    U_samples = U_samples - U_samples.min(axis=0, keepdims=True)
+
+    # Posterior mean potential, used for representative well_locations / barriers.
+    U_mean = U_samples.mean(axis=1)
+    U_mean = U_mean - U_mean.min()
+    u_range_mean = float(U_mean.max())
+
+    # Per-sample well counts using the legacy filter.
+    n_wells_samples = np.empty(n_samples, dtype=int)
+    for j in range(n_samples):
+        U_j = U_samples[:, j]
+        u_range_j = float(U_j.max())
+        if u_range_j == 0.0:
+            n_wells_samples[j] = 0
+            continue
+        thr_j = min_barrier_fraction * u_range_j
+        kept_idx, _ = _greedy_well_filter(x_grid, U_j, thr_j, min_well_separation)
+        n_wells_samples[j] = len(kept_idx)
+
+    p_multiwell = float(np.mean(n_wells_samples >= 2))
+    mean_n_wells = float(np.mean(n_wells_samples))
+
+    if mean_n_wells < 1.3:
         regime = 'single-well'
+    elif mean_n_wells < 1.7:
+        regime = 'uncertain'
     else:
         regime = 'multi-well'
 
+    if u_range_mean == 0.0:
+        return {
+            'n_wells': round(mean_n_wells, 2),
+            'p_multiwell': round(p_multiwell, 4),
+            'well_locations': [], 'barriers': [],
+            'u_range': 0.0, 'regime': regime,
+        }
+
+    threshold_mean = min_barrier_fraction * u_range_mean
+    kept_idx_mean, barriers_mean = _greedy_well_filter(
+        x_grid, U_mean, threshold_mean, min_well_separation,
+    )
+    well_locations = [float(x_grid[i]) for i in kept_idx_mean]
+    barriers = [round(b, 6) for b in barriers_mean]
+
     return {
-        'n_wells': n,
+        'n_wells': round(mean_n_wells, 2),
+        'p_multiwell': round(p_multiwell, 4),
         'well_locations': well_locations,
         'barriers': barriers,
-        'u_range': round(u_range, 4),
+        'u_range': round(u_range_mean, 4),
         'regime': regime,
     }
 
@@ -321,6 +365,7 @@ def analyze_window(
         km_df,
         min_barrier_fraction=min_barrier_fraction,
         min_well_separation=min_well_separation,
+        weight_threshold=weight_threshold,
     )
 
     return {
@@ -482,6 +527,7 @@ def run_phase_a(
                     'seconds_interval': seconds_interval,
                     'regime': 'unavailable',
                     'n_wells': None,
+                    'p_multiwell': None,
                     'well_locations': None,
                     'barriers': None,
                     'n_observations': 0,
@@ -499,6 +545,7 @@ def run_phase_a(
                 'seconds_interval': result['seconds_interval'],
                 'regime': result['regime'],
                 'n_wells': result['n_wells'],
+                'p_multiwell': result.get('p_multiwell', np.nan),
                 'well_locations': [round(x, 6) for x in result['well_locations']],
                 'barriers': [round(b, 6) for b in result['barriers']],
                 'u_range': result['u_range'],
@@ -521,7 +568,7 @@ def run_phase_a(
     out_df = out_df.sort_values(
         ['window_start', 'seconds_interval']
     ).reset_index(drop=True)
-     out_df.to_csv(out_path, index=False)
+    out_df.to_csv(out_path, index=False)
     return out_df
 
 
@@ -533,18 +580,32 @@ def print_regime_table(labels_df, console=None):
     table.add_column(u'Δt (s)', justify='right')
     table.add_column('Regime', style='green')
     table.add_column('Wells', justify='right', style='magenta')
+    table.add_column('P(multi)', justify='right', style='magenta')
     table.add_column('U range (ann.)', justify='right', style='yellow')
     table.add_column('Barriers', style='yellow')
     table.add_column('# obs', justify='right')
 
+    has_pmulti = 'p_multiwell' in labels_df.columns
+
     for _, r in labels_df.iterrows():
         u_range_str = f"{r['u_range']:.2f}" if pd.notna(r.get('u_range')) else ''
+        n_wells_val = r['n_wells']
+        if pd.isna(n_wells_val):
+            n_wells_str = ''
+        else:
+            # n_wells is now a float (posterior mean); show one decimal.
+            n_wells_str = f'{float(n_wells_val):.1f}'
+        if has_pmulti and pd.notna(r.get('p_multiwell')):
+            pmulti_str = f"{float(r['p_multiwell']):.2f}"
+        else:
+            pmulti_str = ''
         table.add_row(
             str(r['window_start']),
             str(r['window_end']),
             str(r['seconds_interval']),
             str(r['regime']),
-            '' if pd.isna(r['n_wells']) else str(int(r['n_wells'])),
+            n_wells_str,
+            pmulti_str,
             u_range_str,
             str(r['barriers']) if r['barriers'] is not None else '',
             str(r['n_observations']),

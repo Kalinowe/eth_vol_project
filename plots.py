@@ -306,5 +306,99 @@ def plot_phase_c_drifts(x_prev, theta, output_path):
     print(f'Saved {output_path}')
 
 
+def plot_kappa_series(df_kappa: pd.DataFrame, output_path: str) -> None:
+    """
+    Line chart of kappa vs datetime with a horizontal dashed reference line
+    at the median kappa across the series.
+    """
+    if df_kappa.empty:
+        print(f'[plot_kappa_series] empty DataFrame; skipping {output_path}')
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(df_kappa['datetime'], df_kappa['kappa'],
+            color='#2196F3', lw=1.0, label=r'$\kappa(t)$')
+    median_k = float(np.nanmedian(df_kappa['kappa']))
+    ax.axhline(median_k, color='gray', ls='--', lw=0.9,
+               label=f'median = {median_k:.3g}')
+    ax.set_xlabel('Date')
+    ax.set_ylabel(r'$\kappa$ (mean-reversion rate)')
+    ax.set_title(r'Phase C — rolling $\kappa(t)$ (critical-slowing-down signal)')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='best', fontsize=9)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+    print(f'Saved {output_path}')
+
+
+def plot_forecast(df_forecast: pd.DataFrame, output_path: str, k: int = 5) -> None:
+    """
+    Line chart of P(double-well | x_{1:t}) at horizon k vs t, with a 0.5
+    reference line.
+    """
+    sub = df_forecast[df_forecast['k'] == k]
+    if sub.empty:
+        print(f'[plot_forecast] no rows for k={k}; skipping {output_path}')
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(sub['t'], sub['p_double_ahead'], color='#F44336', lw=0.7)
+    ax.axhline(0.5, color='gray', ls='--', lw=0.9)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel('t (step index)')
+    ax.set_ylabel('P(double-well ahead)')
+    ax.set_title(f'P(double-well | x_{{1:t}}), k={k} steps ahead')
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+    print(f'Saved {output_path}')
+
+
+def plot_mcmc_kappa_posterior(kappa_samples, kappa_em, output_path):
+    """
+    Histogram of posterior kappa samples with a vertical line at the EM
+    point estimate for comparison.
+    """
+    fig, ax = plt.subplots(figsize=(7, 3))
+    ax.hist(kappa_samples, bins=40, density=True, alpha=0.7,
+            color='#2196F3', label='Posterior')
+    ax.axvline(kappa_em, color='#F44336', linewidth=1.5,
+               linestyle='--', label=f'EM estimate ({kappa_em:.4g})')
+    ax.set_xlabel(r'$\kappa$ (mean-reversion rate)')
+    ax.set_ylabel('Density')
+    ax.set_title(r'Posterior distribution of $\kappa$')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f'Saved {output_path}')
+
+
+def plot_mcmc_loglik_trace(chain_loglik, n_burn, output_path):
+    """
+    Log-likelihood trace across all MCMC sweeps with burn-in shaded separately.
+    """
+    fig, ax = plt.subplots(figsize=(9, 3))
+    iters = np.arange(len(chain_loglik))
+    ax.plot(iters[:n_burn], chain_loglik[:n_burn],
+            color='gray', alpha=0.6, linewidth=0.8, label='Burn-in')
+    ax.plot(iters[n_burn:], chain_loglik[n_burn:],
+            color='#2196F3', linewidth=0.8, label='Sampling')
+    ax.axvline(n_burn, color='black', linewidth=0.8, linestyle=':')
+    ax.set_xlabel('Sweep')
+    ax.set_ylabel('Log-likelihood')
+    ax.set_title('MCMC log-likelihood trace')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f'Saved {output_path}')
+
+
 if __name__ == '__main__':
     print('This module expects precomputed KM results to be passed in from main.')

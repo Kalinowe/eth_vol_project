@@ -181,6 +181,23 @@ def mle_transition_matrix(N: np.ndarray) -> np.ndarray:
     return A
 
 
+def map_transition_matrix(N: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """
+    Posterior mean of each row of the transition matrix under a
+    Dirichlet(alpha[s,:]) prior.
+
+        A_post[s, s'] = (N[s, s'] + alpha[s, s'])
+                        / sum_{s''} (N[s, s''] + alpha[s, s''])
+
+    With alpha = np.ones((K,K)) this is a uniform (add-one) prior.
+    With alpha = 1 + lambda_ * N_hist it is a Phase-B-informed prior.
+    Always produces a strictly positive, row-stochastic matrix.
+    """
+    numerator = N.astype(float) + np.asarray(alpha, dtype=float)
+    denominator = numerator.sum(axis=1, keepdims=True)
+    return numerator / denominator
+
+
 def stationary_distribution(A: np.ndarray) -> np.ndarray:
     """Left eigenvector of A for eigenvalue 1, normalised to sum to 1."""
     eigenvalues, eigenvectors = np.linalg.eig(A.T)
@@ -247,6 +264,8 @@ def print_results(
     residual: float,
     n_transitions: int,
     console: Console | None = None,
+    alpha: np.ndarray | None = None,
+    prior_lambda: float | None = None,
 ) -> None:
     console = console or Console()
 
@@ -264,7 +283,14 @@ def print_results(
         count_table.add_row(s_from, *[str(N[i, j]) for j in range(len(STATES))])
     console.print(count_table)
 
-    prob_table = Table(title='MLE Transition Matrix  A[i→j]')
+    if alpha is not None and not np.all(np.asarray(alpha) == 1.0):
+        lam_str = f'lambda={prior_lambda:.2f}' if prior_lambda is not None else ''
+        console.print(
+            '[yellow]Transition matrix is Dirichlet-regularised'
+            f' ({lam_str}). MLE would differ where counts are low.[/yellow]'
+        )
+
+    prob_table = Table(title='Posterior Transition Matrix  A[i→j]')
     prob_table.add_column('From \\ To', style='cyan')
     for s in STATES:
         prob_table.add_column(s, justify='right', style='green')
@@ -291,6 +317,7 @@ def save_results_csv(
     pi: np.ndarray,
     dwells: np.ndarray,
     output_path: str,
+    alpha: np.ndarray | None = None,
 ) -> None:
     rows = [
         {'from_state': STATES[i], 'to_state': STATES[j], 'A': A[i, j]}
@@ -307,6 +334,15 @@ def save_results_csv(
         pd.DataFrame(rows).to_csv(f, index=False)
         f.write('\n# stationary_distribution\n')
         df_summary.to_csv(f, index=False)
+        if alpha is not None:
+            prior_rows = [
+                {'from_state': STATES[i], 'to_state': STATES[j],
+                 'alpha': float(alpha[i, j])}
+                for i in range(len(STATES))
+                for j in range(len(STATES))
+            ]
+            f.write('\n# prior_counts\n')
+            pd.DataFrame(prior_rows).to_csv(f, index=False)
     print(f'Saved {output_path}')
 
 
@@ -319,6 +355,8 @@ def run_markov_chain(
     seconds_interval: int = 30,
     output_dir: str = 'regime_results',
     console: Console | None = None,
+    prior_counts: np.ndarray | None = None,
+    prior_lambda: float = 0.3,
 ) -> dict | None:
     """
     Fit and report an empirical Markov chain from the regime label sequence.
@@ -329,13 +367,19 @@ def run_markov_chain(
     seconds_interval : interval whose metadata (n_wells, barriers, etc.) is
                        attached to each window row; does not filter the vote
     output_dir       : directory for plots and CSV results
+    prior_counts     : optional (K,K) historical count matrix used to build a
+                       Phase-B-informed Dirichlet prior alpha = 1 + lambda*N_hist.
+                       When None, a uniform add-one prior is used.
+    prior_lambda     : strength of the historical prior. Ignored if
+                       prior_counts is None.
 
     Returns
     -------
-    dict with keys {N, A, pi, dwells, seq_df} or None if data is insufficient.
+    dict with keys {N, A, pi, dwells, seq_df, alpha} or None if data is
+    insufficient. A is the Dirichlet posterior mean, never exactly zero.
     seq_df has one row per window with regime, confidence, and metadata columns
     from seconds_interval.
-    Raises MarkovChainError if ergodicity / stationarity checks fail.
+    Raises MarkovChainError if irreducibility (on N) or stationarity checks fail.
     """
     os.makedirs(output_dir, exist_ok=True)
     console = console or Console()
@@ -365,16 +409,29 @@ def run_markov_chain(
         return None
 
     N = build_transition_counts(seq_df)
-    A = mle_transition_matrix(N)
+
+    # Irreducibility is a property of the empirical sequence; check before
+    # smoothing so that a degenerate run halts even with a Dirichlet prior.
+    K = len(STATES)
+    if prior_counts is not None:
+        alpha = np.ones((K, K)) + prior_lambda * np.asarray(prior_counts, dtype=float)
+    else:
+        alpha = np.ones((K, K))   # uniform add-one prior — eliminates zero entries
+    A = map_transition_matrix(N, alpha)
     pi = stationary_distribution(A)
     dwells = mean_dwell_times(A)
     residual = float(np.linalg.norm(pi @ A - pi, 1))
 
-    # Guard: raises MarkovChainError on failure — do this before any output
+    # Guard: raises MarkovChainError on failure — do this before any output.
+    # check_chain inspects N (not A) so the irreducibility test still bites
+    # even though A itself is regularised away from zero.
     check_chain(N, A, pi)
 
     n_transitions = int(N.sum())
-    print_results(N, A, pi, dwells, residual, n_transitions, console=console)
+    print_results(
+        N, A, pi, dwells, residual, n_transitions, console=console,
+        alpha=alpha, prior_lambda=prior_lambda if prior_counts is not None else None,
+    )
 
     stem = os.path.splitext(os.path.basename(labels_csv))[0]
     prefix = os.path.join(output_dir, f'mc_{stem}_{seconds_interval}s')
@@ -382,9 +439,10 @@ def run_markov_chain(
     plots.plot_mc_transition_heatmap(A, STATES, f'{prefix}_transition.png')
     plots.plot_mc_stationary(pi, dwells, STATES, COLORS, f'{prefix}_stationary.png')
     plots.plot_mc_timeline(seq_df, STATES, COLORS, STATE_IDX, f'{prefix}_timeline.png')
-    save_results_csv(A, pi, dwells, f'{prefix}_results.csv')
+    save_results_csv(A, pi, dwells, f'{prefix}_results.csv', alpha=alpha)
 
-    return {'N': N, 'A': A, 'pi': pi, 'dwells': dwells, 'seq_df': seq_df}
+    return {'N': N, 'A': A, 'pi': pi, 'dwells': dwells, 'seq_df': seq_df,
+            'alpha': alpha}
 
 
 # ---------------------------------------------------------------------------
