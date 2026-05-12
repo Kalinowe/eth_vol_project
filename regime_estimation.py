@@ -14,6 +14,7 @@ the static potential plot.
 
 import glob
 import os
+import warnings
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -22,6 +23,7 @@ from rich.console import Console
 from rich.table import Table
 from scipy.integrate import cumulative_trapezoid
 from scipy.signal import argrelmin
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
@@ -226,7 +228,7 @@ def classify_potential_topology(
     x_std = float(np.std(x)) if np.std(x) > 0 else 1.0
     kernel = (
         RBF(length_scale=x_std * 0.3, length_scale_bounds=(1e-3, 10.0))
-        + WhiteKernel(noise_level=1.0)
+        + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-10, 1e3))
     )
     gp = GaussianProcessRegressor(
         kernel=kernel,
@@ -234,7 +236,13 @@ def classify_potential_topology(
         n_restarts_optimizer=n_restarts,
         normalize_y=True,
     )
-    gp.fit(x.reshape(-1, 1), f)
+    # Widening the WhiteKernel bound above lets the optimiser drive
+    # noise_level very low when the per-bin alpha already absorbs the noise;
+    # any residual convergence warning is benign and suppressed here so the
+    # per-window console output stays clean.
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', ConvergenceWarning)
+        gp.fit(x.reshape(-1, 1), f)
 
     x_grid = np.linspace(x.min(), x.max(), n_grid)
     f_samples = gp.sample_y(
@@ -427,11 +435,11 @@ def _load_cached_windows(
     )
 
     # Rows from before p_multiwell was added are missing or NaN there —
-    # treat them as not covered so they get recomputed.
+    # drop them so freshly computed rows can take their place.
     if 'p_multiwell' not in cached_df.columns:
         cached_df['p_multiwell'] = np.nan
     valid_rows = cached_df[cached_df['p_multiwell'].notna()
-                           | (cached_df['regime'] == 'unavailable')]
+                           | (cached_df['regime'] == 'unavailable')].copy()
 
     intervals_set = set(seconds_intervals)
     covered = set()
@@ -439,7 +447,10 @@ def _load_cached_windows(
         if intervals_set.issubset(set(grp['seconds_interval'].values)):
             covered.add((ws, we))
 
-    return cached_df, covered
+    # Return only valid rows; otherwise the downstream drop_duplicates
+    # (keep='first') would shadow freshly computed p_multiwell values with
+    # stale NaN ones from older CSVs.
+    return valid_rows, covered
 
 
 # ---------------------------------------------------------------------------
@@ -581,9 +592,10 @@ def run_phase_a(
 
     out_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
-    # Deduplicate (prefer cached rows) and sort chronologically
+    # Deduplicate; prefer freshly computed rows (keep='last') so a stale cache
+    # entry cannot shadow an updated p_multiwell or regime label.
     out_df = out_df.drop_duplicates(
-        subset=['window_start', 'window_end', 'seconds_interval'], keep='first'
+        subset=['window_start', 'window_end', 'seconds_interval'], keep='last'
     )
     out_df = out_df.sort_values(
         ['window_start', 'seconds_interval']
