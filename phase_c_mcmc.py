@@ -36,6 +36,7 @@ from scipy.stats import norm
 from phase_c import (
     EPS,
     STATES,
+    build_window_assignments,
     emission_log_b,
     load_series,
     mu_multi,
@@ -236,31 +237,7 @@ def augmented_log_b(x_prev, dx, dt, theta, sigma2,
     return log_b
 
 
-def build_window_assignments(dt_t, labels_df):
-    """
-    Assign each observation timestamp to the index of the Phase A window it
-    falls in. Observations outside all windows get -1 (uniform p_label).
-
-    Returns
-    -------
-    window_assignments : (T,) int array
-    p_label_pairs      : (W+1, 2) array; rows 0..W-1 are [1-p_mw, p_mw] per
-                         window, last row is the uniform default.
-    """
-    dt_series = pd.Series(pd.to_datetime(dt_t))
-    W = len(labels_df)
-    window_assignments = np.full(len(dt_t), -1, dtype=int)
-    for i, row in labels_df.iterrows():
-        mask = ((dt_series >= row['window_start'])
-                & (dt_series < row['window_end']))
-        window_assignments[mask.values] = i
-
-    p_mw = labels_df['p_multiwell'].fillna(0.5).to_numpy(dtype=float)
-    p_pairs = np.empty((W + 1, 2))
-    p_pairs[:W, 0] = 1.0 - p_mw
-    p_pairs[:W, 1] = p_mw
-    p_pairs[W] = [0.5, 0.5]
-    return window_assignments, p_pairs
+# build_window_assignments is imported from phase_c.
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +562,8 @@ def run_phase_c_mcmc(
     trim_quantile=0.01,
     detrend=0,
     seed=42,
-    output_dir='regime_results',
+    output_dir='phase_c_results',
+    phase_b_dir=None,
     use_chain_cache=True,
     console=None,
 ):
@@ -607,6 +585,11 @@ def run_phase_c_mcmc(
       use_chain_cache=True and the file is present.
     """
     os.makedirs(output_dir, exist_ok=True)
+    if phase_b_dir is None:
+        # Default: read/write Phase B artefacts next to the labels CSV so
+        # we don't duplicate the empirical Markov chain into phase_c_results.
+        phase_b_dir = os.path.dirname(labels_csv) or 'regime_results'
+    os.makedirs(phase_b_dir, exist_ok=True)
     console = console or Console()
     rng = np.random.default_rng(seed)
 
@@ -673,7 +656,7 @@ def run_phase_c_mcmc(
     # ------------------------------------------------------------------ #
     if N_phase_b is None:
         N_phase_b = _try_load_phase_b_counts(
-            labels_csv, seconds_interval, output_dir, lambda_prior, console,
+            labels_csv, seconds_interval, phase_b_dir, lambda_prior, console,
         )
         if N_phase_b is None:
             console.print(
@@ -682,7 +665,7 @@ def run_phase_c_mcmc(
             from markov_chain import run_markov_chain
             mc = run_markov_chain(
                 labels_csv, seconds_interval=seconds_interval,
-                output_dir=output_dir, console=console,
+                output_dir=phase_b_dir, console=console,
                 prior_lambda=lambda_prior,
             )
             if mc is None:
@@ -848,6 +831,23 @@ def run_phase_c_mcmc(
         f"[green]Acceptance rate (cubic MH): "
         f"{chain['acceptance_rate_cubic']:.2f}[/green]"
     )
+
+    # Time-share per state: posterior-mean filtered probability averaged over t,
+    # plus the share implied by the sampled state sequences.
+    pfilt_share = chain['p_filt_mean'].mean(axis=0)
+    chain_S = chain.get('chain_S')
+    if chain_S is not None:
+        S_share = np.array([(chain_S == s).mean() for s in range(len(STATES))])
+    else:
+        S_share = pfilt_share
+    from rich.table import Table as _Table
+    share = _Table(title='Phase C MCMC — Share of time in each state')
+    share.add_column('State', style='cyan')
+    share.add_column('Posterior p_filt', justify='right', style='green')
+    share.add_column('Sampled S', justify='right', style='yellow')
+    for i, s in enumerate(STATES):
+        share.add_row(s, f'{pfilt_share[i]:.4f}', f'{S_share[i]:.4f}')
+    console.print(share)
 
     return {**chain, 'summary': summary_df, 'df_forecast': df_forecast}
 

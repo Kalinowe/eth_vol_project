@@ -51,6 +51,7 @@ import plots
 
 STATES = ['single-well', 'multi-well']
 EPS = 1e-300
+PHASE_C_OUTPUT_DIR = 'phase_c_results'
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +329,81 @@ def emission_log_b(x_prev, dx, dt, theta, sigma2):
 
 
 # ---------------------------------------------------------------------------
+# GP label prior — soft emission tilt
+# ---------------------------------------------------------------------------
+
+def build_window_assignments(dt_t, labels_df):
+    """
+    Map each observation timestamp to the Phase A window index it falls in.
+    Observations outside all windows get -1 (uniform p_label).
+
+    Returns
+    -------
+    window_assignments : (T,) int array of window indices (or -1)
+    p_label_pairs      : (W+1, 2) of [1-p_mw, p_mw] per window;
+                         the last row is the uniform default [0.5, 0.5].
+    """
+    dt_series = pd.Series(pd.to_datetime(dt_t))
+    W = len(labels_df)
+    window_assignments = np.full(len(dt_t), -1, dtype=int)
+    for i, row in labels_df.iterrows():
+        mask = ((dt_series >= row['window_start'])
+                & (dt_series < row['window_end']))
+        window_assignments[mask.values] = i
+
+    p_mw = labels_df['p_multiwell'].fillna(0.5).to_numpy(dtype=float)
+    p_pairs = np.empty((W + 1, 2))
+    p_pairs[:W, 0] = 1.0 - p_mw
+    p_pairs[:W, 1] = p_mw
+    p_pairs[W] = [0.5, 0.5]
+    return window_assignments, p_pairs
+
+
+def augmented_log_b(log_b, window_assignments, p_label_pairs, eta=0.3):
+    """
+    Tilt emission log-likelihoods by the Phase A GP label likelihood:
+
+        log b_tilde_s(t) = log b_s(t) + eta * log p_label(s | window_t)
+
+    Window -1 (no Phase A coverage) maps to the uniform default row.
+    """
+    if eta == 0.0 or p_label_pairs is None:
+        return log_b
+    idx = window_assignments.copy()
+    n_w = p_label_pairs.shape[0] - 1   # last row is uniform default
+    idx = np.where(idx < 0, n_w, idx)
+    return log_b + eta * np.log(np.clip(p_label_pairs[idx], 1e-6, 1.0 - 1e-6))
+
+
+# ---------------------------------------------------------------------------
+# Dwell-time Dirichlet prior on the transition matrix
+# ---------------------------------------------------------------------------
+
+def build_dwell_alpha_prior(
+    n_observations: int,
+    dt_seconds: float,
+    target_dwell_seconds: float,
+    prior_strength: float,
+) -> np.ndarray:
+    """
+    Symmetric 2x2 Dirichlet pseudo-count matrix that pulls each row of P
+    toward (1 - dt/D, dt/D) where D = target_dwell_seconds.
+
+    Total prior mass per row is prior_strength * n_observations, so larger
+    prior_strength enforces the target dwell more strictly.
+
+    Returns alpha[i,j] with diag = N0*(1 - dt/D), off-diag = N0*(dt/D).
+    """
+    D_steps = max(target_dwell_seconds / dt_seconds, 1.0 + 1e-9)
+    p_off = 1.0 / D_steps
+    p_on = 1.0 - p_off
+    N0 = max(prior_strength * float(n_observations), 1.0)
+    alpha = np.array([[N0 * p_on, N0 * p_off],
+                      [N0 * p_off, N0 * p_on]], dtype=float)
+    return alpha
+
+
+# ---------------------------------------------------------------------------
 # Hamilton forward filter (scaled, log-space normaliser)
 # ---------------------------------------------------------------------------
 
@@ -470,8 +546,14 @@ def _wls_cubic(x, y, w, theta_prev):
     return float(max(alpha, 1e-9)), float(beta), c_opt
 
 
-def m_step(x_prev, dx, dt, gamma, xi, theta, sigma2):
-    """Update kappa, m, alpha, beta, c, P. sigma2 fixed."""
+def m_step(x_prev, dx, dt, gamma, xi, theta, sigma2, alpha_prior_P=None):
+    """
+    Update kappa, m, alpha, beta, c, P. sigma2 fixed.
+
+    alpha_prior_P : optional (2,2) Dirichlet pseudo-counts added to xi_sum
+                    before row normalisation. Lets us pull P toward a target
+                    mean dwell time without disturbing the SDE M-steps.
+    """
     rt = dx / dt
     w0 = gamma[:, 0]
     w1 = gamma[:, 1]
@@ -483,6 +565,8 @@ def m_step(x_prev, dx, dt, gamma, xi, theta, sigma2):
     new_alpha, new_beta, new_c = _wls_cubic(x_prev, rt, w1, theta)
 
     xi_sum = xi.sum(axis=0)
+    if alpha_prior_P is not None:
+        xi_sum = xi_sum + np.asarray(alpha_prior_P, dtype=float)
     row_sum = xi_sum.sum(axis=1, keepdims=True)
     safe = np.where(row_sum == 0, 1.0, row_sum)
     P_new = xi_sum / safe
@@ -504,13 +588,30 @@ def m_step(x_prev, dx, dt, gamma, xi, theta, sigma2):
 def run_em(
     x_prev, dx, dt, theta, P, pi0, sigma2,
     max_iter=50, tol=1e-4, console=None,
+    alpha_prior_P=None,
+    window_assignments=None, p_label_pairs=None, eta=0.0,
 ):
+    """
+    EM with optional Dirichlet prior on P (mean-dwell enforcement) and a
+    Phase A GP label tilt on the emission log-likelihood.
+
+    alpha_prior_P : (2,2) Dirichlet pseudo-counts added to xi_sum in M-step.
+    window_assignments, p_label_pairs, eta : if eta > 0, the emission
+        log-likelihoods are tilted by eta * log p_multiwell at each step,
+        pulling the smoothed gamma toward the GP prior within each window.
+    """
     console = console or Console()
     log_lik_trace = []
     prev_ll = -np.inf
 
+    def _emit(theta_):
+        lb = emission_log_b(x_prev, dx, dt, theta_, sigma2)
+        if eta > 0.0 and window_assignments is not None and p_label_pairs is not None:
+            lb = augmented_log_b(lb, window_assignments, p_label_pairs, eta=eta)
+        return lb
+
     for it in range(max_iter):
-        log_b = emission_log_b(x_prev, dx, dt, theta, sigma2)
+        log_b = _emit(theta)
         p_filt, log_lik, log_c = hamilton_filter(log_b, P, pi0)
         gamma, xi = kim_smoother(p_filt, log_b, log_c, P)
         log_lik_trace.append(log_lik)
@@ -527,11 +628,14 @@ def run_em(
         else:
             console.print(f'[cyan]EM iter {it:3d}[/cyan]  log-lik={log_lik:.6e}')
 
-        theta, P = m_step(x_prev, dx, dt, gamma, xi, theta, sigma2)
+        theta, P = m_step(
+            x_prev, dx, dt, gamma, xi, theta, sigma2,
+            alpha_prior_P=alpha_prior_P,
+        )
         prev_ll = log_lik
 
     # Final E-step with the most recent theta
-    log_b = emission_log_b(x_prev, dx, dt, theta, sigma2)
+    log_b = _emit(theta)
     p_filt, log_lik, log_c = hamilton_filter(log_b, P, pi0)
     gamma, xi = kim_smoother(p_filt, log_b, log_c, P)
     log_lik_trace.append(log_lik)
@@ -635,7 +739,10 @@ def run_phase_c(
     detrend=0,
     max_iter=50,
     tol=1e-4,
-    output_dir='regime_results',
+    output_dir=PHASE_C_OUTPUT_DIR,
+    target_dwell_seconds=7 * 86400.0,
+    dwell_prior_strength=10.0,
+    eta_label=0.3,
     console=None,
 ):
     """
@@ -643,14 +750,21 @@ def run_phase_c(
 
     Parameters
     ----------
-    labels_csv : path to a Phase A regime labels CSV (used only to find
-                 representative single-/multi-well windows whose km_df
-                 informs the parametric drift initialisation).
+    labels_csv : path to a Phase A regime labels CSV. Used for parametric
+                 drift initialisation AND for the GP-derived p_multiwell
+                 prior tilt on the emission likelihoods.
     pi_init    : (2,) initial-state prior. Default uniform [0.5, 0.5].
                  Pass markov_chain.run_markov_chain(...)['pi'] to use the
                  empirical stationary distribution.
     epsilon_P  : near-identity off-diagonal for the initial transition matrix.
     sigma2     : if None, estimated as var(dx)/dt and held fixed.
+    target_dwell_seconds : enforced mean dwell time (default 1 week). The
+                 M-step adds a Dirichlet prior on each row of P with
+                 P[i,i] ~ 1 - dt / target_dwell_seconds.
+    dwell_prior_strength : prior mass = strength * len(dx). Larger values
+                 pull P closer to the target dwell. Pass 0 to disable.
+    eta_label  : strength of the Phase A GP p_multiwell tilt on the
+                 emission log-likelihoods. Pass 0 to disable.
     """
     os.makedirs(output_dir, exist_ok=True)
     console = console or Console()
@@ -682,9 +796,57 @@ def run_phase_c(
     pi_init = np.asarray(pi_init, dtype=float)
     pi_init = pi_init / pi_init.sum()
 
+    # Dwell-time enforcement: Dirichlet prior on each row of P pulled toward
+    # 1 - dt/D, with D = target_dwell_seconds. Strength scales with series
+    # length so the prior holds its weight in long runs.
+    alpha_prior_P = None
+    if dwell_prior_strength > 0.0:
+        alpha_prior_P = build_dwell_alpha_prior(
+            n_observations=len(dx),
+            dt_seconds=float(dt),
+            target_dwell_seconds=float(target_dwell_seconds),
+            prior_strength=float(dwell_prior_strength),
+        )
+        target_p_off = dt / target_dwell_seconds
+        console.print(
+            f'  dwell prior: D_target={target_dwell_seconds:.0f}s '
+            f'(~{target_dwell_seconds / 86400:.1f}d), '
+            f'P[i,i]_target={1 - target_p_off:.6f}, '
+            f'mass={alpha_prior_P.sum():.3g}'
+        )
+
+    # GP label tilt: load Phase A windows (at this interval) and build
+    # per-observation p_multiwell vectors used to tilt the emission log-b.
+    window_assignments = None
+    p_label_pairs = None
+    if eta_label > 0.0 and os.path.exists(labels_csv):
+        labels_df = pd.read_csv(
+            labels_csv, parse_dates=['window_start', 'window_end'],
+        )
+        labels_df = labels_df[labels_df['seconds_interval'] == seconds_interval]
+        labels_df = labels_df.drop_duplicates('window_start').reset_index(drop=True)
+        if 'p_multiwell' not in labels_df.columns or labels_df.empty:
+            console.print(
+                '[yellow]Phase A labels lack p_multiwell — skipping GP tilt.'
+                '[/yellow]'
+            )
+        else:
+            window_assignments, p_label_pairs = build_window_assignments(
+                dt_t, labels_df,
+            )
+            covered = (window_assignments >= 0).mean()
+            console.print(
+                f'  GP label tilt: eta={eta_label}, '
+                f'{covered:.1%} of observations covered by a Phase A window.'
+            )
+
     out = run_em(
         x_prev, dx, dt, theta, P0, pi_init, sigma2,
         max_iter=max_iter, tol=tol, console=console,
+        alpha_prior_P=alpha_prior_P,
+        window_assignments=window_assignments,
+        p_label_pairs=p_label_pairs,
+        eta=eta_label,
     )
 
     stem = (
@@ -772,6 +934,17 @@ def run_phase_c(
     for i, s_from in enumerate(STATES):
         counts.add_row(s_from, *[f'{xi_sum[i, j]:.2f}' for j in range(2)])
     console.print(counts)
+
+    # Time-share per state: mean of smoothed gamma_t (also report filtered).
+    gamma_share = out['gamma'].mean(axis=0)
+    pfilt_share = out['p_filt'].mean(axis=0)
+    share = Table(title='Phase C — Share of time in each state')
+    share.add_column('State', style='cyan')
+    share.add_column('Smoothed (gamma)', justify='right', style='green')
+    share.add_column('Filtered (p_filt)', justify='right', style='yellow')
+    for i, s in enumerate(STATES):
+        share.add_row(s, f'{gamma_share[i]:.4f}', f'{pfilt_share[i]:.4f}')
+    console.print(share)
 
     return {
         **out,

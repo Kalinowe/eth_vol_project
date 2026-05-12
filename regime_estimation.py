@@ -26,7 +26,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
 import data_collection as dc
-from force_field_estimation import estimate_km, integrate_drift_to_potential
+from force_field_estimation import estimate_km
 
 
 # ---------------------------------------------------------------------------
@@ -426,9 +426,16 @@ def _load_cached_windows(
         subset=['window_start', 'window_end', 'seconds_interval'], keep='first'
     )
 
+    # Rows from before p_multiwell was added are missing or NaN there —
+    # treat them as not covered so they get recomputed.
+    if 'p_multiwell' not in cached_df.columns:
+        cached_df['p_multiwell'] = np.nan
+    valid_rows = cached_df[cached_df['p_multiwell'].notna()
+                           | (cached_df['regime'] == 'unavailable')]
+
     intervals_set = set(seconds_intervals)
     covered = set()
-    for (ws, we), grp in cached_df.groupby(['window_start', 'window_end']):
+    for (ws, we), grp in valid_rows.groupby(['window_start', 'window_end']):
         if intervals_set.issubset(set(grp['seconds_interval'].values)):
             covered.add((ws, we))
 
@@ -480,10 +487,23 @@ def run_phase_a(
     )
     out_path = os.path.join(output_dir, fname)
 
-    # Fast path: exact output file already on disk
+    # Fast path: exact output file already on disk — but only if it carries
+    # p_multiwell (older CSVs written before that column existed force a rerun).
     if os.path.exists(out_path):
-        console.print(f'[green]Labels CSV already exists:[/green] {fname} — loading from disk.')
-        return pd.read_csv(out_path)
+        cached = pd.read_csv(out_path)
+        has_pmulti = (
+            'p_multiwell' in cached.columns
+            and cached[cached['regime'].isin(['single-well', 'multi-well',
+                                              'uncertain', 'no-equilibrium'])]
+                  ['p_multiwell'].notna().all()
+        )
+        if has_pmulti:
+            console.print(f'[green]Labels CSV already exists:[/green] {fname} — loading from disk.')
+            return cached
+        console.print(
+            f'[yellow]Cached labels CSV {fname} predates p_multiwell — '
+            'recomputing missing windows.[/yellow]'
+        )
 
     # Partial cache: collect rows already computed in other files
     cached_df, covered_windows = _load_cached_windows(

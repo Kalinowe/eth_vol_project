@@ -130,8 +130,8 @@ def attach_interval_metadata(
     Metadata columns joined: n_wells, well_locations, barriers, u_range,
     n_observations (whichever are present in full_df).
     """
-    meta_cols = ['window_start', 'window_end', 'n_wells', 'well_locations',
-                 'barriers', 'u_range', 'n_observations']
+    meta_cols = ['window_start', 'window_end', 'n_wells', 'p_multiwell',
+                 'well_locations', 'barriers', 'u_range', 'n_observations']
     available = [c for c in meta_cols if c in full_df.columns]
     sub = full_df[full_df['seconds_interval'] == seconds_interval][available].copy()
     if sub.empty:
@@ -154,7 +154,7 @@ def _adjacent(end_of_prev: pd.Timestamp, start_of_next: pd.Timestamp) -> bool:
 
 def build_transition_counts(seq_df: pd.DataFrame) -> np.ndarray:
     """
-    N[i,j] = # times state i was immediately followed by state j.
+    N[i,j] = # times state i was immediately followed by state j (hard labels).
     Pairs separated by a dropped window (non-adjacent) are skipped.
     """
     K = len(STATES)
@@ -165,6 +165,41 @@ def build_transition_counts(seq_df: pd.DataFrame) -> np.ndarray:
         if not _adjacent(cur['window_end'], nxt['window_start']):
             continue
         N[STATE_IDX[cur['regime']], STATE_IDX[nxt['regime']]] += 1
+    return N
+
+
+def build_transition_counts_soft(seq_df: pd.DataFrame) -> np.ndarray:
+    """
+    Soft transition counts using p_multiwell as the per-window posterior over
+    states. For each consecutive adjacent pair (t, t+1):
+
+        p_t = [1 - p_mw_t, p_mw_t]
+        N  += outer(p_t, p_{t+1})
+
+    A row whose p_multiwell is missing falls back to its hard label
+    (one-hot vector), so windows that predate p_multiwell still contribute.
+    Pairs separated by a dropped window are skipped.
+    """
+    K = len(STATES)
+    N = np.zeros((K, K), dtype=float)
+
+    def _row_prob(row):
+        p_mw = row.get('p_multiwell', np.nan)
+        if pd.notna(p_mw):
+            p = float(np.clip(p_mw, 0.0, 1.0))
+            return np.array([1.0 - p, p])
+        v = np.zeros(K)
+        v[STATE_IDX[row['regime']]] = 1.0
+        return v
+
+    for t in range(len(seq_df) - 1):
+        cur  = seq_df.iloc[t]
+        nxt  = seq_df.iloc[t + 1]
+        if not _adjacent(cur['window_end'], nxt['window_start']):
+            continue
+        p_cur = _row_prob(cur)
+        p_nxt = _row_prob(nxt)
+        N += np.outer(p_cur, p_nxt)
     return N
 
 
@@ -229,11 +264,13 @@ def check_chain(N: np.ndarray, A: np.ndarray, pi: np.ndarray) -> None:
     """
     K = len(STATES)
 
-    # -- irreducibility: every state must be reachable from every other --
+    # -- irreducibility: every state must be reachable from every other.
+    # Soft counts are non-integer; require at least 0.5 effective transitions
+    # so a single fractional whisper does not pass the check.
     off_diag_zero = [
         (STATES[i], STATES[j])
         for i in range(K) for j in range(K)
-        if i != j and N[i, j] == 0
+        if i != j and N[i, j] < 0.5
     ]
     if off_diag_zero:
         pairs = ', '.join(f'{a}→{b}' for a, b in off_diag_zero)
@@ -258,20 +295,27 @@ def check_chain(N: np.ndarray, A: np.ndarray, pi: np.ndarray) -> None:
 
 def print_results(
     N: np.ndarray,
-    A: np.ndarray,
-    pi: np.ndarray,
-    dwells: np.ndarray,
+    A_mle: np.ndarray,
+    pi_mle: np.ndarray,
+    dwells_mle: np.ndarray,
     residual: float,
-    n_transitions: int,
+    n_transitions: float,
     console: Console | None = None,
     alpha: np.ndarray | None = None,
     prior_lambda: float | None = None,
 ) -> None:
+    """
+    Print the *empirical* (MLE) transition matrix, stationary distribution and
+    dwell times. The Dirichlet-smoothed posterior is kept inside
+    run_markov_chain's return dict for downstream Phase C use but is not
+    displayed here so the console reflects pure data.
+    """
     console = console or Console()
 
+    n_str = f'{n_transitions:.2f}' if isinstance(n_transitions, float) else str(n_transitions)
     console.print(
-        f"\n[bold cyan]Empirical Markov Chain  |  "
-        f"{n_transitions} transitions  |  "
+        f"\n[bold cyan]Empirical Markov Chain (MLE)  |  "
+        f"{n_str} transitions  |  "
         f"||πA−π||₁ = {residual:.2e}[/bold cyan]\n"
     )
 
@@ -280,32 +324,37 @@ def print_results(
     for s in STATES:
         count_table.add_column(s, justify='right')
     for i, s_from in enumerate(STATES):
-        count_table.add_row(s_from, *[str(N[i, j]) for j in range(len(STATES))])
+        cells = [
+            f'{N[i, j]:.2f}' if N.dtype.kind == 'f' else str(int(N[i, j]))
+            for j in range(len(STATES))
+        ]
+        count_table.add_row(s_from, *cells)
     console.print(count_table)
 
-    if alpha is not None and not np.all(np.asarray(alpha) == 1.0):
-        lam_str = f'lambda={prior_lambda:.2f}' if prior_lambda is not None else ''
-        console.print(
-            '[yellow]Transition matrix is Dirichlet-regularised'
-            f' ({lam_str}). MLE would differ where counts are low.[/yellow]'
-        )
-
-    prob_table = Table(title='Posterior Transition Matrix  A[i→j]')
+    prob_table = Table(title='Empirical Transition Matrix  A_MLE[i→j]')
     prob_table.add_column('From \\ To', style='cyan')
     for s in STATES:
         prob_table.add_column(s, justify='right', style='green')
     for i, s_from in enumerate(STATES):
-        prob_table.add_row(s_from, *[f'{A[i, j]:.4f}' for j in range(len(STATES))])
+        prob_table.add_row(s_from, *[f'{A_mle[i, j]:.4f}' for j in range(len(STATES))])
     console.print(prob_table)
 
-    summary = Table(title='Stationary Distribution & Mean Dwell Times')
+    summary = Table(title='Empirical Stationary Distribution & Mean Dwell Times')
     summary.add_column('State', style='cyan')
-    summary.add_column('π (stationary)', justify='right', style='green')
+    summary.add_column('π_MLE (stationary)', justify='right', style='green')
     summary.add_column('Mean dwell (windows)', justify='right', style='yellow')
     for i, s in enumerate(STATES):
-        dwell_str = f'{dwells[i]:.2f}' if np.isfinite(dwells[i]) else '∞'
-        summary.add_row(s, f'{pi[i]:.4f}', dwell_str)
+        dwell_str = f'{dwells_mle[i]:.2f}' if np.isfinite(dwells_mle[i]) else '∞'
+        summary.add_row(s, f'{pi_mle[i]:.4f}', dwell_str)
     console.print(summary)
+
+    if alpha is not None and not np.all(np.asarray(alpha) == 1.0):
+        lam_str = f'λ={prior_lambda:.2f}' if prior_lambda is not None else ''
+        console.print(
+            f'[dim]Note: a Dirichlet-smoothed posterior ({lam_str}) is also '
+            'computed and returned for Phase C; it is hidden here so the '
+            'console reflects the raw empirical estimate.[/dim]'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +406,7 @@ def run_markov_chain(
     console: Console | None = None,
     prior_counts: np.ndarray | None = None,
     prior_lambda: float = 0.3,
+    use_soft_counts: bool = True,
 ) -> dict | None:
     """
     Fit and report an empirical Markov chain from the regime label sequence.
@@ -375,11 +425,16 @@ def run_markov_chain(
 
     Returns
     -------
-    dict with keys {N, A, pi, dwells, seq_df, alpha} or None if data is
-    insufficient. A is the Dirichlet posterior mean, never exactly zero.
-    seq_df has one row per window with regime, confidence, and metadata columns
-    from seconds_interval.
+    dict with keys
+        N, alpha, seq_df
+        A, pi, dwells              -- Dirichlet posterior mean (for Phase C)
+        A_mle, pi_mle, dwells_mle  -- pure empirical MLE (matches console output)
+    or None if data is insufficient.
     Raises MarkovChainError if irreducibility (on N) or stationarity checks fail.
+
+    Console output and persisted plots/CSV reflect the MLE view so that the
+    standalone report is purely empirical; the Dirichlet posterior is kept in
+    the return dict only as a prior for downstream Phase C consumers.
     """
     os.makedirs(output_dir, exist_ok=True)
     console = console or Console()
@@ -408,7 +463,14 @@ def run_markov_chain(
         )
         return None
 
-    N = build_transition_counts(seq_df)
+    if use_soft_counts:
+        N = build_transition_counts_soft(seq_df)
+        console.print(
+            '[cyan]Soft transition counts weighted by p_multiwell '
+            f'(total mass = {N.sum():.2f}).[/cyan]'
+        )
+    else:
+        N = build_transition_counts(seq_df).astype(float)
 
     # Irreducibility is a property of the empirical sequence; check before
     # smoothing so that a degenerate run halts even with a Dirichlet prior.
@@ -417,32 +479,47 @@ def run_markov_chain(
         alpha = np.ones((K, K)) + prior_lambda * np.asarray(prior_counts, dtype=float)
     else:
         alpha = np.ones((K, K))   # uniform add-one prior — eliminates zero entries
+
+    # Empirical (MLE) view — shown in the console.
+    A_mle = mle_transition_matrix(N)
+    pi_mle = stationary_distribution(A_mle)
+    dwells_mle = mean_dwell_times(A_mle)
+    residual_mle = float(np.linalg.norm(pi_mle @ A_mle - pi_mle, 1))
+
+    # Dirichlet-smoothed posterior — returned for downstream Phase C consumers
+    # so they can still benefit from the regularisation.
     A = map_transition_matrix(N, alpha)
     pi = stationary_distribution(A)
     dwells = mean_dwell_times(A)
-    residual = float(np.linalg.norm(pi @ A - pi, 1))
 
     # Guard: raises MarkovChainError on failure — do this before any output.
     # check_chain inspects N (not A) so the irreducibility test still bites
     # even though A itself is regularised away from zero.
     check_chain(N, A, pi)
 
-    n_transitions = int(N.sum())
+    n_transitions = float(N.sum()) if N.dtype.kind == 'f' else int(N.sum())
     print_results(
-        N, A, pi, dwells, residual, n_transitions, console=console,
+        N, A_mle, pi_mle, dwells_mle, residual_mle, n_transitions,
+        console=console,
         alpha=alpha, prior_lambda=prior_lambda if prior_counts is not None else None,
     )
 
     stem = os.path.splitext(os.path.basename(labels_csv))[0]
     prefix = os.path.join(output_dir, f'mc_{stem}_{seconds_interval}s')
 
-    plots.plot_mc_transition_heatmap(A, STATES, f'{prefix}_transition.png')
-    plots.plot_mc_stationary(pi, dwells, STATES, COLORS, f'{prefix}_stationary.png')
+    # Plots and persisted CSV reflect the MLE view; the smoothed posterior is
+    # only used as a prior downstream and is recoverable from alpha + N.
+    plots.plot_mc_transition_heatmap(A_mle, STATES, f'{prefix}_transition.png')
+    plots.plot_mc_stationary(pi_mle, dwells_mle, STATES, COLORS, f'{prefix}_stationary.png')
     plots.plot_mc_timeline(seq_df, STATES, COLORS, STATE_IDX, f'{prefix}_timeline.png')
-    save_results_csv(A, pi, dwells, f'{prefix}_results.csv', alpha=alpha)
+    save_results_csv(A_mle, pi_mle, dwells_mle, f'{prefix}_results.csv', alpha=alpha)
 
-    return {'N': N, 'A': A, 'pi': pi, 'dwells': dwells, 'seq_df': seq_df,
-            'alpha': alpha}
+    return {
+        'N': N,
+        'A': A, 'pi': pi, 'dwells': dwells,
+        'A_mle': A_mle, 'pi_mle': pi_mle, 'dwells_mle': dwells_mle,
+        'seq_df': seq_df, 'alpha': alpha,
+    }
 
 
 # ---------------------------------------------------------------------------
