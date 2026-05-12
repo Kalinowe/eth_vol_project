@@ -6,7 +6,7 @@ Label mapping
 -------------
 Only two states are modelled:
     'single-well'  ->  state 0
-    'double-well'  ->  state 1
+    'multi-well'  ->  state 1
 
 Vote aggregation
 ----------------

@@ -3,7 +3,7 @@ Phase C — parametric Markov-switching SDE.
 
 Two-state hidden chain S_t in {0, 1} with parametric drifts:
     state 0  ('single-well')   mu_1(x) = -kappa (x - m)
-    state 1  ('double-well')   mu_2(x) = -alpha (x - c)^3 + beta (x - c)
+    state 1  ('muti-well')   mu_2(x) = -alpha (x - c)^3 + beta (x - c)
 
 Shared diffusion sigma. Euler-Maruyama emission per step:
     Delta x_t  |  x_{t-1}, S_t = s   ~   N(  mu_s(x_{t-1}) * dt,  sigma^2 * dt  )
@@ -14,7 +14,7 @@ Pipeline (run_phase_c):
   2. Initialise sigma^2 = var(Delta x) / dt and hold it fixed throughout.
   3. Initialise drift parameters by fitting the parametric forms to per-window
      km_df drift curves saved by Phase A (regime_results/km/), pooled by the
-     Phase A regime label (single-well vs double-well).
+     Phase A regime label (single-well vs multi-well).
   4. Initial transition matrix is near-identity P = [[1-eps, eps], [eps, 1-eps]].
      Initial state prior pi_0 is supplied by the caller (e.g. the empirical
      stationary distribution from markov_chain.run_markov_chain). Default
@@ -49,7 +49,7 @@ import data_collection as dc
 import plots
 
 
-STATES = ['single-well', 'double-well']
+STATES = ['single-well', 'multi-well']
 EPS = 1e-300
 
 
@@ -61,7 +61,7 @@ def mu_single(x, kappa, m):
     return -kappa * (x - m)
 
 
-def mu_double(x, alpha, beta, c):
+def mu_multi(x, alpha, beta, c):
     u = x - c
     return -alpha * u ** 3 + beta * u
 
@@ -232,20 +232,20 @@ def fit_initial_theta_from_km(labels_csv, seconds_interval, output_dir, console=
 
     # State 1: cubic drift  -alpha*(x-c)^3 + beta*(x-c).
     x2, mu2 = pool_km_drift_curves(
-        labels_csv, 'double-well', seconds_interval, output_dir,
+        labels_csv, 'multi-well', seconds_interval, output_dir,
     )
     if len(x2) >= 5:
         c0 = float(np.mean(x2))
         def _resid(p):
             a, b, c = p
-            return mu2 - mu_double(x2, a, b, c)
+            return mu2 - mu_multi(x2, a, b, c)
         res = least_squares(_resid, x0=[1.0, 1.0, c0])
         alpha, beta, c = res.x
         alpha = max(float(alpha), 1e-9)
         beta = float(beta)
         c = float(c)
     else:
-        warnings.warn('No double-well km_df available; using cubic defaults.')
+        warnings.warn('No multi-well km_df available; using cubic defaults.')
         alpha, beta, c = 1.0, 1.0, 0.0
 
     return {'kappa': float(kappa), 'm': float(m),
@@ -290,7 +290,7 @@ def fit_initial_theta_moments(x_prev, dx, dt, console=None):
 
     if mask_dw.sum() < 5:
         warnings.warn(
-            'Double-well candidate cluster has <5 points; using cubic defaults.'
+            'Multi-well candidate cluster has <5 points; using cubic defaults.'
         )
         alpha_init, beta_init, c_init = 1.0, 1.0, float(np.mean(x_prev))
     else:
@@ -320,7 +320,7 @@ def emission_log_b(x_prev, dx, dt, theta, sigma2):
     inv_2var = 0.5 / var
     norm_const = -0.5 * np.log(2.0 * np.pi * var)
     mu1 = mu_single(x_prev, theta['kappa'], theta['m']) * dt
-    mu2 = mu_double(x_prev, theta['alpha'], theta['beta'], theta['c']) * dt
+    mu2 = mu_multi(x_prev, theta['alpha'], theta['beta'], theta['c']) * dt
     log_b = np.empty((len(dx), 2))
     log_b[:, 0] = norm_const - inv_2var * (dx - mu1) ** 2
     log_b[:, 1] = norm_const - inv_2var * (dx - mu2) ** 2
@@ -559,7 +559,7 @@ def predict_k_steps(
         P(S_{t+k} = s | x_{1:t}) = [p_filt[t] @ A^k]_s
 
     Returns a long-format DataFrame with columns
-    ['t', 'k', 'p_single_ahead', 'p_double_ahead'].
+    ['t', 'k', 'p_single_ahead', 'p_multi_ahead'].
     """
     from numpy.linalg import matrix_power
     rows = []
@@ -572,7 +572,7 @@ def predict_k_steps(
                 't': int(t),
                 'k': int(k),
                 'p_single_ahead': float(p_ahead[t, 0]),
-                'p_double_ahead': float(p_ahead[t, 1]),
+                'p_multi_ahead': float(p_ahead[t, 1]),
             })
     return pd.DataFrame(rows)
 
@@ -644,7 +644,7 @@ def run_phase_c(
     Parameters
     ----------
     labels_csv : path to a Phase A regime labels CSV (used only to find
-                 representative single-/double-well windows whose km_df
+                 representative single-/multi-well windows whose km_df
                  informs the parametric drift initialisation).
     pi_init    : (2,) initial-state prior. Default uniform [0.5, 0.5].
                  Pass markov_chain.run_markov_chain(...)['pi'] to use the
@@ -697,9 +697,9 @@ def run_phase_c(
         'x_prev': x_prev,
         'dx': dx,
         'p_filt_single': out['p_filt'][:, 0],
-        'p_filt_double': out['p_filt'][:, 1],
+        'p_filt_multi': out['p_filt'][:, 1],
         'gamma_single': out['gamma'][:, 0],
-        'gamma_double': out['gamma'][:, 1],
+        'gamma_multi': out['gamma'][:, 1],
     })
     probs_path = os.path.join(output_dir, f'{stem}_probs.csv')
     df_probs.to_csv(probs_path, index=False)
@@ -726,10 +726,6 @@ def run_phase_c(
         out['gamma'],
         os.path.join(output_dir, f'{stem}_gamma.png'),
         datetimes=pd.to_datetime(dt_t),
-    )
-    plots.plot_phase_c_drifts(
-        x_prev, out['theta'],
-        os.path.join(output_dir, f'{stem}_drifts.png'),
     )
 
     # k-step ahead regime forecast
@@ -806,10 +802,10 @@ if __name__ == '__main__':
     _console.print(f'[cyan]Labels file : {labels_csv}[/cyan]')
 
     # To use the empirical stationary distribution from markov_chain.py:
-    # from markov_chain import run_markov_chain
-    # mc = run_markov_chain(labels_csv, seconds_interval=seconds_interval)
-    # pi_init = mc['pi'] if mc else None
-    pi_init = None
+    from markov_chain import run_markov_chain
+    mc = run_markov_chain(labels_csv, seconds_interval=seconds_interval)
+    pi_init = mc['pi'] if mc else None
+    #pi_init = None
   
     run_phase_c(
         start_date, end_date, seconds_interval,

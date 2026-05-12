@@ -38,7 +38,7 @@ from phase_c import (
     STATES,
     emission_log_b,
     load_series,
-    mu_double,
+    mu_multi,
 )
 import plots
 
@@ -161,7 +161,7 @@ def draw_cubic_params(x_prev, dx, dt, S, sigma2, theta_cur,
     sd = float(np.sqrt(var))
 
     def log_lik_cubic(alpha, beta, c):
-        mu = mu_double(x1, alpha, beta, c)
+        mu = mu_multi(x1, alpha, beta, c)
         return float(norm.logpdf(r1, loc=mu, scale=sd).sum())
 
     alpha_prop = abs(theta_cur['alpha']
@@ -220,7 +220,7 @@ def augmented_log_b(x_prev, dx, dt, theta, sigma2,
     Log emission probabilities augmented by Phase A label likelihood:
         b_tilde_s(t) = b_s(t) * p_label(s | w_t)^eta
 
-    p_label_pairs : (W, 2) array of [p_single, p_double] per window index.
+    p_label_pairs : (W, 2) array of [p_single, p_multi] per window index.
                     Row -1 (default) is uniform [0.5, 0.5].
     """
     log_b = emission_log_b(x_prev, dx, dt, theta, sigma2)
@@ -453,7 +453,7 @@ def posterior_predictive_forecast(p_filt_mean, chain_P,
                 't':              int(t),
                 'k':              int(k),
                 'p_single_ahead': float(p_ahead[t, 0]),
-                'p_double_ahead': float(p_ahead[t, 1]),
+                'p_multi_ahead': float(p_ahead[t, 1]),
             })
 
     return pd.DataFrame(rows)
@@ -494,7 +494,7 @@ def _try_load_em_result(stem_em, output_dir, console):
         ], dtype=float)
 
         probs_df = pd.read_csv(paths['probs'])
-        gamma = probs_df[['gamma_single', 'gamma_double']].to_numpy(
+        gamma = probs_df[['gamma_single', 'gamma_multi']].to_numpy(
             dtype=float
         )
     except (KeyError, ValueError) as exc:
@@ -732,7 +732,7 @@ def run_phase_c_mcmc(
     S_init = (u[:, None] >= cum[:, :-1]).sum(axis=1).astype(np.int8)
     console.print(
         f'  Initial S: {(S_init == 0).mean():.1%} single-well  '
-        f'{(S_init == 1).mean():.1%} double-well'
+        f'{(S_init == 1).mean():.1%} multi-well'
     )
 
     # ------------------------------------------------------------------ #

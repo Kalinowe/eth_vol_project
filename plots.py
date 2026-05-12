@@ -251,7 +251,7 @@ def plot_mc_timeline(
 
 def plot_phase_c_gamma_timeline(gamma, output_path, datetimes=None):
     """
-    Smoothed double-well probability gamma_t over the full series.
+    Smoothed multi-well probability gamma_t over the full series.
     """
     fig, ax = plt.subplots(figsize=(12, 4))
     if datetimes is not None:
@@ -261,7 +261,7 @@ def plot_phase_c_gamma_timeline(gamma, output_path, datetimes=None):
         ax.plot(gamma[:, 1], color='#F44336', lw=0.6)
         ax.set_xlabel('step index')
     ax.set_ylim(0, 1)
-    ax.set_ylabel(r'$\gamma_t$(double-well)')
+    ax.set_ylabel(r'$\gamma_t$(multi-well)')
     ax.set_title('Phase C — smoothed regime probability')
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -269,12 +269,12 @@ def plot_phase_c_gamma_timeline(gamma, output_path, datetimes=None):
     plt.close(fig)
     print(f'Saved {output_path}')
 
-
+"""
 def plot_phase_c_drifts(x_prev, theta, output_path):
-    """
-    Fitted parametric drifts mu_1 (OU) and mu_2 (cubic) on a common x grid,
-    plus a histogram of x_prev for context.
-    """
+
+ #   Fitted parametric drifts mu_1 (OU) and mu_2 (cubic) on a common x grid,
+ #   plus a histogram of x_prev for context.
+  
     x_lo, x_hi = float(np.min(x_prev)), float(np.max(x_prev))
     x_grid = np.linspace(x_lo, x_hi, 400)
     mu1 = -theta['kappa'] * (x_grid - theta['m'])
@@ -304,7 +304,7 @@ def plot_phase_c_drifts(x_prev, theta, output_path):
     fig.savefig(output_path, dpi=120)
     plt.close(fig)
     print(f'Saved {output_path}')
-
+"""
 
 def plot_kappa_series(df_kappa: pd.DataFrame, output_path: str) -> None:
     """
@@ -335,7 +335,7 @@ def plot_kappa_series(df_kappa: pd.DataFrame, output_path: str) -> None:
 
 def plot_forecast(df_forecast: pd.DataFrame, output_path: str, k: int = 5) -> None:
     """
-    Line chart of P(double-well | x_{1:t}) at horizon k vs t, with a 0.5
+    Line chart of P(multi-well | x_{1:t}) at horizon k vs t, with a 0.5
     reference line.
     """
     sub = df_forecast[df_forecast['k'] == k]
@@ -344,12 +344,12 @@ def plot_forecast(df_forecast: pd.DataFrame, output_path: str, k: int = 5) -> No
         return
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(sub['t'], sub['p_double_ahead'], color='#F44336', lw=0.7)
+    ax.plot(sub['t'], sub['p_multi_ahead'], color='#F44336', lw=0.7)
     ax.axhline(0.5, color='gray', ls='--', lw=0.9)
     ax.set_ylim(0, 1)
     ax.set_xlabel('t (step index)')
-    ax.set_ylabel('P(double-well ahead)')
-    ax.set_title(f'P(double-well | x_{{1:t}}), k={k} steps ahead')
+    ax.set_ylabel('P(multi-well ahead)')
+    ax.set_title(f'P(multi-well | x_{{1:t}}), k={k} steps ahead')
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
