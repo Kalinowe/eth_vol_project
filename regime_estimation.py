@@ -8,8 +8,8 @@ Pipeline per calendar-month window:
   4. Classify the topology of mu(x) -- count stable equilibria, infer regime.
 
 Each (window, sampling-interval) row produces a regime label that can be
-sanity-checked by setting main.py to that exact window and visually inspecting
-the static potential plot.
+sanity-checked by re-running RunEM.py on that exact window and visually
+inspecting the static potential plot.
 """
 
 import glob
@@ -612,7 +612,7 @@ def print_regime_table(labels_df, console=None):
     table.add_column(u'Δt (s)', justify='right')
     table.add_column('Regime', style='green')
     table.add_column('Wells', justify='right', style='magenta')
-    table.add_column('P(multi)', justify='right', style='magenta')
+    table.add_column('p_multiwell', justify='right', style='magenta')
     table.add_column('U range (ann.)', justify='right', style='yellow')
     table.add_column('Barriers', style='yellow')
     table.add_column('# obs', justify='right')
@@ -650,7 +650,7 @@ def print_regime_table(labels_df, console=None):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    # --- Configuration (mirrors main.py defaults so windows can be cross-checked) ---
+    # --- Configuration (mirrors RunEM.py defaults so windows can be cross-checked) ---
     start_date = datetime(2024, 1, 1)
     end_date = datetime(2024, 12, 31)
 

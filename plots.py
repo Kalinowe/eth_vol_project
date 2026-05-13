@@ -308,22 +308,25 @@ def plot_phase_c_drifts(x_prev, theta, output_path):
 
 def plot_kappa_series(df_kappa: pd.DataFrame, output_path: str) -> None:
     """
-    Line chart of kappa vs datetime with a horizontal dashed reference line
-    at the median kappa across the series.
+    Line chart of annualised kappa vs datetime with a horizontal dashed
+    reference at the median across the series. Expects the column
+    'kappa_ann' (kappa multiplied by SEC_PER_YEAR) — see
+    ExpectationMaximisation.estimate_kappa_series.
     """
     if df_kappa.empty:
         print(f'[plot_kappa_series] empty DataFrame; skipping {output_path}')
         return
 
+    col = 'kappa_ann' if 'kappa_ann' in df_kappa.columns else 'kappa'
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(df_kappa['datetime'], df_kappa['kappa'],
-            color='#2196F3', lw=1.0, label=r'$\kappa(t)$')
-    median_k = float(np.nanmedian(df_kappa['kappa']))
+    ax.plot(df_kappa['datetime'], df_kappa[col],
+            color='#2196F3', lw=1.0, label=r'$\kappa_{\mathrm{ann}}(t)$')
+    median_k = float(np.nanmedian(df_kappa[col]))
     ax.axhline(median_k, color='gray', ls='--', lw=0.9,
                label=f'median = {median_k:.3g}')
     ax.set_xlabel('Date')
-    ax.set_ylabel(r'$\kappa$ (mean-reversion rate)')
-    ax.set_title(r'Phase C — rolling $\kappa(t)$ (critical-slowing-down signal)')
+    ax.set_ylabel(r'$\kappa_{\mathrm{ann}}$ (yr$^{-1}$)')
+    ax.set_title(r'Phase C — rolling $\kappa_{\mathrm{ann}}(t)$ (critical-slowing-down signal)')
     ax.grid(True, alpha=0.3)
     ax.legend(loc='best', fontsize=9)
     fig.autofmt_xdate()

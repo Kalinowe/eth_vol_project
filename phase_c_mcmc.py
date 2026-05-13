@@ -8,7 +8,7 @@ sampler with three blocks per sweep:
   Block 2  Draw theta   | S_{1:T}, x    (conjugate OU + MH for cubic)
   Block 3  Draw P       | S_{1:T}       (Dirichlet conjugate, exact)
 
-Warm-started from the EM solution produced by phase_c.run_phase_c. Heavy
+Warm-started from the EM solution produced by ExpectationMaximisation.run_phase_c. Heavy
 upstream work (label generation, Phase B chain, EM warm start, MCMC chain)
 is cached by checking for the corresponding output file before recomputing.
 
@@ -33,7 +33,7 @@ from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
 from scipy.stats import norm
 
 # Reuse from existing modules — do not duplicate
-from phase_c import (
+from ExpectationMaximisation import (
     EPS,
     STATES,
     build_window_assignments,
@@ -237,7 +237,7 @@ def augmented_log_b(x_prev, dx, dt, theta, sigma2,
     return log_b
 
 
-# build_window_assignments is imported from phase_c.
+# build_window_assignments is imported from ExpectationMaximisation.
 
 
 # ---------------------------------------------------------------------------
@@ -683,9 +683,9 @@ def run_phase_c_mcmc(
     if em_result is None:
         console.print(
             '[yellow]No EM result supplied or cached — running '
-            'phase_c.run_phase_c to generate the warm start.[/yellow]'
+            'ExpectationMaximisation.run_phase_c to generate the warm start.[/yellow]'
         )
-        from phase_c import run_phase_c
+        from ExpectationMaximisation import run_phase_c
         em_result = run_phase_c(
             start_date, end_date, seconds_interval,
             labels_csv=labels_csv,
