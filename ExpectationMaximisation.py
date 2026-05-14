@@ -866,6 +866,8 @@ def run_phase_c(
     dwell_prior_strength=10.0,
     eta_label=0.3,
     theta_init='km',
+    theta_init_seconds_interval=30,
+    theta_init_labels_csv=None,
     console=None,
 ):
     """
@@ -900,6 +902,17 @@ def run_phase_c(
                  'moments' -> data-only init via
                  ``fit_initial_theta_moments`` (OLS + 2-means clustering).
                  No dependence on Phase A.
+    theta_init_seconds_interval : interval (in seconds) of the Phase A KM
+                 curves used to initialise theta. Defaults to 30s. The KM
+                 estimator divides by dt, so the returned drift is already
+                 per-second regardless of the source interval — using a
+                 finer KM (30s) to seed a coarser EM (300s) is valid and
+                 typically produces a less Euler-biased starting point.
+    theta_init_labels_csv : path to the Phase A labels CSV produced at
+                 ``theta_init_seconds_interval``. If None, derived from
+                 ``labels_csv`` by substituting the interval token in the
+                 filename. The file must exist when ``theta_init='km'``
+                 and ``theta_init_seconds_interval != seconds_interval``.
     """
     os.makedirs(output_dir, exist_ok=True)
     console = console or Console()
@@ -944,11 +957,38 @@ def run_phase_c(
 
     theta = None
     if theta_init == 'km':
+        init_int = int(theta_init_seconds_interval)
+        if theta_init_labels_csv is not None:
+            init_labels_csv = theta_init_labels_csv
+        elif init_int == int(seconds_interval):
+            init_labels_csv = labels_csv
+        else:
+            # Derive sibling labels CSV at the init interval by swapping the
+            # interval token: _<EM>s_<window>.csv -> _<init>s_<window>.csv.
+            base = os.path.basename(labels_csv)
+            replaced = base.replace(
+                f'_{int(seconds_interval)}s_',
+                f'_{init_int}s_',
+            )
+            init_labels_csv = os.path.join(
+                os.path.dirname(labels_csv) or '.', replaced,
+            )
+        if not os.path.exists(init_labels_csv):
+            raise FileNotFoundError(
+                f"theta_init='km' requested seconds_interval={init_int} "
+                f'but the corresponding labels CSV was not found at '
+                f'{init_labels_csv}. Run Phase A at that interval first, or '
+                'pass theta_init_labels_csv explicitly.'
+            )
         # ``output_dir`` here is the Phase C output directory; Phase A KM CSVs
-        # live in the *labels* directory.  Use that as the search root.
-        km_root = os.path.dirname(labels_csv) or '.'
+        # live next to the labels CSV.  Use that as the search root.
+        km_root = os.path.dirname(init_labels_csv) or '.'
+        console.print(
+            f'  KM-based theta init: labels={os.path.basename(init_labels_csv)}, '
+            f'KM interval={init_int}s'
+        )
         theta = fit_initial_theta_from_km(
-            labels_csv, int(seconds_interval), km_root, console=console,
+            init_labels_csv, init_int, km_root, console=console,
         )
         if theta is None:
             console.print(

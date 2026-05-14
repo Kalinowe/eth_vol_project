@@ -8,40 +8,34 @@ Only two states are modelled:
     'single-well'  ->  state 0
     'multi-well'  ->  state 1
 
-Vote aggregation
-----------------
-The regime labels CSV contains one row per (window, seconds_interval).
-Before chain estimation, all intervals for each window are collapsed into a
-single regime via majority vote:
+Input
+-----
+A single-interval labels CSV with one row per window (see
+``regime_estimation.run_phase_a``). The interval lives in the filename;
+this module does not select among intervals.
 
-    - 'X/N' confidence when a STATES regime wins the plurality
-      (e.g. '2/3' or '3/3' with three intervals)
-    - 'invalid regimes' when the plurality winner is not in STATES or when
-      there is a tie
-
-Windows whose aggregated regime is not in STATES are dropped with a warning;
-transitions that cross such gaps are NOT counted (gap-aware adjacency check).
-
-The seconds_interval argument selects which interval's metadata columns
-(n_wells, well_locations, barriers, u_range, n_observations) are attached
-to each window row and included in the return dict.
+Each row provides ``regime`` (hard label from Phase A) and ``p_multiwell``
+(GP posterior over multi-well topology). The Markov-chain transitions can be
+counted either as hard one-hot vectors (``use_soft_counts=False``) or as
+soft counts ``outer([1-p_mw, p_mw], [1-p_mw, p_mw])`` (``use_soft_counts=True``,
+default).
 
 Ergodicity check
 ----------------
-After computing the stationary distribution pi, we verify:
+After computing pi we verify
 
     np.linalg.norm(pi @ A - pi, 1) < STATIONARITY_TOL
 
-and that the chain is irreducible (every off-diagonal entry of N is > 0).
+and that every off-diagonal of N exceeds 0.5 (soft counts are non-integer).
 A MarkovChainError is raised before any further computation if either check
 fails, so no compute is wasted on a degenerate result.
 
 Outputs (written to output_dir)
 --------------------------------
-    mc_<stem>_<interval>s_transition.png
-    mc_<stem>_<interval>s_stationary.png
-    mc_<stem>_<interval>s_timeline.png
-    mc_<stem>_<interval>s_results.csv
+    mc_<labels_stem>_transition.png
+    mc_<labels_stem>_stationary.png
+    mc_<labels_stem>_timeline.png
+    mc_<labels_stem>_results.csv
 """
 
 import os
@@ -76,68 +70,21 @@ class MarkovChainError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 def load_labels_csv(labels_csv: str) -> pd.DataFrame:
-    """Load the full regime labels CSV (all intervals), sorted by window then interval."""
+    """
+    Load the single-interval regime labels CSV, sorted by window. Adds a
+    ``confidence`` diagnostic column from ``p_multiwell`` (distance from 0.5
+    in the direction of the assigned regime) for the timeline plot.
+    """
     df = pd.read_csv(labels_csv, parse_dates=['window_start', 'window_end'])
     print(f'Loaded {len(df)} rows from {labels_csv}')
-    return df.sort_values(['window_start', 'seconds_interval']).reset_index(drop=True)
-
-
-def aggregate_label_votes(full_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Collapse multiple seconds_interval rows per window into a single row via
-    majority vote.
-
-    Assumes an odd number of intervals so ties cannot occur among valid states,
-    but a tie guard is included regardless.
-
-    Returns DataFrame with columns ['window_start', 'window_end', 'regime',
-    'confidence'] where confidence is 'X/N' when a STATES regime wins (X votes
-    out of N intervals) or 'invalid regimes' otherwise.
-    """
-    rows = []
-    for (ws, we), grp in full_df.groupby(['window_start', 'window_end'], sort=True):
-        counts = grp['regime'].value_counts()
-        total = int(counts.sum())
-        top_regime = counts.index[0]
-        top_count = int(counts.iloc[0])
-
-        tie = len(counts) > 1 and counts.iloc[0] == counts.iloc[1]
-        if tie or top_regime not in STATE_IDX:
-            regime = top_regime
-            confidence = 'invalid regimes'
-        else:
-            regime = top_regime
-            confidence = f'{top_count}/{total}'
-
-        rows.append({'window_start': ws, 'window_end': we,
-                     'regime': regime, 'confidence': confidence})
-
-    return pd.DataFrame(rows)
-
-
-def attach_interval_metadata(
-    agg_df: pd.DataFrame,
-    full_df: pd.DataFrame,
-    seconds_interval: int,
-) -> pd.DataFrame:
-    """
-    Left-join per-window metadata from the specified seconds_interval onto
-    the aggregated DataFrame.
-
-    Metadata columns joined: n_wells, well_locations, barriers, u_range,
-    n_observations (whichever are present in full_df).
-    """
-    meta_cols = ['window_start', 'window_end', 'n_wells', 'p_multiwell',
-                 'well_locations', 'barriers', 'u_range', 'n_observations']
-    available = [c for c in meta_cols if c in full_df.columns]
-    sub = full_df[full_df['seconds_interval'] == seconds_interval][available].copy()
-    if sub.empty:
-        warnings.warn(
-            f'No rows found for seconds_interval={seconds_interval}; '
-            'metadata columns will be NaN.',
-            stacklevel=3,
+    df = df.sort_values('window_start').reset_index(drop=True)
+    if 'p_multiwell' in df.columns and 'regime' in df.columns:
+        df['confidence'] = np.where(
+            df['regime'] == 'multi-well',
+            df['p_multiwell'],
+            1.0 - df['p_multiwell'].fillna(0.5),
         )
-    return agg_df.merge(sub, on=['window_start', 'window_end'], how='left')
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +348,6 @@ def save_results_csv(
 def run_markov_chain(
     labels_csv: str,
     window_type: str = 'weekly',
-    seconds_interval: int = 30,
     output_dir: str = 'regime_results',
     console: Console | None = None,
     prior_counts: np.ndarray | None = None,
@@ -409,19 +355,22 @@ def run_markov_chain(
     use_soft_counts: bool = True,
 ) -> dict | None:
     """
-    Fit and report an empirical Markov chain from the regime label sequence.
+    Fit and report an empirical Markov chain from the single-interval regime
+    label sequence.
 
     Parameters
     ----------
-    labels_csv       : path to CSV produced by regime_estimation.run_phase_a()
-    seconds_interval : interval whose metadata (n_wells, barriers, etc.) is
-                       attached to each window row; does not filter the vote
-    output_dir       : directory for plots and CSV results
-    prior_counts     : optional (K,K) historical count matrix used to build a
-                       Phase-B-informed Dirichlet prior alpha = 1 + lambda*N_hist.
-                       When None, a uniform add-one prior is used.
-    prior_lambda     : strength of the historical prior. Ignored if
-                       prior_counts is None.
+    labels_csv     : path to CSV produced by regime_estimation.run_phase_a()
+                     for one ``seconds_interval``. The interval is encoded
+                     in the filename.
+    output_dir     : directory for plots and CSV results.
+    prior_counts   : optional (K,K) historical count matrix used to build a
+                     Phase-B-informed Dirichlet prior alpha = 1 + lambda*N_hist.
+                     When None, a uniform add-one prior is used.
+    prior_lambda   : strength of the historical prior. Ignored if
+                     prior_counts is None.
+    use_soft_counts: if True, transitions are counted by outer products of
+                     ``[1-p_mw, p_mw]`` per window.
 
     Returns
     -------
@@ -439,26 +388,23 @@ def run_markov_chain(
     os.makedirs(output_dir, exist_ok=True)
     console = console or Console()
 
-    # --- Aggregate all intervals into one regime per window ---
-    full_df = load_labels_csv(labels_csv)
-    agg_df = aggregate_label_votes(full_df)
-    seq_df = attach_interval_metadata(agg_df, full_df, seconds_interval)
+    seq_df = load_labels_csv(labels_csv)
 
-    # Drop windows where the majority vote did not resolve to a modelled state
+    # Drop windows whose Phase A label did not resolve to a modelled state.
     mask_valid = seq_df['regime'].isin(STATES)
     n_dropped = int((~mask_valid).sum())
     if n_dropped > 0:
-        dropped = seq_df.loc[~mask_valid, ['window_start', 'window_end', 'regime', 'confidence']]
+        dropped = seq_df.loc[~mask_valid, ['window_start', 'window_end', 'regime']]
         warnings.warn(
-            f"{n_dropped} window(s) dropped (no valid majority): "
-            f"{dropped[['regime', 'confidence']].value_counts().to_dict()}",
+            f"{n_dropped} window(s) dropped (regime not in STATES): "
+            f"{dropped['regime'].value_counts().to_dict()}",
             stacklevel=2,
         )
     seq_df = seq_df[mask_valid].reset_index(drop=True)
 
     if len(seq_df) < 2:
         console.print(
-            f'[red]Only {len(seq_df)} valid window(s) after vote aggregation — '
+            f'[red]Only {len(seq_df)} valid window(s) — '
             'need at least 2 to estimate transitions.[/red]'
         )
         return None
@@ -506,7 +452,7 @@ def run_markov_chain(
     )
 
     stem = os.path.splitext(os.path.basename(labels_csv))[0]
-    prefix = os.path.join(output_dir, f'mc_{stem}_{seconds_interval}s')
+    prefix = os.path.join(output_dir, f'mc_{stem}')
 
     # Plots and persisted CSV reflect the MLE view; the smoothed posterior is
     # only used as a prior downstream and is recoverable from alpha + N.

@@ -393,21 +393,24 @@ def analyze_window(
 def _load_cached_windows(
     output_dir: str,
     window_type: str,
+    seconds_interval: int,
     start_date: datetime,
     end_date: datetime,
-    seconds_intervals: list,
 ) -> tuple[pd.DataFrame, set]:
     """
-    Scan output_dir for regime_labels_*_{window_type}.csv files.
+    Scan output_dir for ``regime_labels_*_{interval}s_{window_type}.csv`` files
+    and collect rows whose window falls inside [start_date, end_date]. One
+    interval per CSV — different intervals live in separate files.
 
     Returns
     -------
-    cached_df  : DataFrame of rows whose window falls entirely within
-                 [start_date, end_date]; dates stored as strings (YYYY-MM-DD).
-    covered    : set of (window_start_str, window_end_str) pairs where every
-                 requested seconds_interval is already present in cached_df.
+    cached_df  : DataFrame of valid (non-NaN p_multiwell) rows. Dates as strings.
+    covered    : set of (window_start_str, window_end_str) already present.
     """
-    pattern = os.path.join(output_dir, f'regime_labels_*_{window_type}.csv')
+    pattern = os.path.join(
+        output_dir,
+        f'regime_labels_*_{int(seconds_interval)}s_{window_type}.csv',
+    )
     csv_files = glob.glob(pattern)
     if not csv_files:
         return pd.DataFrame(), set()
@@ -431,7 +434,7 @@ def _load_cached_windows(
 
     cached_df = pd.concat(frames, ignore_index=True)
     cached_df = cached_df.drop_duplicates(
-        subset=['window_start', 'window_end', 'seconds_interval'], keep='first'
+        subset=['window_start', 'window_end'], keep='first'
     )
 
     # Rows from before p_multiwell was added are missing or NaN there —
@@ -441,15 +444,10 @@ def _load_cached_windows(
     valid_rows = cached_df[cached_df['p_multiwell'].notna()
                            | (cached_df['regime'] == 'unavailable')].copy()
 
-    intervals_set = set(seconds_intervals)
     covered = set()
-    for (ws, we), grp in valid_rows.groupby(['window_start', 'window_end']):
-        if intervals_set.issubset(set(grp['seconds_interval'].values)):
-            covered.add((ws, we))
+    for (ws, we), _ in valid_rows.groupby(['window_start', 'window_end']):
+        covered.add((ws, we))
 
-    # Return only valid rows; otherwise the downstream drop_duplicates
-    # (keep='first') would shadow freshly computed p_multiwell values with
-    # stale NaN ones from older CSVs.
     return valid_rows, covered
 
 
@@ -460,7 +458,7 @@ def _load_cached_windows(
 def run_phase_a(
     start_date,
     end_date,
-    seconds_intervals,
+    seconds_interval,
     kernel_half_width=5,
     trim_quantile=0.01,
     n_bins=200,
@@ -473,28 +471,31 @@ def run_phase_a(
     console=None,
 ):
     """
-    Loop over windows x sampling intervals and assemble a label table.
+    Single-interval driver. Iterate over windows and assemble a label table at
+    one sampling resolution.
 
     start_date and end_date are snapped to exact window boundaries before
-    execution (see normalize_window_boundaries).  A notice is printed when
+    execution (see normalize_window_boundaries). A notice is printed when
     either date is adjusted.
 
-    Args:
-        window_type: 'weekly', 'biweekly', or 'monthly' (default).
+    Different ``seconds_interval`` values live in **separate** CSVs — the
+    interval is encoded in the filename:
+        regime_labels_<start>_to_<end>_<int>s_<window_type>.csv
+    so a multi-interval run is now several independent ``run_phase_a`` calls.
 
-    Returns the assembled DataFrame and writes it to
-    `<output_dir>/regime_labels_<snapped_start>_to_<snapped_end>_<window_type>.csv`.
+    Returns the assembled DataFrame and writes it to the path above.
     """
     os.makedirs(output_dir, exist_ok=True)
     console = console or Console()
+    seconds_interval = int(seconds_interval)
 
     start_date, end_date = normalize_window_boundaries(
         start_date, end_date, window_type, console=console
     )
 
     fname = (
-        f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}"
-        f"_{window_type}.csv"
+        f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_"
+        f"{end_date.strftime('%Y-%m-%d')}_{seconds_interval}s_{window_type}.csv"
     )
     out_path = os.path.join(output_dir, fname)
 
@@ -502,23 +503,24 @@ def run_phase_a(
     # p_multiwell (older CSVs written before that column existed force a rerun).
     if os.path.exists(out_path):
         cached = pd.read_csv(out_path)
+        good_regimes = ['single-well', 'multi-well', 'uncertain', 'no-equilibrium']
         has_pmulti = (
             'p_multiwell' in cached.columns
-            and cached[cached['regime'].isin(['single-well', 'multi-well',
-                                              'uncertain', 'no-equilibrium'])]
-                  ['p_multiwell'].notna().all()
+            and cached[cached['regime'].isin(good_regimes)]['p_multiwell'].notna().all()
         )
         if has_pmulti:
-            console.print(f'[green]Labels CSV already exists:[/green] {fname} — loading from disk.')
+            console.print(
+                f'[green]Labels CSV already exists:[/green] {fname} — loading from disk.'
+            )
             return cached
         console.print(
             f'[yellow]Cached labels CSV {fname} predates p_multiwell — '
             'recomputing missing windows.[/yellow]'
         )
 
-    # Partial cache: collect rows already computed in other files
+    # Partial cache: collect rows already computed in other files at this interval.
     cached_df, covered_windows = _load_cached_windows(
-        output_dir, window_type, start_date, end_date, seconds_intervals
+        output_dir, window_type, seconds_interval, start_date, end_date,
     )
 
     all_windows = list(iter_windows(start_date, end_date, window_type))
@@ -538,52 +540,51 @@ def run_phase_a(
 
     rows = []
     for window_start, window_end in missing_windows:
-        for seconds_interval in seconds_intervals:
-            result = analyze_window(
-                window_start,
-                window_end,
-                seconds_interval,
-                kernel_half_width=kernel_half_width,
-                trim_quantile=trim_quantile,
-                n_bins=n_bins,
-                weight_threshold=weight_threshold,
-                detrend=detrend,
-                min_barrier_fraction=min_barrier_fraction,
-                min_well_separation=min_well_separation,
-            )
-            if result is None:
-                rows.append({
-                    'window_start': window_start.strftime('%Y-%m-%d'),
-                    'window_end': window_end.strftime('%Y-%m-%d'),
-                    'seconds_interval': seconds_interval,
-                    'regime': 'unavailable',
-                    'n_wells': None,
-                    'p_multiwell': None,
-                    'well_locations': None,
-                    'barriers': None,
-                    'n_observations': 0,
-                })
-                continue
-            km_path = os.path.join(
-                km_dir,
-                f"km_{result['window_start'].strftime('%Y-%m-%d')}_to_"
-                f"{result['window_end'].strftime('%Y-%m-%d')}_{seconds_interval}s.csv",
-            )
-            result['km_df'].to_csv(km_path, index=False)
+        result = analyze_window(
+            window_start,
+            window_end,
+            seconds_interval,
+            kernel_half_width=kernel_half_width,
+            trim_quantile=trim_quantile,
+            n_bins=n_bins,
+            weight_threshold=weight_threshold,
+            detrend=detrend,
+            min_barrier_fraction=min_barrier_fraction,
+            min_well_separation=min_well_separation,
+        )
+        if result is None:
             rows.append({
-                'window_start': result['window_start'].strftime('%Y-%m-%d'),
-                'window_end': result['window_end'].strftime('%Y-%m-%d'),
-                'seconds_interval': result['seconds_interval'],
-                'regime': result['regime'],
-                'n_wells': result['n_wells'],
-                'p_multiwell': result.get('p_multiwell', np.nan),
-                'well_locations': [round(x, 6) for x in result['well_locations']],
-                'barriers': [round(b, 6) for b in result['barriers']],
-                'u_range': result['u_range'],
-                'n_observations': result['n_observations'],
+                'window_start': window_start.strftime('%Y-%m-%d'),
+                'window_end': window_end.strftime('%Y-%m-%d'),
+                'seconds_interval': seconds_interval,
+                'regime': 'unavailable',
+                'n_wells': None,
+                'p_multiwell': None,
+                'well_locations': None,
+                'barriers': None,
+                'n_observations': 0,
             })
+            continue
+        km_path = os.path.join(
+            km_dir,
+            f"km_{result['window_start'].strftime('%Y-%m-%d')}_to_"
+            f"{result['window_end'].strftime('%Y-%m-%d')}_{seconds_interval}s.csv",
+        )
+        result['km_df'].to_csv(km_path, index=False)
+        rows.append({
+            'window_start': result['window_start'].strftime('%Y-%m-%d'),
+            'window_end': result['window_end'].strftime('%Y-%m-%d'),
+            'seconds_interval': seconds_interval,
+            'regime': result['regime'],
+            'n_wells': result['n_wells'],
+            'p_multiwell': result.get('p_multiwell', np.nan),
+            'well_locations': [round(x, 6) for x in result['well_locations']],
+            'barriers': [round(b, 6) for b in result['barriers']],
+            'u_range': result['u_range'],
+            'n_observations': result['n_observations'],
+        })
 
-    # Merge cached and newly computed rows
+    # Merge cached and newly computed rows.
     parts = []
     if not cached_df.empty:
         parts.append(cached_df)
@@ -595,21 +596,21 @@ def run_phase_a(
     # Deduplicate; prefer freshly computed rows (keep='last') so a stale cache
     # entry cannot shadow an updated p_multiwell or regime label.
     out_df = out_df.drop_duplicates(
-        subset=['window_start', 'window_end', 'seconds_interval'], keep='last'
+        subset=['window_start', 'window_end'], keep='last'
     )
-    out_df = out_df.sort_values(
-        ['window_start', 'seconds_interval']
-    ).reset_index(drop=True)
+    out_df = out_df.sort_values('window_start').reset_index(drop=True)
     out_df.to_csv(out_path, index=False)
     return out_df
 
 
 def print_regime_table(labels_df, console=None):
     console = console or Console()
-    table = Table(title='Phase A: Monthly Regime Labels')
+    intervals = sorted(set(pd.to_numeric(labels_df.get('seconds_interval', []),
+                                         errors='coerce').dropna().astype(int)))
+    interval_label = f'{intervals[0]}s' if len(intervals) == 1 else 'mixed'
+    table = Table(title=f'Phase A regime labels — Δt = {interval_label}')
     table.add_column('Start', style='cyan')
     table.add_column('End', style='cyan')
-    table.add_column(u'Δt (s)', justify='right')
     table.add_column('Regime', style='green')
     table.add_column('Wells', justify='right', style='magenta')
     table.add_column('p_multiwell', justify='right', style='magenta')
@@ -625,7 +626,6 @@ def print_regime_table(labels_df, console=None):
         if pd.isna(n_wells_val):
             n_wells_str = ''
         else:
-            # n_wells is now a float (posterior mean); show one decimal.
             n_wells_str = f'{float(n_wells_val):.1f}'
         if has_pmulti and pd.notna(r.get('p_multiwell')):
             pmulti_str = f"{float(r['p_multiwell']):.2f}"
@@ -634,7 +634,6 @@ def print_regime_table(labels_df, console=None):
         table.add_row(
             str(r['window_start']),
             str(r['window_end']),
-            str(r['seconds_interval']),
             str(r['regime']),
             n_wells_str,
             pmulti_str,

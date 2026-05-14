@@ -40,11 +40,11 @@ start_date = datetime(2025, 1, 1)
 end_date   = datetime(2025, 12, 31)
 
 # --- Data aggregation / KM estimation ----------------------------------------
-# seconds_interval: the bar size used inside Phase C. Phase A scans all the
-# intervals listed in seconds_intervals_phase_a so the GP topology can be
-# cross-checked across resolutions.
+# A single seconds_interval is used end-to-end. Phase A no longer cross-checks
+# across resolutions — uncertainty over topology is captured by p_multiwell.
+# Different intervals live in separate labels CSVs (interval encoded in the
+# filename) so they don't collide.
 seconds_interval         = 300
-seconds_intervals_phase_a = [300]
 kernel_half_width        = 20       # smoothing half-width for log-price aggregator
 trim_quantile            = 0.01    # symmetric tail trim on log-prices
 n_bins                   = 100     # number of bins for KM drift / diffusion
@@ -67,6 +67,9 @@ epsilon_P  = 1e-3                  # near-identity init for the transition matri
 sigma2     = None                  # None -> estimate from var(dx)/dt
 regime_specific_sigma2 = False     # if True, re-estimate sigma2 per state each M-step
 theta_init = 'km'                  # 'km' (Phase-A-pooled curves) or 'moments' (data-only)
+theta_init_seconds_interval = 30   # KM interval used for the warm start; can be
+                                   # finer than seconds_interval. KM is per-second
+                                   # so the scale is consistent across intervals.
 
 # --- Phase C priors ----------------------------------------------------------
 # Dwell-time enforcement: pull P[i,i] toward 1 - dt / target_dwell_seconds.
@@ -93,9 +96,14 @@ def main() -> None:
 
     console.rule('[bold cyan]Step 1 — Download + aggregate raw data')
     dc.ensure_data(snapped_start, snapped_end)
-    for interval in sorted(set(seconds_intervals_phase_a) | {seconds_interval}):
+    # If the KM warm-start uses a different interval, we need the aggregated
+    # bars + Phase A artefacts at *both* resolutions.
+    intervals_needed = {seconds_interval}
+    if theta_init == 'km' and theta_init_seconds_interval != seconds_interval:
+        intervals_needed.add(int(theta_init_seconds_interval))
+    for iv in sorted(intervals_needed):
         dc.aggregate_log_returns_range(
-            snapped_start, snapped_end, interval,
+            snapped_start, snapped_end, iv,
             kernel_half_width=kernel_half_width,
             trim_quantile=trim_quantile,
             detrend=detrend,
@@ -104,7 +112,7 @@ def main() -> None:
     console.rule('[bold cyan]Step 2 — Phase A: regime estimation')
     labels_df = run_phase_a(
         snapped_start, snapped_end,
-        seconds_intervals_phase_a,
+        seconds_interval,
         kernel_half_width=kernel_half_width,
         trim_quantile=trim_quantile,
         n_bins=n_bins,
@@ -121,14 +129,42 @@ def main() -> None:
     labels_csv = os.path.join(
         regime_dir,
         f"regime_labels_{snapped_start.strftime('%Y-%m-%d')}_to_"
-        f"{snapped_end.strftime('%Y-%m-%d')}_{window_type}.csv",
+        f"{snapped_end.strftime('%Y-%m-%d')}_{seconds_interval}s_{window_type}.csv",
     )
+
+    # Second Phase A pass at the KM warm-start interval (if different) so the
+    # corresponding labels CSV + km/ files exist for fit_initial_theta_from_km.
+    theta_init_labels_csv = None
+    if theta_init == 'km' and theta_init_seconds_interval != seconds_interval:
+        console.rule(
+            f'[bold cyan]Step 2b — Phase A at {theta_init_seconds_interval}s '
+            'for KM warm start'
+        )
+        run_phase_a(
+            snapped_start, snapped_end,
+            theta_init_seconds_interval,
+            kernel_half_width=kernel_half_width,
+            trim_quantile=trim_quantile,
+            n_bins=n_bins,
+            weight_threshold=weight_threshold,
+            detrend=detrend,
+            min_barrier_fraction=min_barrier_fraction,
+            min_well_separation=min_well_separation,
+            window_type=window_type,
+            output_dir=regime_dir,
+            console=console,
+        )
+        theta_init_labels_csv = os.path.join(
+            regime_dir,
+            f"regime_labels_{snapped_start.strftime('%Y-%m-%d')}_to_"
+            f"{snapped_end.strftime('%Y-%m-%d')}_"
+            f"{theta_init_seconds_interval}s_{window_type}.csv",
+        )
 
     console.rule('[bold cyan]Step 3 — Phase B: empirical Markov chain')
     mc = run_markov_chain(
         labels_csv,
         window_type=window_type,
-        seconds_interval=seconds_interval,
         output_dir=regime_dir,
         prior_lambda=prior_lambda,
         use_soft_counts=use_soft_counts,
@@ -154,6 +190,8 @@ def main() -> None:
         dwell_prior_strength=dwell_prior_strength,
         eta_label=eta_label,
         theta_init=theta_init,
+        theta_init_seconds_interval=theta_init_seconds_interval,
+        theta_init_labels_csv=theta_init_labels_csv,
         console=console,
     )
 

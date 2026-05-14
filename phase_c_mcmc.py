@@ -491,17 +491,19 @@ def _try_load_em_result(stem_em, output_dir, console):
 # Phase B count-matrix loader (avoid recomputing if results CSV exists)
 # ---------------------------------------------------------------------------
 
-def _try_load_phase_b_counts(labels_csv, seconds_interval, output_dir,
-                             prior_lambda, console):
+def _try_load_phase_b_counts(labels_csv, output_dir, prior_lambda, console):
     """
     Recover the Phase B N count matrix without re-running run_markov_chain.
 
     The Phase B results CSV stores the prior pseudo-counts alpha = 1 + lambda*N.
     Inverting that recovers N exactly. Returns None if the file is missing
     or malformed.
+
+    Labels CSVs are single-interval (interval encoded in filename), so the
+    MC artefact is keyed off the labels stem alone — no extra suffix.
     """
     stem = os.path.splitext(os.path.basename(labels_csv))[0]
-    mc_csv = os.path.join(output_dir, f'mc_{stem}_{seconds_interval}s_results.csv')
+    mc_csv = os.path.join(output_dir, f'mc_{stem}_results.csv')
     if not os.path.exists(mc_csv):
         return None
 
@@ -656,7 +658,7 @@ def run_phase_c_mcmc(
     # ------------------------------------------------------------------ #
     if N_phase_b is None:
         N_phase_b = _try_load_phase_b_counts(
-            labels_csv, seconds_interval, phase_b_dir, lambda_prior, console,
+            labels_csv, phase_b_dir, lambda_prior, console,
         )
         if N_phase_b is None:
             console.print(
@@ -664,7 +666,7 @@ def run_phase_c_mcmc(
             )
             from markov_chain import run_markov_chain
             mc = run_markov_chain(
-                labels_csv, seconds_interval=seconds_interval,
+                labels_csv,
                 output_dir=phase_b_dir, console=console,
                 prior_lambda=lambda_prior,
             )
@@ -870,19 +872,21 @@ if __name__ == '__main__':
 
     fname = (
         f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_"
-        f"{end_date.strftime('%Y-%m-%d')}_{window_type}.csv"
+        f"{end_date.strftime('%Y-%m-%d')}_{seconds_interval}s_{window_type}.csv"
     )
     labels_csv = os.path.join('regime_results', fname)
 
     if not os.path.exists(labels_csv):
-        # Fall back to the most recent labels CSV produced for this window_type
+        # Fall back to the most recent labels CSV produced at this interval +
+        # window_type pair.
         candidates = sorted(glob.glob(os.path.join(
-            'regime_results', f'regime_labels_*_{window_type}.csv',
+            'regime_results',
+            f'regime_labels_*_{seconds_interval}s_{window_type}.csv',
         )))
         if not candidates:
             raise FileNotFoundError(
-                f'No regime_labels CSV found in regime_results/. '
-                f'Run regime_estimation.py first.'
+                'No matching regime_labels CSV found in regime_results/. '
+                'Run RunEM.py first to populate it.'
             )
         labels_csv = candidates[-1]
 
