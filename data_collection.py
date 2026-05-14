@@ -271,3 +271,18 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
 
         combined_df.to_csv(output_file, index=False)
         return combined_df
+
+
+# ---------------------------------------------------------------------------
+# Useful tool
+# ---------------------------------------------------------------------------
+
+def window_seconds(window_type):
+    if window_type == 'weekly':
+        return 7 * 24 * 3600
+    elif window_type == 'biweekly':
+        return 14 * 24 * 3600
+    elif window_type == 'monthly':
+        return 30 * 24 * 3600
+    else:
+        raise ValueError(f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'.")

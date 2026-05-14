@@ -30,6 +30,19 @@ from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 import data_collection as dc
 from force_field_estimation import estimate_km
 
+# ---------------------------------------------------------------------------
+# Useful tool
+# ---------------------------------------------------------------------------
+
+def window_seconds(window_type):
+    if window_type == 'weekly':
+        return 7 * 24 * 3600
+    elif window_type == 'biweekly':
+        return 14 * 24 * 3600
+    elif window_type == 'monthly':
+        return 30 * 24 * 3600
+    else:
+        raise ValueError(f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'.")
 
 # ---------------------------------------------------------------------------
 # Window iteration
@@ -503,7 +516,7 @@ def run_phase_a(
     # p_multiwell (older CSVs written before that column existed force a rerun).
     if os.path.exists(out_path):
         cached = pd.read_csv(out_path)
-        good_regimes = ['single-well', 'multi-well', 'uncertain', 'no-equilibrium']
+        good_regimes = ['single-well', 'multi-well', 'uncertain']
         has_pmulti = (
             'p_multiwell' in cached.columns
             and cached[cached['regime'].isin(good_regimes)]['p_multiwell'].notna().all()

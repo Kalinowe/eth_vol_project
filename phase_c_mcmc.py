@@ -441,9 +441,9 @@ def posterior_predictive_forecast(p_filt_mean, chain_P,
 # ---------------------------------------------------------------------------
 
 def _phase_c_em_paths(stem_em, output_dir):
-    return {
-        'theta':  os.path.join(output_dir, f'{stem_em}_theta.csv'),
-        'probs':  os.path.join(output_dir, f'{stem_em}_probs.csv'),
+    return { # EM results are stored in an interval-specific subfolder
+        'theta':  os.path.join(output_dir, str(stem_em.split('_')[-1].replace('s', '')), f'{stem_em}_theta.csv'),
+        'probs':  os.path.join(output_dir, str(stem_em.split('_')[-1].replace('s', '')), f'{stem_em}_probs.csv'),
     }
 
 
@@ -595,18 +595,18 @@ def run_phase_c_mcmc(
     console = console or Console()
     rng = np.random.default_rng(seed)
 
+    interval_output_dir = os.path.join(output_dir, str(seconds_interval))
+    os.makedirs(interval_output_dir, exist_ok=True)
+
     stem_em = (
         f"phase_c_{pd.to_datetime(start_date).strftime('%Y-%m-%d')}_to_"
         f"{pd.to_datetime(end_date).strftime('%Y-%m-%d')}_{seconds_interval}s"
     )
-    stem = (
-        f"phase_c_mcmc_{pd.to_datetime(start_date).strftime('%Y-%m-%d')}_to_"
-        f"{pd.to_datetime(end_date).strftime('%Y-%m-%d')}_{seconds_interval}s"
-    )
+    stem = f"phase_c_mcmc_{pd.to_datetime(start_date).strftime('%Y-%m-%d')}_to_{pd.to_datetime(end_date).strftime('%Y-%m-%d')}_{seconds_interval}s"
 
-    chain_path    = os.path.join(output_dir, f'{stem}_chain.npz')
-    summary_path  = os.path.join(output_dir, f'{stem}_summary.csv')
-    forecast_path = os.path.join(output_dir, f'{stem}_forecast.csv')
+    chain_path    = os.path.join(interval_output_dir, f'{stem}_chain.npz')
+    summary_path  = os.path.join(interval_output_dir, f'{stem}_summary.csv')
+    forecast_path = os.path.join(interval_output_dir, f'{stem}_forecast.csv')
 
     # ------------------------------------------------------------------ #
     # Short-circuit when a complete chain is already on disk
@@ -681,14 +681,14 @@ def run_phase_c_mcmc(
     # EM warm start (cached or recomputed)
     # ------------------------------------------------------------------ #
     if em_result is None:
-        em_result = _try_load_em_result(stem_em, output_dir, console)
+        em_result = _try_load_em_result(stem_em, output_dir, console) # output_dir here is the base dir, _try_load_em_result will construct the interval-specific path
     if em_result is None:
         console.print(
             '[yellow]No EM result supplied or cached — running '
             'ExpectationMaximisation.run_phase_c to generate the warm start.[/yellow]'
         )
         from ExpectationMaximisation import run_phase_c
-        em_result = run_phase_c(
+        em_result = run_phase_c( # This call will save to the interval-specific subfolder
             start_date, end_date, seconds_interval,
             labels_csv=labels_csv,
             output_dir=output_dir,
@@ -815,18 +815,18 @@ def run_phase_c_mcmc(
     # Plots
     # ------------------------------------------------------------------ #
     plots.plot_phase_c_gamma_timeline(
-        chain['p_filt_mean'],
-        os.path.join(output_dir, f'{stem}_gamma_post.png'),
+        chain['p_filt_mean'], # Use interval_output_dir for plots
+        os.path.join(interval_output_dir, f'{stem}_gamma_post.png'),
         datetimes=pd.to_datetime(dt_t),
     )
     plots.plot_mcmc_kappa_posterior(
         np.array([t['kappa'] for t in chain['chain_theta']]),
         theta_em['kappa'],
-        os.path.join(output_dir, f'{stem}_kappa_post.png'),
+        os.path.join(interval_output_dir, f'{stem}_kappa_post.png'),
     )
     plots.plot_mcmc_loglik_trace(
         chain['chain_loglik'], n_burn,
-        os.path.join(output_dir, f'{stem}_loglik_trace.png'),
+        os.path.join(interval_output_dir, f'{stem}_loglik_trace.png'),
     )
 
     console.print(

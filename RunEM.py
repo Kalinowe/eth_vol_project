@@ -44,12 +44,12 @@ end_date   = datetime(2025, 12, 31)
 # across resolutions — uncertainty over topology is captured by p_multiwell.
 # Different intervals live in separate labels CSVs (interval encoded in the
 # filename) so they don't collide.
-seconds_interval         = 300
-kernel_half_width        = 20       # smoothing half-width for log-price aggregator
+seconds_interval         = 100
+kernel_half_width        = 50       # smoothing half-width for log-price aggregator
 trim_quantile            = 0.01    # symmetric tail trim on log-prices
 n_bins                   = 100     # number of bins for KM drift / diffusion
 weight_threshold         = 5       # minimum bin count for a usable KM cell
-detrend                  = 1       # 1 -> linear-detrend log-prices before KM
+detrend                  = 0       # 1 -> linear-detrend log-prices before KM
 
 # --- Phase A topology classifier ---------------------------------------------
 window_type           = 'weekly'   # 'weekly' | 'biweekly' | 'monthly'
@@ -65,18 +65,18 @@ max_iter   = 30
 tol        = 1e-4
 epsilon_P  = 1e-3                  # near-identity init for the transition matrix
 sigma2     = None                  # None -> estimate from var(dx)/dt
-regime_specific_sigma2 = False     # if True, re-estimate sigma2 per state each M-step
-theta_init = 'km'                  # 'km' (Phase-A-pooled curves) or 'moments' (data-only)
-theta_init_seconds_interval = 30   # KM interval used for the warm start; can be
+regime_specific_sigma2 = True     # if True, re-estimate sigma2 per state each M-step
+theta_init = 'moments'                  # 'km' (Phase-A-pooled curves) or 'moments' (data-only)
+theta_init_seconds_interval = 60   # KM interval used for the warm start; can be
                                    # finer than seconds_interval. KM is per-second
                                    # so the scale is consistent across intervals.
 
 # --- Phase C priors ----------------------------------------------------------
 # Dwell-time enforcement: pull P[i,i] toward 1 - dt / target_dwell_seconds.
-target_dwell_seconds   = 7 * 86400.0   # one week
+target_dwell_seconds   = dc.window_seconds(window_type)   # one week
 dwell_prior_strength   = 10          # prior mass = strength * len(dx); 0 disables
 # GP label tilt: add eta_label * log p_multiwell_window(t) to emission log-b.
-eta_label              = 0.5          # 0 disables
+eta_label              = 0.3          # 0 disables
 
 # --- Output ------------------------------------------------------------------
 regime_dir   = 'regime_results'        # Phase A + Phase B artefacts
@@ -102,6 +102,8 @@ def main() -> None:
     if theta_init == 'km' and theta_init_seconds_interval != seconds_interval:
         intervals_needed.add(int(theta_init_seconds_interval))
     for iv in sorted(intervals_needed):
+
+        
         dc.aggregate_log_returns_range(
             snapped_start, snapped_end, iv,
             kernel_half_width=kernel_half_width,
@@ -109,36 +111,14 @@ def main() -> None:
             detrend=detrend,
         )
 
-    console.rule('[bold cyan]Step 2 — Phase A: regime estimation')
-    labels_df = run_phase_a(
-        snapped_start, snapped_end,
-        seconds_interval,
-        kernel_half_width=kernel_half_width,
-        trim_quantile=trim_quantile,
-        n_bins=n_bins,
-        weight_threshold=weight_threshold,
-        detrend=detrend,
-        min_barrier_fraction=min_barrier_fraction,
-        min_well_separation=min_well_separation,
-        window_type=window_type,
-        output_dir=regime_dir,
-        console=console,
-    )
-    print_regime_table(labels_df, console=console)
-
-    labels_csv = os.path.join(
-        regime_dir,
-        f"regime_labels_{snapped_start.strftime('%Y-%m-%d')}_to_"
-        f"{snapped_end.strftime('%Y-%m-%d')}_{seconds_interval}s_{window_type}.csv",
-    )
-
-    # Second Phase A pass at the KM warm-start interval (if different) so the
-    # corresponding labels CSV + km/ files exist for fit_initial_theta_from_km.
     theta_init_labels_csv = None
+    # Phase A pass at the KM warm-start interval (if different) so the
+    # corresponding labels CSV + km/ files exist for fit_initial_theta_from_km.
     if theta_init == 'km' and theta_init_seconds_interval != seconds_interval:
+ 
         console.rule(
-            f'[bold cyan]Step 2b — Phase A at {theta_init_seconds_interval}s '
-            'for KM warm start'
+            f'[bold cyan]Step 2 — Phase A regime estimation at {theta_init_seconds_interval}s '
+            'for a KM-based warm start'
         )
         run_phase_a(
             snapped_start, snapped_end,
@@ -161,9 +141,35 @@ def main() -> None:
             f"{theta_init_seconds_interval}s_{window_type}.csv",
         )
 
+    else:
+
+        console.rule('[bold cyan]Step 2 — Phase A: regime estimation for moments-based warm start')
+        labels_df = run_phase_a(
+            snapped_start, snapped_end,
+            seconds_interval,
+            kernel_half_width=kernel_half_width,
+            trim_quantile=trim_quantile,
+            n_bins=n_bins,
+            weight_threshold=weight_threshold,
+            detrend=detrend,
+            min_barrier_fraction=min_barrier_fraction,
+            min_well_separation=min_well_separation,
+            window_type=window_type,
+            output_dir=regime_dir,
+            console=console,
+        )
+        print_regime_table(labels_df, console=console)
+
+    labels_csv = os.path.join(
+        regime_dir,
+        f"regime_labels_{snapped_start.strftime('%Y-%m-%d')}_to_"
+        f"{snapped_end.strftime('%Y-%m-%d')}_{seconds_interval}s_{window_type}.csv",
+    )
+
+
     console.rule('[bold cyan]Step 3 — Phase B: empirical Markov chain')
     mc = run_markov_chain(
-        labels_csv,
+        labels_csv=labels_csv,
         window_type=window_type,
         output_dir=regime_dir,
         prior_lambda=prior_lambda,
