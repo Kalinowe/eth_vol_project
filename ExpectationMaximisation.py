@@ -195,12 +195,31 @@ def pool_km_drift_curves(
 ):
     """
     Pool per-window km_df drift curves for windows whose Phase A label matches
-    `regime_label` at the requested seconds_interval. Bin-aggregate (mean) onto
-    a common bin_center grid and return (x, mu_hat).
+    `regime_label` at the requested seconds_interval. Each per-bin row inherits
+    two weights:
+
+      - the KM bin count (``weight`` in km_df) — more counts = more precise drift,
+      - the window's regime confidence from ``p_multiwell`` — high for multi-well
+        when pooling 'multi-well', 1 - p_multiwell when pooling 'single-well'.
+
+    Their product ``w_combined = weight * regime_confidence`` is the WLS weight
+    used downstream. Bins are aggregated as a weighted mean over the union of
+    contributing windows.
+
+    Returns
+    -------
+    x  : (B,) sorted bin centres
+    mu : (B,) pooled drift (annualised if annualize=True)
+    w  : (B,) combined weights summed across windows
     """
     df = pd.read_csv(labels_csv)
     sub = df[(df['regime'] == regime_label)
              & (df['seconds_interval'] == seconds_interval)]
+
+    if sub.empty:
+        return np.array([]), np.array([]), np.array([])
+
+    has_pmulti = 'p_multiwell' in sub.columns
 
     pooled = []
     for _, row in sub.iterrows():
@@ -210,19 +229,36 @@ def pool_km_drift_curves(
         )
         if km is None:
             continue
-        clean = km.dropna(subset=['drift'])[['bin_center', 'drift']]
-        if not clean.empty:
-            pooled.append(clean)
+        clean = km.dropna(subset=['drift'])[['bin_center', 'drift', 'weight']].copy()
+        if clean.empty:
+            continue
+
+        if has_pmulti:
+            p_mw = row.get('p_multiwell')
+            p_mw = 0.5 if (p_mw is None or pd.isna(p_mw)) else float(p_mw)
+        else:
+            p_mw = 1.0 if regime_label == 'multi-well' else 0.0
+        regime_conf = p_mw if regime_label == 'multi-well' else (1.0 - p_mw)
+        clean['w_combined'] = clean['weight'].astype(float) * float(regime_conf)
+        pooled.append(clean)
 
     if not pooled:
-        return np.array([]), np.array([])
+        return np.array([]), np.array([]), np.array([])
 
     pooled_df = pd.concat(pooled, ignore_index=True)
     pooled_df['bin'] = np.round(pooled_df['bin_center'], 4)
-    agg = pooled_df.groupby('bin')['drift'].mean().reset_index()
+    pooled_df['drift_w'] = pooled_df['drift'] * pooled_df['w_combined']
+    grouped = pooled_df.groupby('bin')
+    agg = pd.DataFrame({
+        'sum_drift_w': grouped['drift_w'].sum(),
+        'sum_w':       grouped['w_combined'].sum(),
+    }).reset_index()
+    agg = agg[agg['sum_w'] > 0].copy()
+    agg['drift'] = agg['sum_drift_w'] / agg['sum_w']
+
     x = agg['bin'].values.astype(float)
     mu = agg['drift'].values.astype(float)
-    w = agg['p_multiwell'].values.astype(float)
+    w = agg['sum_w'].values.astype(float)
     if annualize:
         sec_per_year = 365.25 * 24 * 3600
         mu = mu * sec_per_year
@@ -231,12 +267,18 @@ def pool_km_drift_curves(
 
 def fit_initial_theta_from_km(labels_csv, seconds_interval, output_dir, console=None):
     """
-    Fit OU and cubic drifts to pooled km drift curves. Falls back to heuristic
-    defaults when no km files are available for one of the regimes.
+    Initialise theta from pooled per-window KM drift curves produced by Phase A.
 
-    Retained for comparison; the active initialiser is
-    ``fit_initial_theta_moments`` which fits to the Phase C observation pairs
-    directly and avoids the circular dependency on Phase A labels.
+    Active initialiser for the EM (selectable via ``theta_init='km'`` in
+    ``run_phase_c``). Both fits are weighted by ``pool_km_drift_curves``'s
+    combined weight (KM bin count × window regime-confidence).
+
+    Returns
+    -------
+    dict | None
+        {'kappa','m','alpha','beta','c'} on success; ``None`` if either pool
+        is too sparse, so the caller can fall back to the data-only moment
+        initialiser.
     """
     console = console or Console()
 
@@ -247,39 +289,35 @@ def fit_initial_theta_from_km(labels_csv, seconds_interval, output_dir, console=
         labels_csv, 'single-well', seconds_interval, output_dir,
         annualize=False,
     )
-    if len(x1) >= 5:
-        intercept, slope = _wls_linear(x1, mu1, w1)
-        kappa = max(-slope, 1e-9)
-        m = intercept / kappa
-    else:
-        warnings.warn('No single-well km_df available; using OU defaults.')
-        kappa, m = 1.0, 0.0
-
-    # State 1: cubic drift  -alpha*(x-c)^3 + beta*(x-c).
     x2, mu2, w2 = pool_km_drift_curves(
         labels_csv, 'multi-well', seconds_interval, output_dir,
         annualize=False,
     )
-    if len(x2) >= 5:
-        c0 = float(np.mean(x2))
-        """
-        def _resid(p):
-            a, b, c = p
-            return mu2 - mu_multi(x2, a, b, c)
-        """
-        alpha, beta, c = _wls_cubic(x2, mu2, w2, theta_prev={'alpha': 1.0, 'beta': 1.0, 'c': c0})
-        alpha = max(float(alpha), 1e-9)
-        beta = float(beta)
-        c = float(c)
-    else:
-        warnings.warn('No multi-well km_df available; using cubic defaults.')
-        alpha, beta, c = 1.0, 1.0, 0.0
+    if len(x1) < 5 or len(x2) < 5:
+        console.print(
+            f'[yellow]KM-pooled curves too sparse '
+            f'(single-well n={len(x1)}, multi-well n={len(x2)}); '
+            'caller should fall back to moments-based init.[/yellow]'
+        )
+        return None
 
-    return {'kappa': float(kappa),
-            'm': float(m),
-            'alpha': float(max(alpha,1e-4)),
-            'beta': float(beta),
-            'c': float(c)}
+    intercept, slope = _wls_linear(x1, mu1, w1)
+    kappa = max(-slope, 1e-9)
+    m = intercept / kappa
+
+    c0 = float(np.mean(x2))
+    alpha, beta, c = _wls_cubic(
+        x2, mu2, w2,
+        theta_prev={'alpha': 1.0, 'beta': 1.0, 'c': c0},
+    )
+
+    return {
+        'kappa': float(kappa),
+        'm':     float(m),
+        'alpha': float(max(alpha, 1e-4)),
+        'beta':  float(beta),
+        'c':     float(c),
+    }
 
 
 def fit_initial_theta_moments(x_prev, dx, dt, console=None):
@@ -756,6 +794,7 @@ def estimate_kappa_series(
     dt_t: np.ndarray,
     window_size: int = 2000,
     step: int = 200,
+    smooth_window: int = 30,
 ) -> pd.DataFrame:
     """
     Rolling-window OU mean-reversion rate kappa over the Phase C observation
@@ -764,13 +803,16 @@ def estimate_kappa_series(
 
     Uses OLS of (dx/dt) on x_prev per window: intercept gives kappa*m,
     slope gives -kappa. The returned column ``kappa_ann`` is annualised
-    (multiplied by SEC_PER_YEAR); per-second values are easy to derive but
-    too small to read in plots.
+    (multiplied by SEC_PER_YEAR). A centred rolling-mean of width
+    ``smooth_window`` (in samples, not seconds) is then applied and stored
+    in ``kappa_ann_smoothed`` so plots get a readable trend rather than a
+    noisy zig-zag. Set ``smooth_window <= 1`` to disable.
     """
     r = dx / dt
     T = len(r)
+    cols = ['datetime', 'kappa_ann', 'kappa_ann_smoothed', 'kappa_m', 'n_obs']
     if T <= window_size:
-        return pd.DataFrame(columns=['datetime', 'kappa_ann', 'kappa_m', 'n_obs'])
+        return pd.DataFrame(columns=cols)
 
     rows = []
     idx = np.arange(0, T - window_size, step)
@@ -788,7 +830,17 @@ def estimate_kappa_series(
             'kappa_m': float(m),
             'n_obs': int(window_size),
         })
-    return pd.DataFrame(rows)
+
+    df = pd.DataFrame(rows)
+    if smooth_window and smooth_window > 1:
+        df['kappa_ann_smoothed'] = (
+            df['kappa_ann']
+              .rolling(window=int(smooth_window), center=True, min_periods=1)
+              .mean()
+        )
+    else:
+        df['kappa_ann_smoothed'] = df['kappa_ann']
+    return df[cols]
 
 
 # ---------------------------------------------------------------------------
@@ -813,6 +865,7 @@ def run_phase_c(
     target_dwell_seconds=7 * 86400.0,
     dwell_prior_strength=10.0,
     eta_label=0.3,
+    theta_init='km',
     console=None,
 ):
     """
@@ -841,6 +894,12 @@ def run_phase_c(
                  pull P closer to the target dwell. Pass 0 to disable.
     eta_label  : strength of the Phase A GP p_multiwell tilt on the
                  emission log-likelihoods. Pass 0 to disable.
+    theta_init : 'km' (default) -> initialise theta from pooled Phase A KM
+                 drift curves via ``fit_initial_theta_from_km``. Falls back
+                 to 'moments' when the pools are too sparse.
+                 'moments' -> data-only init via
+                 ``fit_initial_theta_moments`` (OLS + 2-means clustering).
+                 No dependence on Phase A.
     """
     os.makedirs(output_dir, exist_ok=True)
     console = console or Console()
@@ -883,10 +942,23 @@ def run_phase_c(
             f'-> annualised sigma = {s_ann_init[0]:.4f}'
         )
 
-    theta = fit_initial_theta_moments(x_prev, dx, dt, console=console)
+    theta = None
+    if theta_init == 'km':
+        # ``output_dir`` here is the Phase C output directory; Phase A KM CSVs
+        # live in the *labels* directory.  Use that as the search root.
+        km_root = os.path.dirname(labels_csv) or '.'
+        theta = fit_initial_theta_from_km(
+            labels_csv, int(seconds_interval), km_root, console=console,
+        )
+        if theta is None:
+            console.print(
+                '[yellow]Falling back to moments-based theta init.[/yellow]'
+            )
+    if theta is None:
+        theta = fit_initial_theta_moments(x_prev, dx, dt, console=console)
     theta_ann = annualize_theta(theta)
     console.print(
-        f'  initial theta (annualised): '
+        f'  initial theta (annualised, init={theta_init}): '
         f'kappa_ann={theta_ann["kappa_ann"]:.4g}  m={theta_ann["m"]:.4g}  '
         f'alpha_ann={theta_ann["alpha_ann"]:.4g}  '
         f'beta_ann={theta_ann["beta_ann"]:.4g}  c={theta_ann["c"]:.4g}'
@@ -1036,9 +1108,23 @@ def run_phase_c(
     }).to_csv(lltrace_path, index=False)
     console.print(f'[green]Wrote[/green] {lltrace_path}')
 
-    plots.plot_phase_c_gamma_timeline(
-        out['gamma'],
-        os.path.join(output_dir, f'{stem}_gamma.png'),
+    plots.plot_phase_c_drifts(
+        x_prev,
+        out['theta'],
+        os.path.join(output_dir, f'{stem}_drifts.png'),
+    )
+
+    # Rolling kappa(t) — critical-slowing-down diagnostic. Smoothed for
+    # readability; raw kappa_ann is kept alongside in the CSV.
+    df_kappa = estimate_kappa_series(x_prev, dx, float(dt), dt_t)
+    kappa_path = os.path.join(output_dir, f'{stem}_kappa.csv')
+    df_kappa.to_csv(kappa_path, index=False)
+    console.print(f'[green]Wrote[/green] {kappa_path}')
+
+    # Overlay: filled gamma area with smoothed kappa on top.
+    plots.plot_gamma_kappa_overlay(
+        out['gamma'], df_kappa,
+        os.path.join(output_dir, f'{stem}_gamma_kappa.png'),
         datetimes=pd.to_datetime(dt_t),
     )
 

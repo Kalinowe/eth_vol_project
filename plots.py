@@ -269,29 +269,30 @@ def plot_phase_c_gamma_timeline(gamma, output_path, datetimes=None):
     plt.close(fig)
     print(f'Saved {output_path}')
 
-"""
 def plot_phase_c_drifts(x_prev, theta, output_path):
-
- #   Fitted parametric drifts mu_1 (OU) and mu_2 (cubic) on a common x grid,
- #   plus a histogram of x_prev for context.
-  
+    """
+    Fitted parametric drifts mu_1 (OU) and mu_2 (cubic) on a common x grid,
+    plus a histogram of x_prev for context. Drifts are plotted **annualised**
+    (multiplied by SEC_PER_YEAR) to match the project convention.
+    """
+    sec_per_year = 365.25 * 24 * 3600
     x_lo, x_hi = float(np.min(x_prev)), float(np.max(x_prev))
     x_grid = np.linspace(x_lo, x_hi, 400)
-    mu1 = -theta['kappa'] * (x_grid - theta['m'])
+    mu1 = (-theta['kappa'] * (x_grid - theta['m'])) * sec_per_year
     u = x_grid - theta['c']
-    mu2 = -theta['alpha'] * u ** 3 + theta['beta'] * u
+    mu2 = (-theta['alpha'] * u ** 3 + theta['beta'] * u) * sec_per_year
 
     fig, (ax1, ax2) = plt.subplots(
         2, 1, figsize=(10, 7), sharex=True,
         gridspec_kw={'height_ratios': [3, 1]},
     )
     ax1.plot(x_grid, mu1, color='#2196F3',
-             label=r'state 0  $-\kappa(x-m)$')
+             label=r'state 0  $-\kappa(x-m)$  (single-well)')
     ax1.plot(x_grid, mu2, color='#F44336',
-             label=r'state 1  $-\alpha(x-c)^3+\beta(x-c)$')
+             label=r'state 1  $-\alpha(x-c)^3+\beta(x-c)$  (multi-well)')
     ax1.axhline(0, color='gray', alpha=0.4, lw=0.5)
-    ax1.set_ylabel('drift')
-    ax1.set_title('Phase C — fitted parametric drifts')
+    ax1.set_ylabel('drift (yr$^{-1}$)')
+    ax1.set_title('Phase C — fitted parametric drifts (annualised)')
     ax1.grid(True, alpha=0.3)
     ax1.legend()
 
@@ -304,7 +305,76 @@ def plot_phase_c_drifts(x_prev, theta, output_path):
     fig.savefig(output_path, dpi=120)
     plt.close(fig)
     print(f'Saved {output_path}')
-"""
+
+def plot_gamma_kappa_overlay(
+    gamma: np.ndarray,
+    df_kappa: pd.DataFrame,
+    output_path: str,
+    datetimes=None,
+) -> None:
+    """
+    Overlay: filled area = smoothed multi-well probability γ_t (right axis,
+    [0, 1]); line on top = annualised rolling κ(t) (left axis). Designed to
+    answer 'does a fall in κ precede a multi-well regime?'.
+    """
+    if datetimes is not None:
+        x_gamma = pd.to_datetime(datetimes)
+    else:
+        x_gamma = np.arange(len(gamma))
+
+    fig, ax_k = plt.subplots(figsize=(13, 4.5))
+    ax_g = ax_k.twinx()
+
+    # Right axis: filled regime probability (drawn first, lower z-order).
+    ax_g.fill_between(
+        x_gamma, 0.0, gamma[:, 1],
+        color='#F44336', alpha=0.22,
+        linewidth=0,
+        label=r'$\gamma_t$(multi-well)',
+    )
+    ax_g.plot(x_gamma, gamma[:, 1], color='#F44336', lw=0.6, alpha=0.55)
+    ax_g.set_ylim(0.0, 1.0)
+    ax_g.set_ylabel(r'$\gamma_t$ (multi-well)', color='#F44336')
+    ax_g.tick_params(axis='y', labelcolor='#F44336')
+
+    # Left axis: kappa line (drawn on top via zorder shuffle).
+    if df_kappa is not None and not df_kappa.empty:
+        col = (
+            'kappa_ann_smoothed'
+            if 'kappa_ann_smoothed' in df_kappa.columns
+            else ('kappa_ann' if 'kappa_ann' in df_kappa.columns else 'kappa')
+        )
+        ax_k.plot(
+            df_kappa['datetime'], df_kappa[col],
+            color='#1565C0', lw=1.6,
+            label=r'$\kappa_{\mathrm{ann}}(t)$ (smoothed)',
+        )
+        median_k = float(np.nanmedian(df_kappa[col]))
+        ax_k.axhline(
+            median_k, color='gray', ls='--', lw=0.9, alpha=0.7,
+            label=f'median κ = {median_k:.3g}',
+        )
+    ax_k.set_ylabel(r'$\kappa_{\mathrm{ann}}$ (yr$^{-1}$)', color='#1565C0')
+    ax_k.tick_params(axis='y', labelcolor='#1565C0')
+    ax_k.set_xlabel('Date')
+    ax_k.set_title('Phase C — κ(t) over smoothed multi-well probability')
+    ax_k.grid(True, alpha=0.3)
+
+    # Put the kappa axis (and line) above the filled area.
+    ax_k.set_zorder(ax_g.get_zorder() + 1)
+    ax_k.patch.set_visible(False)
+
+    # Combined legend across both axes.
+    h_k, l_k = ax_k.get_legend_handles_labels()
+    h_g, l_g = ax_g.get_legend_handles_labels()
+    ax_k.legend(h_k + h_g, l_k + l_g, loc='upper left', fontsize=9, framealpha=0.85)
+
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=130)
+    plt.close(fig)
+    print(f'Saved {output_path}')
+
 
 def plot_kappa_series(df_kappa: pd.DataFrame, output_path: str) -> None:
     """
@@ -317,7 +387,11 @@ def plot_kappa_series(df_kappa: pd.DataFrame, output_path: str) -> None:
         print(f'[plot_kappa_series] empty DataFrame; skipping {output_path}')
         return
 
-    col = 'kappa_ann' if 'kappa_ann' in df_kappa.columns else 'kappa'
+    col = (
+        'kappa_ann_smoothed'
+        if 'kappa_ann_smoothed' in df_kappa.columns
+        else ('kappa_ann' if 'kappa_ann' in df_kappa.columns else 'kappa')
+    )
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.plot(df_kappa['datetime'], df_kappa[col],
             color='#2196F3', lw=1.0, label=r'$\kappa_{\mathrm{ann}}(t)$')

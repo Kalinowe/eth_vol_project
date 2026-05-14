@@ -66,6 +66,7 @@ tol        = 1e-4
 epsilon_P  = 1e-3                  # near-identity init for the transition matrix
 sigma2     = None                  # None -> estimate from var(dx)/dt
 regime_specific_sigma2 = False     # if True, re-estimate sigma2 per state each M-step
+theta_init = 'km'                  # 'km' (Phase-A-pooled curves) or 'moments' (data-only)
 
 # --- Phase C priors ----------------------------------------------------------
 # Dwell-time enforcement: pull P[i,i] toward 1 - dt / target_dwell_seconds.
@@ -152,6 +153,7 @@ def main() -> None:
         target_dwell_seconds=target_dwell_seconds,
         dwell_prior_strength=dwell_prior_strength,
         eta_label=eta_label,
+        theta_init=theta_init,
         console=console,
     )
 

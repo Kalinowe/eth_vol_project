@@ -44,8 +44,6 @@ Outputs (written to output_dir)
     mc_<stem>_<interval>s_results.csv
 """
 
-from datetime import datetime
-import glob
 import os
 import warnings
 
@@ -55,7 +53,6 @@ from rich.console import Console
 from rich.table import Table
 
 import plots
-from regime_estimation import normalize_window_boundaries
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -531,22 +528,13 @@ def run_markov_chain(
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    
-    start_date = datetime(2024, 1, 1)
-    end_date = datetime(2024, 12, 31)
-    window_type = 'weekly'
-
-    start_date, end_date = normalize_window_boundaries(start_date,end_date,window_type)
-    seconds_interval = 30
-
-    fname = (
-    f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_{end_date.strftime('%Y-%m-%d')}"
-    f"_{window_type}.csv")
-
-    labels_csv = os.path.join('regime_results', fname)
-
-    _console = Console()
-    _console.print(f'[cyan]Labels file : {labels_csv}[/cyan]')
-    _console.print(f'[cyan]Interval    : {seconds_interval}s[/cyan]')
-
-    run_markov_chain(labels_csv, seconds_interval=seconds_interval)
+    # Standalone execution is intentionally disabled: this module is part of
+    # the pipeline and its parameters live in RunEM.py. Running it directly
+    # would silently fall back to hardcoded config and quietly diverge from
+    # whatever RunEM is currently configured to do.
+    Console().print(
+        '[yellow]markov_chain.py is part of the pipeline; '
+        'run [bold]python RunEM.py[/bold] to execute Phase B with the '
+        'centrally-configured parameters.[/yellow]'
+    )
+    raise SystemExit(0)

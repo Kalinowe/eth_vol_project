@@ -650,40 +650,13 @@ def print_regime_table(labels_df, console=None):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    # --- Configuration (mirrors RunEM.py defaults so windows can be cross-checked) ---
-    start_date = datetime(2024, 1, 1)
-    end_date = datetime(2024, 12, 31)
-
-    seconds_intervals = [300]
-    kernel_half_width = 20
-    trim_quantile = 0.01
-    n_bins = 100
-    weight_threshold = 5
-    detrend = 1  # leave the trend in; let mu(x) absorb it
-
-    # Window granularity: 'weekly', 'biweekly', or 'monthly'
-    window_type = 'weekly'
-
-    # Topology filters. min_barrier_fraction: keep a well only if its barrier
-    # height is >= this fraction of the total U range. 0.1 = 10%.
-    # Increase toward 0.2-0.3 to suppress minor wiggles.
-    min_barrier_fraction = 0.1
-    min_well_separation = 0.0
-
-    _console = Console()
-    labels = run_phase_a(
-        start_date,
-        end_date,
-        seconds_intervals,
-        kernel_half_width=kernel_half_width,
-        trim_quantile=trim_quantile,
-        n_bins=n_bins,
-        weight_threshold=weight_threshold,
-        detrend=detrend,
-        min_barrier_fraction=min_barrier_fraction,
-        min_well_separation=min_well_separation,
-        window_type=window_type,
-        console=_console,
+    # Standalone execution is intentionally disabled: this module is part of
+    # the pipeline and its parameters live in RunEM.py. Running it directly
+    # would silently fall back to the old hardcoded config and quietly
+    # diverge from whatever RunEM is currently configured to do.
+    Console().print(
+        '[yellow]regime_estimation.py is part of the pipeline; '
+        'run [bold]python RunEM.py[/bold] to execute Phase A with the '
+        'centrally-configured parameters.[/yellow]'
     )
-
-    print_regime_table(labels)
+    raise SystemExit(0)
