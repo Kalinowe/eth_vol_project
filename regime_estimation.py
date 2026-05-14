@@ -654,8 +654,8 @@ if __name__ == '__main__':
     start_date = datetime(2024, 1, 1)
     end_date = datetime(2024, 12, 31)
 
-    seconds_intervals = [30, 60, 120]
-    kernel_half_width = 5
+    seconds_intervals = [300]
+    kernel_half_width = 20
     trim_quantile = 0.01
     n_bins = 100
     weight_threshold = 5

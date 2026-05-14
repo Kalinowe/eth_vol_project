@@ -336,29 +336,6 @@ def plot_kappa_series(df_kappa: pd.DataFrame, output_path: str) -> None:
     print(f'Saved {output_path}')
 
 
-def plot_forecast(df_forecast: pd.DataFrame, output_path: str, k: int = 5) -> None:
-    """
-    Line chart of P(multi-well | x_{1:t}) at horizon k vs t, with a 0.5
-    reference line.
-    """
-    sub = df_forecast[df_forecast['k'] == k]
-    if sub.empty:
-        print(f'[plot_forecast] no rows for k={k}; skipping {output_path}')
-        return
-
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(sub['t'], sub['p_multi_ahead'], color='#F44336', lw=0.7)
-    ax.axhline(0.5, color='gray', ls='--', lw=0.9)
-    ax.set_ylim(0, 1)
-    ax.set_xlabel('t (step index)')
-    ax.set_ylabel('P(multi-well ahead)')
-    ax.set_title(f'P(multi-well | x_{{1:t}}), k={k} steps ahead')
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=120)
-    plt.close(fig)
-    print(f'Saved {output_path}')
-
 
 def plot_mcmc_kappa_posterior(kappa_samples, kappa_em, output_path):
     """

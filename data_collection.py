@@ -210,65 +210,64 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
     )
     if os.path.exists(output_file):
         cached = pd.read_csv(output_file, parse_dates=['datetime'])
-        if not cached.empty:
-            return cached
-        os.remove(output_file)  # stale empty file — fall through and re-aggregate
-
-    current = start_dt
-    combined_frames = []
-
-    prev_log_last = None
-    while current <= end_dt:
-        date_str = current.strftime('%Y-%m-%d')
-        csv_path = os.path.join(output_dir, f'ETHUSDT-aggTrades-{date_str}.csv')
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f'Missing required CSV file: {csv_path}')
-
-        daily_df, prev_log_last = aggregate_log_returns(
-            csv_path, 
-            x_seconds, 
-            prev_log_last=prev_log_last, 
-            kernel_half_width=kernel_half_width
-        )
-        combined_frames.append(daily_df)
-        current += timedelta(days=1)
-
-    if combined_frames:
-        combined_df = pd.concat(combined_frames, ignore_index=True)
+        return cached
     else:
-        combined_df = pd.DataFrame(columns=['datetime', 'log_return'])
 
-    # Validate evenly spaced intervals across the full stacked range
-    if not combined_df.empty:
-        if not combined_df['datetime'].is_monotonic_increasing:
-            raise ValueError('Combined datetime values are not strictly increasing.')
+        current = start_dt
+        combined_frames = []
 
-        interval_seconds = combined_df['datetime'].diff().dt.total_seconds().iloc[1:]
-        if not np.allclose(interval_seconds, x_seconds, atol=1e-6):
-            bad_index = interval_seconds[~np.isclose(interval_seconds, x_seconds, atol=1e-6)].index[0]
-            bad_start = combined_df.loc[bad_index - 1, 'datetime']
-            bad_end = combined_df.loc[bad_index, 'datetime']
-            raise ValueError(
-                f'Uneven interval spacing detected between {bad_start} and {bad_end}: '
-                f'{interval_seconds.iloc[bad_index-1]} seconds (expected {x_seconds})'
+        prev_log_last = None
+        while current <= end_dt:
+            date_str = current.strftime('%Y-%m-%d')
+            csv_path = os.path.join(output_dir, f'ETHUSDT-aggTrades-{date_str}.csv')
+            if not os.path.exists(csv_path):
+                raise FileNotFoundError(f'Missing required CSV file: {csv_path}')
+
+            daily_df, prev_log_last = aggregate_log_returns(
+                csv_path, 
+                x_seconds, 
+                prev_log_last=prev_log_last, 
+                kernel_half_width=kernel_half_width
             )
-            
-    # Remove linear trend from log-prices if requested
-    if detrend and not combined_df.empty:
-        t = np.arange(len(combined_df), dtype=np.float64)
-        for col in ('log_first_price', 'log_last_price'):
-            valid = combined_df[col].notna()
-            coeffs = np.polyfit(t[valid], combined_df.loc[valid, col], 1)
-            trend = np.polyval(coeffs, t)
-            combined_df[col] = combined_df[col] - trend
-        combined_df['log_return'] = combined_df['log_last_price'] - combined_df['log_first_price']
+            combined_frames.append(daily_df)
+            current += timedelta(days=1)
 
-    # Trim extreme log prices if requested
-    if trim_quantile > 0 and not combined_df.empty:
-        lower_q = combined_df['log_first_price'].quantile(trim_quantile / 2)
-        upper_q = combined_df['log_first_price'].quantile(1 - trim_quantile / 2)
-        combined_df = combined_df[(combined_df['log_first_price'] >= lower_q) & 
-                                 (combined_df['log_first_price'] <= upper_q)].copy()
+        if combined_frames:
+            combined_df = pd.concat(combined_frames, ignore_index=True)
+        else:
+            combined_df = pd.DataFrame(columns=['datetime', 'log_return'])
 
-    combined_df.to_csv(output_file, index=False)
-    return combined_df
+        # Validate evenly spaced intervals across the full stacked range
+        if not combined_df.empty:
+            if not combined_df['datetime'].is_monotonic_increasing:
+                raise ValueError('Combined datetime values are not strictly increasing.')
+
+            interval_seconds = combined_df['datetime'].diff().dt.total_seconds().iloc[1:]
+            if not np.allclose(interval_seconds, x_seconds, atol=1e-6):
+                bad_index = interval_seconds[~np.isclose(interval_seconds, x_seconds, atol=1e-6)].index[0]
+                bad_start = combined_df.loc[bad_index - 1, 'datetime']
+                bad_end = combined_df.loc[bad_index, 'datetime']
+                raise ValueError(
+                    f'Uneven interval spacing detected between {bad_start} and {bad_end}: '
+                    f'{interval_seconds.iloc[bad_index-1]} seconds (expected {x_seconds})'
+                )
+                
+        # Remove linear trend from log-prices if requested
+        if detrend and not combined_df.empty:
+            t = np.arange(len(combined_df), dtype=np.float64)
+            for col in ('log_first_price', 'log_last_price'):
+                valid = combined_df[col].notna()
+                coeffs = np.polyfit(t[valid], combined_df.loc[valid, col], 1)
+                trend = np.polyval(coeffs, t)
+                combined_df[col] = combined_df[col] - trend
+            combined_df['log_return'] = combined_df['log_last_price'] - combined_df['log_first_price']
+
+        # Trim extreme log prices if requested
+        if trim_quantile > 0 and not combined_df.empty:
+            lower_q = combined_df['log_first_price'].quantile(trim_quantile / 2)
+            upper_q = combined_df['log_first_price'].quantile(1 - trim_quantile / 2)
+            combined_df = combined_df[(combined_df['log_first_price'] >= lower_q) & 
+                                    (combined_df['log_first_price'] <= upper_q)].copy()
+
+        combined_df.to_csv(output_file, index=False)
+        return combined_df

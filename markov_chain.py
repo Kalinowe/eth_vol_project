@@ -300,6 +300,7 @@ def print_results(
     dwells_mle: np.ndarray,
     residual: float,
     n_transitions: float,
+    window_type: str = 'weekly',
     console: Console | None = None,
     alpha: np.ndarray | None = None,
     prior_lambda: float | None = None,
@@ -316,7 +317,8 @@ def print_results(
     console.print(
         f"\n[bold cyan]Empirical Markov Chain (MLE)  |  "
         f"{n_str} transitions  |  "
-        f"||πA−π||₁ = {residual:.2e}[/bold cyan]\n"
+        f"||πA−π||₁ = {residual:.2e}  |  "
+        f"Window type: {window_type}[/bold cyan]\n"
     )
 
     count_table = Table(title='Transition Count Matrix  N[i→j]')
@@ -401,6 +403,7 @@ def save_results_csv(
 
 def run_markov_chain(
     labels_csv: str,
+    window_type: str = 'weekly',
     seconds_interval: int = 30,
     output_dir: str = 'regime_results',
     console: Console | None = None,
@@ -500,6 +503,7 @@ def run_markov_chain(
     n_transitions = float(N.sum()) if N.dtype.kind == 'f' else int(N.sum())
     print_results(
         N, A_mle, pi_mle, dwells_mle, residual_mle, n_transitions,
+        window_type=window_type,
         console=console,
         alpha=alpha, prior_lambda=prior_lambda if prior_counts is not None else None,
     )

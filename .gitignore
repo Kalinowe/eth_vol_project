@@ -9,6 +9,8 @@ claude/
 # Regime results data and plots
 regime_results/
 
+# Regime results data and plots
+phase_c_results/
 
 # Python bytecode
 __pycache__/

@@ -222,10 +222,11 @@ def pool_km_drift_curves(
     agg = pooled_df.groupby('bin')['drift'].mean().reset_index()
     x = agg['bin'].values.astype(float)
     mu = agg['drift'].values.astype(float)
+    w = agg['p_multiwell'].values.astype(float)
     if annualize:
         sec_per_year = 365.25 * 24 * 3600
         mu = mu * sec_per_year
-    return x, mu
+    return x, mu, w
 
 
 def fit_initial_theta_from_km(labels_csv, seconds_interval, output_dir, console=None):
@@ -242,12 +243,12 @@ def fit_initial_theta_from_km(labels_csv, seconds_interval, output_dir, console=
     # State 0: OU drift  -kappa*(x-m) = (kappa*m) + (-kappa)*x.
     # We need kappa in per-second units (the EM convention); request the
     # pooled mu in the same units rather than annualised.
-    x1, mu1 = pool_km_drift_curves(
+    x1, mu1, w1 = pool_km_drift_curves(
         labels_csv, 'single-well', seconds_interval, output_dir,
         annualize=False,
     )
     if len(x1) >= 5:
-        slope, intercept = np.polyfit(x1, mu1, 1)
+        intercept, slope = _wls_linear(x1, mu1, w1)
         kappa = max(-slope, 1e-9)
         m = intercept / kappa
     else:
@@ -255,17 +256,18 @@ def fit_initial_theta_from_km(labels_csv, seconds_interval, output_dir, console=
         kappa, m = 1.0, 0.0
 
     # State 1: cubic drift  -alpha*(x-c)^3 + beta*(x-c).
-    x2, mu2 = pool_km_drift_curves(
+    x2, mu2, w2 = pool_km_drift_curves(
         labels_csv, 'multi-well', seconds_interval, output_dir,
         annualize=False,
     )
     if len(x2) >= 5:
         c0 = float(np.mean(x2))
+        """
         def _resid(p):
             a, b, c = p
             return mu2 - mu_multi(x2, a, b, c)
-        res = least_squares(_resid, x0=[1.0, 1.0, c0])
-        alpha, beta, c = res.x
+        """
+        alpha, beta, c = _wls_cubic(x2, mu2, w2, theta_prev={'alpha': 1.0, 'beta': 1.0, 'c': c0})
         alpha = max(float(alpha), 1e-9)
         beta = float(beta)
         c = float(c)
@@ -273,8 +275,11 @@ def fit_initial_theta_from_km(labels_csv, seconds_interval, output_dir, console=
         warnings.warn('No multi-well km_df available; using cubic defaults.')
         alpha, beta, c = 1.0, 1.0, 0.0
 
-    return {'kappa': float(kappa), 'm': float(m),
-            'alpha': float(alpha), 'beta': float(beta), 'c': float(c)}
+    return {'kappa': float(kappa),
+            'm': float(m),
+            'alpha': float(max(alpha,1e-4)),
+            'beta': float(beta),
+            'c': float(c)}
 
 
 def fit_initial_theta_moments(x_prev, dx, dt, console=None):
@@ -1037,28 +1042,7 @@ def run_phase_c(
         datetimes=pd.to_datetime(dt_t),
     )
 
-    # k-step ahead regime forecast
-    k_steps = [1, 5, 20, 60]
-    df_forecast = predict_k_steps(out['p_filt'], out['P'], k_steps)
-    forecast_path = os.path.join(output_dir, f'{stem}_forecast.csv')
-    df_forecast.to_csv(forecast_path, index=False)
-    console.print(f'[green]Wrote[/green] {forecast_path}')
 
-    # rolling kappa(t) — critical-slowing-down signal
-    df_kappa = estimate_kappa_series(x_prev, dx, float(dt), dt_t)
-    kappa_path = os.path.join(output_dir, f'{stem}_kappa.csv')
-    df_kappa.to_csv(kappa_path, index=False)
-    console.print(f'[green]Wrote[/green] {kappa_path}')
-
-    if not df_kappa.empty:
-        plots.plot_kappa_series(
-            df_kappa, os.path.join(output_dir, f'{stem}_kappa.png'),
-        )
-    plots.plot_forecast(
-        df_forecast,
-        os.path.join(output_dir, f'{stem}_forecast_k5.png'),
-        k=5,
-    )
 
     summary = Table(title='Phase C — Final parameters (annualised rates)')
     summary.add_column('Parameter', style='cyan')
@@ -1108,11 +1092,6 @@ def run_phase_c(
         share.add_row(s, f'{gamma_share[i]:.4f}', f'{pfilt_share[i]:.4f}')
     console.print(share)
 
-    return {
-        **out,
-        'df_forecast': df_forecast,
-        'df_kappa': df_kappa,
-    }
 
 
 # ---------------------------------------------------------------------------

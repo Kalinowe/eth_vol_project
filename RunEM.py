@@ -36,20 +36,20 @@ from ExpectationMaximisation import run_phase_c
 # =============================================================================
 
 # --- Date range ---------------------------------------------------------------
-start_date = datetime(2024, 1, 1)
-end_date   = datetime(2024, 12, 31)
+start_date = datetime(2025, 1, 1)
+end_date   = datetime(2025, 12, 31)
 
 # --- Data aggregation / KM estimation ----------------------------------------
 # seconds_interval: the bar size used inside Phase C. Phase A scans all the
 # intervals listed in seconds_intervals_phase_a so the GP topology can be
 # cross-checked across resolutions.
-seconds_interval         = 30
-seconds_intervals_phase_a = [30, 60, 120]
-kernel_half_width        = 5       # smoothing half-width for log-price aggregator
+seconds_interval         = 300
+seconds_intervals_phase_a = [300]
+kernel_half_width        = 20       # smoothing half-width for log-price aggregator
 trim_quantile            = 0.01    # symmetric tail trim on log-prices
 n_bins                   = 100     # number of bins for KM drift / diffusion
 weight_threshold         = 5       # minimum bin count for a usable KM cell
-detrend                  = 0       # 1 -> linear-detrend log-prices before KM
+detrend                  = 1       # 1 -> linear-detrend log-prices before KM
 
 # --- Phase A topology classifier ---------------------------------------------
 window_type           = 'weekly'   # 'weekly' | 'biweekly' | 'monthly'
@@ -57,7 +57,7 @@ min_barrier_fraction  = 0.1        # keep a well only if barrier >= this * U_ran
 min_well_separation   = 0.0
 
 # --- Phase B empirical Markov chain ------------------------------------------
-prior_lambda      = 0.3            # strength of Phase-B-informed Dirichlet prior
+prior_lambda      = 0.1            # strength of Phase-B-informed Dirichlet prior
 use_soft_counts   = True           # weight transitions by p_multiwell
 
 # --- Phase C EM convergence --------------------------------------------------
@@ -70,9 +70,9 @@ regime_specific_sigma2 = False     # if True, re-estimate sigma2 per state each 
 # --- Phase C priors ----------------------------------------------------------
 # Dwell-time enforcement: pull P[i,i] toward 1 - dt / target_dwell_seconds.
 target_dwell_seconds   = 7 * 86400.0   # one week
-dwell_prior_strength   = 10.0          # prior mass = strength * len(dx); 0 disables
+dwell_prior_strength   = 10          # prior mass = strength * len(dx); 0 disables
 # GP label tilt: add eta_label * log p_multiwell_window(t) to emission log-b.
-eta_label              = 0.3           # 0 disables
+eta_label              = 0.5          # 0 disables
 
 # --- Output ------------------------------------------------------------------
 regime_dir   = 'regime_results'        # Phase A + Phase B artefacts
@@ -126,6 +126,7 @@ def main() -> None:
     console.rule('[bold cyan]Step 3 — Phase B: empirical Markov chain')
     mc = run_markov_chain(
         labels_csv,
+        window_type=window_type,
         seconds_interval=seconds_interval,
         output_dir=regime_dir,
         prior_lambda=prior_lambda,
