@@ -122,14 +122,26 @@ def load_series(
     kernel_half_width=5,
     trim_quantile=0.01,
     detrend=0,
+    window_type=None,
 ):
     """
     Load aggregated log-prices over [start_date, end_date] at one sampling
     interval and emit (x_prev, dx, dt, datetimes) with cross-gap increments
     dropped.
 
-    If a cached CSV matching the data_collection naming convention exists in
-    ./data, it is read directly; otherwise the aggregation is run.
+    Two operating modes:
+
+    - ``window_type is None`` (legacy): a single whole-range aggregated CSV
+      produced by ``dc.aggregate_log_returns_range(start, end, ...)`` is read.
+      Detrending (when enabled at aggregation time) is applied globally.
+
+    - ``window_type='weekly'|'biweekly'|'monthly'``: the per-window CSVs
+      produced by Phase A's per-window aggregation are read and concatenated
+      in time order. With ``detrend=1`` each window's linear trend has been
+      removed *within* that window only, so the concatenated log-price series
+      is locally detrended. Cross-window dx are dropped via a window_idx tag
+      so a jump between two independently-detrended windows cannot leak into
+      the SDE M-step.
 
     Returns
     -------
@@ -138,36 +150,79 @@ def load_series(
     dt        : float, nominal step in seconds
     dt_t      : (N,) datetime of x_t (for plotting), aligned with dx
     """
-    cached_path = _aggregated_returns_path(
-        start_date, end_date, seconds_interval,
-        kernel_half_width, trim_quantile, detrend,
-    )
-    if os.path.exists(cached_path):
-        df = pd.read_csv(cached_path, parse_dates=['datetime'])
-        if df.empty:
+    if window_type is None:
+        cached_path = _aggregated_returns_path(
+            start_date, end_date, seconds_interval,
+            kernel_half_width, trim_quantile, detrend,
+        )
+        if os.path.exists(cached_path):
+            df = pd.read_csv(cached_path, parse_dates=['datetime'])
+            if df.empty:
+                df = dc.aggregate_log_returns_range(
+                    start_date, end_date, seconds_interval,
+                    kernel_half_width=kernel_half_width,
+                    trim_quantile=trim_quantile,
+                    detrend=detrend,
+                )
+        else:
             df = dc.aggregate_log_returns_range(
                 start_date, end_date, seconds_interval,
                 kernel_half_width=kernel_half_width,
                 trim_quantile=trim_quantile,
                 detrend=detrend,
             )
+        if df.empty:
+            raise ValueError('Empty aggregated returns dataframe.')
+        df = df.sort_values('datetime').reset_index(drop=True)
+        df['__window_idx'] = 0
     else:
-        df = dc.aggregate_log_returns_range(
-            start_date, end_date, seconds_interval,
-            kernel_half_width=kernel_half_width,
-            trim_quantile=trim_quantile,
-            detrend=detrend,
-        )
-    if df.empty:
-        raise ValueError('Empty aggregated returns dataframe.')
+        from regime_estimation import iter_windows
+        frames = []
+        for w_idx, (window_start, window_end) in enumerate(
+            iter_windows(start_date, end_date, window_type)
+        ):
+            cached_path = _aggregated_returns_path(
+                window_start, window_end, seconds_interval,
+                kernel_half_width, trim_quantile, detrend,
+            )
+            if os.path.exists(cached_path):
+                df_w = pd.read_csv(cached_path, parse_dates=['datetime'])
+                if df_w.empty:
+                    df_w = dc.aggregate_log_returns_range(
+                        window_start, window_end, seconds_interval,
+                        kernel_half_width=kernel_half_width,
+                        trim_quantile=trim_quantile,
+                        detrend=detrend,
+                    )
+            else:
+                df_w = dc.aggregate_log_returns_range(
+                    window_start, window_end, seconds_interval,
+                    kernel_half_width=kernel_half_width,
+                    trim_quantile=trim_quantile,
+                    detrend=detrend,
+                )
+            if df_w is None or df_w.empty:
+                continue
+            df_w = df_w.copy()
+            df_w['__window_idx'] = w_idx
+            frames.append(df_w)
+        if not frames:
+            raise ValueError(
+                f'No per-window aggregated CSVs available for '
+                f'{start_date}..{end_date} at {seconds_interval}s '
+                f'({window_type}).'
+            )
+        df = pd.concat(frames, ignore_index=True).sort_values('datetime')
+        df = df.reset_index(drop=True)
 
-    df = df.sort_values('datetime').reset_index(drop=True)
     x = df['log_first_price'].values.astype(float)
     ts = pd.to_datetime(df['datetime']).values
+    win_idx = df['__window_idx'].values.astype(int)
 
     dt_arr = (np.diff(ts) / np.timedelta64(1, 's')).astype(float)
     finite = np.isfinite(np.diff(x)) & np.isfinite(x[:-1])
-    valid = (dt_arr > 0) & (dt_arr <= 1.5 * seconds_interval) & finite
+    same_window = (win_idx[:-1] == win_idx[1:])
+    valid = (dt_arr > 0) & (dt_arr <= 1.5 * seconds_interval) & finite & same_window
 
     x_prev = x[:-1][valid]
     dx = np.diff(x)[valid]
@@ -865,9 +920,10 @@ def run_phase_c(
     target_dwell_seconds=7 * 86400.0,
     dwell_prior_strength=10.0,
     eta_label=0.3,
-    theta_init='km',
+    theta_init='moments',
     theta_init_seconds_interval=30,
     theta_init_labels_csv=None,
+    window_type=None,
     console=None,
 ):
     """
@@ -896,12 +952,17 @@ def run_phase_c(
                  pull P closer to the target dwell. Pass 0 to disable.
     eta_label  : strength of the Phase A GP p_multiwell tilt on the
                  emission log-likelihoods. Pass 0 to disable.
-    theta_init : 'km' (default) -> initialise theta from pooled Phase A KM
-                 drift curves via ``fit_initial_theta_from_km``. Falls back
-                 to 'moments' when the pools are too sparse.
-                 'moments' -> data-only init via
+    theta_init : 'moments' (default) -> data-only init via
                  ``fit_initial_theta_moments`` (OLS + 2-means clustering).
-                 No dependence on Phase A.
+                 No dependence on Phase A. **Empirically preferred**: with
+                 the moments init EM converges to a clear double-well drift
+                 in windows that Phase A flagged multi-well, whereas the
+                 KM-pooled init tends to settle on a near-flat cubic in the
+                 same windows (the pooled curve is too smoothed to push the
+                 EM out of the OU basin).
+                 'km' -> initialise theta from pooled Phase A KM drift
+                 curves via ``fit_initial_theta_from_km``. Falls back to
+                 'moments' when the pools are too sparse.
     theta_init_seconds_interval : interval (in seconds) of the Phase A KM
                  curves used to initialise theta. Defaults to 30s. The KM
                  estimator divides by dt, so the returned drift is already
@@ -915,14 +976,25 @@ def run_phase_c(
                  and ``theta_init_seconds_interval != seconds_interval``.
     """
     os.makedirs(output_dir, exist_ok=True)
+    # EM artefacts now live in an interval-specific subdirectory so MCMC's
+    # cache lookup (phase_c_mcmc._phase_c_em_paths) finds them without
+    # divergent path logic.
+    interval_output_dir = os.path.join(output_dir, str(int(seconds_interval)))
+    os.makedirs(interval_output_dir, exist_ok=True)
     console = console or Console()
 
     console.print(f'[cyan]Phase C — loading log-price series at {seconds_interval}s ...[/cyan]')
+    if window_type is not None:
+        console.print(
+            f'  per-window mode: concatenating per-{window_type} CSVs with '
+            'cross-window dx dropped.'
+        )
     x_prev, dx, dt, dt_t = load_series(
         start_date, end_date, seconds_interval,
         kernel_half_width=kernel_half_width,
         trim_quantile=trim_quantile,
         detrend=detrend,
+        window_type=window_type,
     )
     console.print(f'  {len(dx)} increments after gap filtering.')
 
@@ -1105,7 +1177,7 @@ def run_phase_c(
         'gamma_single': out['gamma'][:, 0],
         'gamma_multi': out['gamma'][:, 1],
     })
-    probs_path = os.path.join(output_dir, f'{stem}_probs.csv')
+    probs_path = os.path.join(interval_output_dir, f'{stem}_probs.csv')
     df_probs.to_csv(probs_path, index=False)
     console.print(f'[green]Wrote[/green] {probs_path}')
 
@@ -1137,11 +1209,11 @@ def run_phase_c(
         {'param': 'P_10', 'value': float(out['P'][1, 0])},
         {'param': 'P_11', 'value': float(out['P'][1, 1])},
     ]
-    theta_path = os.path.join(output_dir, f'{stem}_theta.csv')
+    theta_path = os.path.join(interval_output_dir, f'{stem}_theta.csv')
     pd.DataFrame(theta_rows).to_csv(theta_path, index=False)
     console.print(f'[green]Wrote[/green] {theta_path}')
 
-    lltrace_path = os.path.join(output_dir, f'{stem}_loglik.csv')
+    lltrace_path = os.path.join(interval_output_dir, f'{stem}_loglik.csv')
     pd.DataFrame({
         'iter': np.arange(len(out['log_lik_trace'])),
         'log_lik': out['log_lik_trace'],
@@ -1151,20 +1223,20 @@ def run_phase_c(
     plots.plot_phase_c_drifts(
         x_prev,
         out['theta'],
-        os.path.join(output_dir, f'{stem}_drifts.png'),
+        os.path.join(interval_output_dir, f'{stem}_drifts.png'),
     )
 
     # Rolling kappa(t) — critical-slowing-down diagnostic. Smoothed for
     # readability; raw kappa_ann is kept alongside in the CSV.
     df_kappa = estimate_kappa_series(x_prev, dx, float(dt), dt_t)
-    kappa_path = os.path.join(output_dir, f'{stem}_kappa.csv')
+    kappa_path = os.path.join(interval_output_dir, f'{stem}_kappa.csv')
     df_kappa.to_csv(kappa_path, index=False)
     console.print(f'[green]Wrote[/green] {kappa_path}')
 
     # Overlay: filled gamma area with smoothed kappa on top.
     plots.plot_gamma_kappa_overlay(
         out['gamma'], df_kappa,
-        os.path.join(output_dir, f'{stem}_gamma_kappa.png'),
+        os.path.join(interval_output_dir, f'{stem}_gamma_kappa.png'),
         datetimes=pd.to_datetime(dt_t),
     )
 
@@ -1217,6 +1289,20 @@ def run_phase_c(
     for i, s in enumerate(STATES):
         share.add_row(s, f'{gamma_share[i]:.4f}', f'{pfilt_share[i]:.4f}')
     console.print(share)
+
+    return {
+        'theta':   out['theta'],
+        'P':       out['P'],
+        'sigma2':  sigma2_arr,
+        'gamma':   out['gamma'],
+        'p_filt':  out['p_filt'],
+        'log_lik': out['log_lik'],
+        'dt_t':    pd.to_datetime(dt_t),
+        'x_prev':  x_prev,
+        'dx':      dx,
+        'dt':      float(dt),
+        'df_kappa': df_kappa,
+    }
 
 
 

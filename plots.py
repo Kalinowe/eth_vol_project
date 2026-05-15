@@ -411,6 +411,67 @@ def plot_kappa_series(df_kappa: pd.DataFrame, output_path: str) -> None:
 
 
 
+def plot_window_price_kappa(
+    datetimes,
+    log_prices,
+    df_kappa: pd.DataFrame,
+    output_path: str,
+    title: str | None = None,
+) -> None:
+    """
+    Per-window diagnostic: log-price (left axis, blue) overlaid with the
+    rolling annualised κ(t) restricted to the same window (right axis, red).
+
+    Inputs come from ``ExpectationMaximisation.estimate_kappa_series``
+    (rolling-OLS κ(t)) and ``ExpectationMaximisation.load_series``
+    (per-window concatenated log_first_price). ``datetimes`` and
+    ``log_prices`` must already be sliced to the window of interest.
+    """
+    times = pd.to_datetime(datetimes)
+
+    fig, ax_p = plt.subplots(figsize=(11, 4))
+    ax_p.plot(times, log_prices, color='#1565C0', lw=0.9, label='log-price')
+    ax_p.set_xlabel('Date')
+    ax_p.set_ylabel('log-price', color='#1565C0')
+    ax_p.tick_params(axis='y', labelcolor='#1565C0')
+    ax_p.grid(True, alpha=0.3)
+
+    ax_k = ax_p.twinx()
+    if df_kappa is not None and not df_kappa.empty:
+        col = (
+            'kappa_ann_smoothed'
+            if 'kappa_ann_smoothed' in df_kappa.columns
+            else ('kappa_ann' if 'kappa_ann' in df_kappa.columns else 'kappa')
+        )
+        ax_k.plot(
+            pd.to_datetime(df_kappa['datetime']), df_kappa[col],
+            color='#F44336', lw=1.4,
+            label=r'$\kappa_{\mathrm{ann}}(t)$ (smoothed)',
+        )
+    else:
+        ax_k.text(
+            0.5, 0.5, 'no κ samples in this window',
+            transform=ax_k.transAxes, ha='center', va='center',
+            color='gray', fontsize=10,
+        )
+    ax_k.set_ylabel(r'$\kappa_{\mathrm{ann}}$ (yr$^{-1}$)', color='#F44336')
+    ax_k.tick_params(axis='y', labelcolor='#F44336')
+
+    if title:
+        ax_p.set_title(title)
+
+    h_p, l_p = ax_p.get_legend_handles_labels()
+    h_k, l_k = ax_k.get_legend_handles_labels()
+    if l_p or l_k:
+        ax_p.legend(h_p + h_k, l_p + l_k, loc='upper left', fontsize=9, framealpha=0.85)
+
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=130)
+    plt.close(fig)
+    print(f'Saved {output_path}')
+
+
 def plot_mcmc_kappa_posterior(kappa_samples, kappa_em, output_path):
     """
     Histogram of posterior kappa samples with a vertical line at the EM

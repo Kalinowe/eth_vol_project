@@ -40,8 +40,17 @@ from ExpectationMaximisation import (
     emission_log_b,
     load_series,
     mu_multi,
+    mu_single,
 )
 import plots
+
+
+def _sigma2_to_pair(sigma2):
+    """Normalise sigma2 input to a length-2 numpy array."""
+    s2 = np.atleast_1d(np.asarray(sigma2, dtype=float))
+    if s2.size == 1:
+        return np.array([float(s2[0]), float(s2[0])], dtype=float)
+    return s2[:2].astype(float)
 
 
 # ---------------------------------------------------------------------------
@@ -107,10 +116,15 @@ def draw_ou_params(x_prev, dx, dt, S, sigma2, prior_ou, rng):
     """
     Conjugate Normal draw of (kappa, m) given S_{1:T}.
 
-    With S known, dx_t/dt | x_{t-1}, S_t=0 ~ N(a + b*x_{t-1}, sigma2/dt)
+    With S known, dx_t/dt | x_{t-1}, S_t=0 ~ N(a + b*x_{t-1}, sigma2_0/dt)
     where a = kappa*m, b = -kappa. Linear Gaussian regression with a
     Normal prior → Normal posterior, drawn jointly.
+
+    ``sigma2`` may be a scalar (shared) or a length-2 array; the OU block
+    consumes the state-0 entry only.
     """
+    s2_pair = _sigma2_to_pair(sigma2)
+    sigma2_s = float(s2_pair[0])
     mask = (S == 0)
     if mask.sum() < 4:
         return {'kappa': prior_ou['kappa'], 'm': prior_ou['m']}
@@ -118,7 +132,7 @@ def draw_ou_params(x_prev, dx, dt, S, sigma2, prior_ou, rng):
     x0 = x_prev[mask]
     r0 = (dx / dt)[mask]
     n = int(mask.sum())
-    w = dt / sigma2  # precision per observation
+    w = dt / sigma2_s  # precision per observation
 
     X = np.column_stack([np.ones(n), x0])
     XtX = (X.T * w) @ X
@@ -151,14 +165,19 @@ def draw_cubic_params(x_prev, dx, dt, S, sigma2, theta_cur,
     Random-walk Metropolis-Hastings step for (alpha, beta, c) given S_{1:T}.
     Symmetric Gaussian proposal centred on the current value; alpha is
     reflected to the positive half-line via the absolute value.
+
+    ``sigma2`` may be a scalar (shared) or a length-2 array; the cubic block
+    consumes the state-1 entry only.
     """
+    s2_pair = _sigma2_to_pair(sigma2)
+    sigma2_s = float(s2_pair[1])
     mask = (S == 1)
     if mask.sum() < 4:
         return theta_cur, False
 
     x1 = x_prev[mask]
     r1 = (dx / dt)[mask]
-    var = sigma2 / dt
+    var = sigma2_s / dt
     sd = float(np.sqrt(var))
 
     def log_lik_cubic(alpha, beta, c):
@@ -183,8 +202,44 @@ def draw_cubic_params(x_prev, dx, dt, S, sigma2, theta_cur,
     return theta_cur, False
 
 
-# TODO: a conjugate Inverse-Gamma update for sigma2 is the natural next
-# extension. Currently sigma2 is held fixed at var(dx)/dt from the EM run.
+def draw_sigma2(x_prev, dx, dt, S, theta, prior_sigma2_a, prior_sigma2_b, rng):
+    """
+    Conjugate Inverse-Gamma draw of state-specific sigma2_s given S_{1:T}
+    and theta.
+
+    Under state s the observation model is
+        dx_t | x_{t-1}, S_t = s   ~   N(mu_s(x_{t-1}) * dt, sigma2_s * dt).
+
+    With sigma2_s ~ InvGamma(a0, b0) prior, the posterior is
+        sigma2_s | rest ~ InvGamma(
+            a0 + N_s / 2,
+            b0 + 0.5 / dt * sum_{t : S_t = s} (dx_t - mu_s(x_{t-1})*dt)^2
+        ).
+
+    A standard sample is precision ~ Gamma(a_post, scale=1/b_post),
+    sigma2 = 1 / precision. prior_sigma2_a / prior_sigma2_b are length-2
+    arrays (one entry per state). N_s = 0 leaves that state at its prior.
+    """
+    sigma2 = np.empty(2)
+    for s in range(2):
+        mask = (S == s)
+        N_s = int(mask.sum())
+        if N_s == 0:
+            # Stay at the prior mean.
+            sigma2[s] = float(prior_sigma2_b[s]) / max(float(prior_sigma2_a[s]) - 1.0, 1e-6)
+            sigma2[s] = max(sigma2[s], 1e-30)
+            continue
+        if s == 0:
+            mu_s = mu_single(x_prev[mask], theta['kappa'], theta['m'])
+        else:
+            mu_s = mu_multi(x_prev[mask], theta['alpha'], theta['beta'], theta['c'])
+        resid = dx[mask] - mu_s * dt
+        ssr = float(np.sum(resid ** 2))
+        a_post = float(prior_sigma2_a[s]) + 0.5 * N_s
+        b_post = float(prior_sigma2_b[s]) + 0.5 * ssr / dt
+        precision = rng.gamma(shape=a_post, scale=1.0 / b_post)
+        sigma2[s] = max(1.0 / precision, 1e-30)
+    return sigma2
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +305,8 @@ def run_gibbs(
     sigma2, alpha_prior,
     window_assignments, p_label_pairs,
     prior_ou, proposal_scale,
+    prior_sigma2_a, prior_sigma2_b,
+    pi_init,
     n_burn=500, n_sample=1000, thin=5,
     eta=0.3,
     rng=None,
@@ -265,12 +322,16 @@ def run_gibbs(
     chain_theta = []
     chain_P = np.empty((n_keep, K, K))
     chain_S = np.empty((n_keep, T), dtype=np.int8)
+    chain_sigma2 = np.empty((n_keep, K))
     chain_loglik = np.empty(n_burn + n_sample)
     p_filt_accum = np.zeros((T, K))
 
     theta = dict(theta_init)
     P = P_init.copy()
     S = S_init.astype(np.int8).copy()
+    sigma2 = _sigma2_to_pair(sigma2)
+    pi0 = np.asarray(pi_init, dtype=float)
+    pi0 = pi0 / pi0.sum()
 
     n_accepted_cubic = 0
     n_proposed_cubic = 0
@@ -284,22 +345,26 @@ def run_gibbs(
 
         for it in range(total):
 
-            # Block 1: Draw S | theta, P, x
+            # Block 1: Draw S | theta, P, sigma2, x. pi_init (Phase B
+            # Dirichlet-conjugated stationary) is used as the initial state
+            # prior in the forward filter — independent of P, unlike the old
+            # P[0] choice which made the initial prior depend on the current
+            # P sample and biased early sweeps.
             log_b = augmented_log_b(
                 x_prev, dx, dt, theta, sigma2,
                 window_assignments, p_label_pairs, eta=eta,
             )
-            S, p_filt, log_lik = ffbs(log_b, P, P[0], rng)
+            S, p_filt, log_lik = ffbs(log_b, P, pi0, rng)
             chain_loglik[it] = log_lik
 
-            # Block 2a: OU conjugate draw
+            # Block 2a: OU conjugate draw (uses sigma2_0)
             ou_draw = draw_ou_params(
                 x_prev, dx, dt, S, sigma2, prior_ou, rng,
             )
             theta['kappa'] = ou_draw['kappa']
             theta['m'] = ou_draw['m']
 
-            # Block 2b: cubic MH step
+            # Block 2b: cubic MH step (uses sigma2_1)
             cubic_draw, accepted = draw_cubic_params(
                 x_prev, dx, dt, S, sigma2, theta, proposal_scale, rng,
             )
@@ -327,12 +392,19 @@ def run_gibbs(
             # Block 3: Draw P | S (exact Dirichlet)
             P = draw_P(S, alpha_prior, rng)
 
+            # Block 4: conjugate Inverse-Gamma per-state sigma2
+            sigma2 = draw_sigma2(
+                x_prev, dx, dt, S, theta,
+                prior_sigma2_a, prior_sigma2_b, rng,
+            )
+
             # Storage: post-burn-in, thinned
             if it >= n_burn and (it - n_burn) % thin == 0:
                 idx = (it - n_burn) // thin
                 chain_theta.append(dict(theta))
                 chain_P[idx] = P
                 chain_S[idx] = S
+                chain_sigma2[idx] = sigma2
                 p_filt_accum += p_filt
 
             prog.advance(task)
@@ -351,6 +423,7 @@ def run_gibbs(
         'chain_theta':           chain_theta,
         'chain_P':               chain_P,
         'chain_S':               chain_S,
+        'chain_sigma2':          chain_sigma2,
         'chain_loglik':          chain_loglik,
         'acceptance_rate_cubic': acceptance_rate_cubic,
         'p_filt_mean':           p_filt_mean,
@@ -362,9 +435,10 @@ def run_gibbs(
 # ---------------------------------------------------------------------------
 
 def summarise_chain(chain_theta, chain_P, chain_loglik, n_burn,
+                    chain_sigma2=None,
                     acceptance_rate_cubic=None, console=None):
     """
-    Posterior mean, sd, and 95% credible intervals for theta and P.
+    Posterior mean, sd, and 95% credible intervals for theta, P, sigma2.
     """
     console = console or Console()
     rows = []
@@ -385,6 +459,17 @@ def summarise_chain(chain_theta, chain_P, chain_loglik, n_burn,
             vals = chain_P[:, i, j]
             rows.append({
                 'param': f'P_{i}{j}',
+                'mean':  float(vals.mean()),
+                'sd':    float(vals.std()),
+                'q025':  float(np.percentile(vals, 2.5)),
+                'q975':  float(np.percentile(vals, 97.5)),
+            })
+
+    if chain_sigma2 is not None and len(chain_sigma2) > 0:
+        for s in range(chain_sigma2.shape[1]):
+            vals = chain_sigma2[:, s]
+            rows.append({
+                'param': f'sigma2_{s}',
                 'mean':  float(vals.mean()),
                 'sd':    float(vals.std()),
                 'q025':  float(np.percentile(vals, 2.5)),
@@ -440,22 +525,27 @@ def posterior_predictive_forecast(p_filt_mean, chain_P,
 # Cached EM warm-start loader
 # ---------------------------------------------------------------------------
 
-def _phase_c_em_paths(stem_em, output_dir):
-    return { # EM results are stored in an interval-specific subfolder
-        'theta':  os.path.join(output_dir, str(stem_em.split('_')[-1].replace('s', '')), f'{stem_em}_theta.csv'),
-        'probs':  os.path.join(output_dir, str(stem_em.split('_')[-1].replace('s', '')), f'{stem_em}_probs.csv'),
+def _phase_c_em_paths(stem_em, output_dir, seconds_interval):
+    """
+    EM results live in ``<output_dir>/<seconds_interval>/`` since the
+    output-directory alignment fix in ExpectationMaximisation.run_phase_c.
+    """
+    interval_dir = os.path.join(output_dir, str(int(seconds_interval)))
+    return {
+        'theta':  os.path.join(interval_dir, f'{stem_em}_theta.csv'),
+        'probs':  os.path.join(interval_dir, f'{stem_em}_probs.csv'),
     }
 
 
-def _try_load_em_result(stem_em, output_dir, console):
+def _try_load_em_result(stem_em, output_dir, seconds_interval, console):
     """
     Reconstruct a minimal EM warm-start dict from cached phase_c outputs.
     Returns None if the cache is incomplete.
 
-    The cache exposes theta, sigma2, P, and gamma (the Kim smoother output).
-    These are exactly what run_phase_c_mcmc needs from EM.
+    The cache exposes theta, sigma2 (length-2, per-state when EM was run with
+    ``regime_specific_sigma2=True``), P, and gamma (Kim smoother output).
     """
-    paths = _phase_c_em_paths(stem_em, output_dir)
+    paths = _phase_c_em_paths(stem_em, output_dir, seconds_interval)
     if not all(os.path.exists(p) for p in paths.values()):
         return None
 
@@ -464,7 +554,16 @@ def _try_load_em_result(stem_em, output_dir, console):
         params = dict(zip(theta_df['param'], theta_df['value']))
         theta = {k: float(params[k]) for k in
                  ('kappa', 'm', 'alpha', 'beta', 'c')}
-        sigma2 = float(params['sigma2'])
+        # Prefer the per-state values when EM produced them; fall back to
+        # the scalar 'sigma2' row for legacy caches.
+        if 'sigma2_0' in params and 'sigma2_1' in params:
+            sigma2 = np.array(
+                [float(params['sigma2_0']), float(params['sigma2_1'])],
+                dtype=float,
+            )
+        else:
+            s2_scalar = float(params['sigma2'])
+            sigma2 = np.array([s2_scalar, s2_scalar], dtype=float)
         P = np.array([
             [params['P_00'], params['P_01']],
             [params['P_10'], params['P_11']],
@@ -554,6 +653,7 @@ def run_phase_c_mcmc(
     labels_csv,
     N_phase_b=None,           # optional; if None, loaded from Phase B cache or computed
     em_result=None,           # optional; if None, loaded from cache or run via run_phase_c
+    pi_init=None,             # optional; Phase B Dirichlet-smoothed stationary
     lambda_prior=0.3,
     eta=0.3,
     n_burn=500,
@@ -563,10 +663,12 @@ def run_phase_c_mcmc(
     kernel_half_width=5,
     trim_quantile=0.01,
     detrend=0,
+    window_type=None,
     seed=42,
     output_dir='phase_c_results',
     phase_b_dir=None,
     use_chain_cache=True,
+    sigma2_prior_a=2.0,
     console=None,
 ):
     """
@@ -630,6 +732,7 @@ def run_phase_c_mcmc(
             'chain_theta':  chain_theta,
             'chain_P':      chain_P,
             'chain_S':      npz['chain_S'] if 'chain_S' in npz.files else None,
+            'chain_sigma2': npz['chain_sigma2'] if 'chain_sigma2' in npz.files else None,
             'chain_loglik': npz['chain_loglik'],
             'p_filt_mean':  npz['p_filt_mean'],
             'summary':      pd.read_csv(summary_path),
@@ -650,12 +753,14 @@ def run_phase_c_mcmc(
         kernel_half_width=kernel_half_width,
         trim_quantile=trim_quantile,
         detrend=detrend,
+        window_type=window_type,
     )
     console.print(f'  {len(dx)} increments loaded.')
 
     # ------------------------------------------------------------------ #
     # Phase B count matrix (cached or recomputed)
     # ------------------------------------------------------------------ #
+    mc_result = None
     if N_phase_b is None:
         N_phase_b = _try_load_phase_b_counts(
             labels_csv, phase_b_dir, lambda_prior, console,
@@ -665,40 +770,70 @@ def run_phase_c_mcmc(
                 '[yellow]Phase B cache miss — running run_markov_chain.[/yellow]'
             )
             from markov_chain import run_markov_chain
-            mc = run_markov_chain(
+            mc_result = run_markov_chain(
                 labels_csv,
                 output_dir=phase_b_dir, console=console,
                 prior_lambda=lambda_prior,
             )
-            if mc is None:
+            if mc_result is None:
                 raise RuntimeError(
                     'Phase B returned None — too few valid windows for chain '
                     'estimation. Extend the date range.'
                 )
-            N_phase_b = mc['N']
+            N_phase_b = mc_result['N']
+
+    # If pi_init wasn't supplied, derive it from the Dirichlet-smoothed
+    # posterior of Phase B so the FFBS initial-state prior matches what EM
+    # uses (and is independent of the current P sample).
+    if pi_init is None:
+        if mc_result is not None and 'pi' in mc_result:
+            pi_init = np.asarray(mc_result['pi'], dtype=float)
+        else:
+            from markov_chain import map_transition_matrix, stationary_distribution
+            alpha_mc = np.ones((2, 2)) + lambda_prior * np.asarray(N_phase_b, dtype=float)
+            A_post = map_transition_matrix(np.zeros((2, 2)), alpha_mc)
+            pi_init = stationary_distribution(A_post)
+    pi_init = np.asarray(pi_init, dtype=float)
+    pi_init = pi_init / pi_init.sum()
+    console.print(
+        f'  pi_init (Phase B Dirichlet-smoothed stationary): '
+        f'[single-well={pi_init[0]:.4f}, multi-well={pi_init[1]:.4f}]'
+    )
 
     # ------------------------------------------------------------------ #
     # EM warm start (cached or recomputed)
     # ------------------------------------------------------------------ #
     if em_result is None:
-        em_result = _try_load_em_result(stem_em, output_dir, console) # output_dir here is the base dir, _try_load_em_result will construct the interval-specific path
+        em_result = _try_load_em_result(stem_em, output_dir, seconds_interval, console)
     if em_result is None:
         console.print(
             '[yellow]No EM result supplied or cached — running '
             'ExpectationMaximisation.run_phase_c to generate the warm start.[/yellow]'
         )
         from ExpectationMaximisation import run_phase_c
-        em_result = run_phase_c( # This call will save to the interval-specific subfolder
+        em_result = run_phase_c(
             start_date, end_date, seconds_interval,
             labels_csv=labels_csv,
             output_dir=output_dir,
+            pi_init=pi_init,
+            regime_specific_sigma2=True,
+            kernel_half_width=kernel_half_width,
+            trim_quantile=trim_quantile,
+            detrend=detrend,
+            window_type=window_type,
             console=console,
         )
 
     theta_em = em_result['theta']
     P_em     = em_result['P']
     gamma_em = em_result['gamma']
-    sigma2   = float(em_result.get('sigma2', np.var(dx) / dt))
+    sigma2   = _sigma2_to_pair(
+        em_result.get('sigma2', np.array([np.var(dx) / dt, np.var(dx) / dt]))
+    )
+    console.print(
+        f'  sigma2 EM warm start: [single-well={sigma2[0]:.4e}, '
+        f'multi-well={sigma2[1]:.4e}]'
+    )
 
     if len(gamma_em) != len(dx):
         raise RuntimeError(
@@ -742,6 +877,17 @@ def run_phase_c_mcmc(
         'c':     max(abs(theta_em['c'])     * 0.05, 1e-4),
     }
 
+    # Inverse-Gamma prior on sigma2_s, centred on EM's sigma2_s. With shape
+    # a0 fixed, scale b0 = (a0 - 1) * sigma2_em_s makes the prior mean equal
+    # to the EM value; a0 ≈ 2 corresponds to a weakly informative prior.
+    a0 = float(sigma2_prior_a)
+    prior_sigma2_a = np.array([a0, a0], dtype=float)
+    prior_sigma2_b = np.array(
+        [max(a0 - 1.0, 1e-6) * float(sigma2[0]),
+         max(a0 - 1.0, 1e-6) * float(sigma2[1])],
+        dtype=float,
+    )
+
     # ------------------------------------------------------------------ #
     # Window-to-observation assignment for label emission
     # ------------------------------------------------------------------ #
@@ -770,6 +916,9 @@ def run_phase_c_mcmc(
         p_label_pairs=p_label_pairs,
         prior_ou=prior_ou,
         proposal_scale=proposal_scale,
+        prior_sigma2_a=prior_sigma2_a,
+        prior_sigma2_b=prior_sigma2_b,
+        pi_init=pi_init,
         n_burn=n_burn, n_sample=n_sample, thin=thin,
         eta=eta, rng=rng, console=console,
     )
@@ -780,6 +929,7 @@ def run_phase_c_mcmc(
     summary_df = summarise_chain(
         chain['chain_theta'], chain['chain_P'],
         chain['chain_loglik'], n_burn,
+        chain_sigma2=chain['chain_sigma2'],
         acceptance_rate_cubic=chain['acceptance_rate_cubic'],
         console=console,
     )
@@ -795,9 +945,11 @@ def run_phase_c_mcmc(
         chain_path,
         chain_P                = chain['chain_P'],
         chain_S                = chain['chain_S'],
+        chain_sigma2           = chain['chain_sigma2'],
         chain_loglik           = chain['chain_loglik'],
         p_filt_mean            = chain['p_filt_mean'],
         acceptance_rate_cubic  = np.array(chain['acceptance_rate_cubic']),
+        pi_init                = pi_init,
         **{
             f'theta_{k}': np.array([t[k] for t in chain['chain_theta']])
             for k in ('kappa', 'm', 'alpha', 'beta', 'c')
@@ -858,6 +1010,98 @@ def run_phase_c_mcmc(
 # Standalone entry
 # ---------------------------------------------------------------------------
 
+def _plot_extreme_window_overlays_mcmc(
+    labels_csv,
+    start_date,
+    end_date,
+    seconds_interval,
+    window_type,
+    kernel_half_width,
+    trim_quantile,
+    detrend,
+    output_dir,
+    console,
+    n_per_class=2,
+):
+    """
+    MCMC twin of RunEM._plot_extreme_window_overlays — picks two clearest
+    single-well and two clearest multi-well windows and plots log-price +
+    rolling κ(t) restricted to each window. Lives under __main__ so the
+    plots are not produced when MCMC is imported by other code.
+    """
+    from ExpectationMaximisation import estimate_kappa_series, load_series
+
+    if not os.path.exists(labels_csv):
+        console.print(f'[yellow]Skipping MCMC window overlays: labels CSV missing ({labels_csv}).[/yellow]')
+        return
+
+    labels_df = pd.read_csv(labels_csv, parse_dates=['window_start', 'window_end'])
+    labels_df['seconds_interval'] = pd.to_numeric(
+        labels_df['seconds_interval'], errors='coerce'
+    ).astype('Int64')
+    sub = labels_df[labels_df['seconds_interval'] == int(seconds_interval)].copy()
+    sub = sub.dropna(subset=['p_multiwell'])
+    if sub.empty:
+        console.print('[yellow]No labelled windows with p_multiwell — skipping overlays.[/yellow]')
+        return
+
+    sub = sub.sort_values('p_multiwell')
+    single_pick = sub.head(n_per_class)
+    multi_pick = sub.tail(n_per_class).iloc[::-1]
+    picks = [('single-well', row) for _, row in single_pick.iterrows()] + \
+            [('multi-well',  row) for _, row in multi_pick.iterrows()]
+
+    interval_dir = os.path.join(output_dir, str(int(seconds_interval)))
+    plot_dir = os.path.join(interval_dir, 'window_overlays')
+    os.makedirs(plot_dir, exist_ok=True)
+
+    x_prev, dx, dt, dt_t = load_series(
+        start_date, end_date, seconds_interval,
+        kernel_half_width=kernel_half_width,
+        trim_quantile=trim_quantile,
+        detrend=detrend,
+        window_type=window_type,
+    )
+    df_kappa_full = estimate_kappa_series(x_prev, dx, float(dt), dt_t)
+    dt_t_series = pd.to_datetime(dt_t)
+
+    for label, row in picks:
+        w_start = pd.Timestamp(row['window_start'])
+        w_end   = pd.Timestamp(row['window_end'])
+        p_mw    = float(row['p_multiwell'])
+
+        mask = (dt_t_series >= w_start) & (dt_t_series <= w_end + pd.Timedelta(days=1))
+        if mask.sum() < 5:
+            console.print(f'[yellow]Window {w_start.date()}..{w_end.date()} too sparse — skipping.[/yellow]')
+            continue
+        x_win = x_prev[mask.values]
+        t_win = dt_t_series[mask.values]
+
+        if not df_kappa_full.empty:
+            kappa_mask = (
+                (df_kappa_full['datetime'] >= w_start)
+                & (df_kappa_full['datetime'] <= w_end + pd.Timedelta(days=1))
+            )
+            df_kappa_win = df_kappa_full[kappa_mask].reset_index(drop=True)
+        else:
+            df_kappa_win = df_kappa_full
+
+        out_path = os.path.join(
+            plot_dir,
+            f'mcmc_window_{label}_{w_start.strftime("%Y-%m-%d")}_pmw{p_mw:.2f}.png',
+        )
+        plots.plot_window_price_kappa(
+            datetimes=t_win,
+            log_prices=x_win,
+            df_kappa=df_kappa_win,
+            output_path=out_path,
+            title=(
+                f'MCMC | {label}  |  {w_start.date()} → {w_end.date()}  |  '
+                f'p_multiwell={p_mw:.2f}'
+            ),
+        )
+
+
 if __name__ == '__main__':
     from regime_estimation import normalize_window_boundaries
 
@@ -898,9 +1142,23 @@ if __name__ == '__main__':
         labels_csv=labels_csv,
         lambda_prior=0.3,
         eta=0.3,
+        window_type=window_type,
         n_burn=500,
         n_sample=2000,
         thin=5,
         k_steps=(1, 5, 20, 60),
+        console=_console,
+    )
+
+    _plot_extreme_window_overlays_mcmc(
+        labels_csv=labels_csv,
+        start_date=start_date,
+        end_date=end_date,
+        seconds_interval=seconds_interval,
+        window_type=window_type,
+        kernel_half_width=5,
+        trim_quantile=0.01,
+        detrend=0,
+        output_dir='phase_c_results',
         console=_console,
     )
