@@ -252,15 +252,29 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
                     f'{interval_seconds.iloc[bad_index-1]} seconds (expected {x_seconds})'
                 )
                 
-        # Remove linear trend from log-prices if requested
+        # Detrend the *drift*, not the price level. We compute the per-bar
+        # drift mu_w = mean(diff(log_first_price)) within the window and
+        # subtract mu_w * (k - k_mean) from both log-price columns. That
+        # operation:
+        #   - leaves the within-window mean log-price intact (well positions
+        #     in absolute log-price space are preserved),
+        #   - zeroes the mean of dx = diff(log_first_price) within the
+        #     window (the drift is demeaned),
+        #   - keeps log_return = log_last_price - log_first_price unchanged
+        #     (the same shift is applied to both columns).
         if detrend and not combined_df.empty:
-            t = np.arange(len(combined_df), dtype=np.float64)
-            for col in ('log_first_price', 'log_last_price'):
-                valid = combined_df[col].notna()
-                coeffs = np.polyfit(t[valid], combined_df.loc[valid, col], 1)
-                trend = np.polyval(coeffs, t)
-                combined_df[col] = combined_df[col] - trend
-            combined_df['log_return'] = combined_df['log_last_price'] - combined_df['log_first_price']
+            valid_first = combined_df['log_first_price'].notna()
+            if int(valid_first.sum()) >= 2:
+                x_first = combined_df.loc[valid_first, 'log_first_price'].to_numpy()
+                mean_dx = float(np.mean(np.diff(x_first)))   # per-bar drift
+                t = np.arange(len(combined_df), dtype=np.float64)
+                k_mean = float(t[valid_first].mean())
+                adjustment = mean_dx * (t - k_mean)
+                for col in ('log_first_price', 'log_last_price'):
+                    combined_df[col] = combined_df[col] - adjustment
+                combined_df['log_return'] = (
+                    combined_df['log_last_price'] - combined_df['log_first_price']
+                )
 
         # Trim extreme log prices if requested
         if trim_quantile > 0 and not combined_df.empty:
