@@ -125,14 +125,39 @@ def main() -> None:
                 detrend=detrend,
             )
 
+    # Phase A always runs at seconds_interval — Phase B and Phase C consume
+    # this labels CSV. If the KM warm start needs a different sampling
+    # resolution, a second pass at theta_init_seconds_interval runs after.
+    console.rule(
+        f'[bold cyan]Step 2 — Phase A regime estimation at {seconds_interval}s'
+    )
+    labels_df = run_phase_a(
+        snapped_start, snapped_end,
+        seconds_interval,
+        kernel_half_width=kernel_half_width,
+        trim_quantile=trim_quantile,
+        n_bins=n_bins,
+        weight_threshold=weight_threshold,
+        detrend=detrend,
+        min_barrier_fraction=min_barrier_fraction,
+        min_well_separation=min_well_separation,
+        window_type=window_type,
+        output_dir=regime_dir,
+        console=console,
+    )
+    print_regime_table(labels_df, console=console)
+
+    labels_csv = os.path.join(
+        regime_dir,
+        f"regime_labels_{snapped_start.strftime('%Y-%m-%d')}_to_"
+        f"{snapped_end.strftime('%Y-%m-%d')}_{seconds_interval}s_{window_type}.csv",
+    )
+
     theta_init_labels_csv = None
-    # Phase A pass at the KM warm-start interval (if different) so the
-    # corresponding labels CSV + km/ files exist for fit_initial_theta_from_km.
-    if theta_init == 'km' and theta_init_seconds_interval != seconds_interval:
- 
+    if theta_init == 'km' and int(theta_init_seconds_interval) != int(seconds_interval):
         console.rule(
-            f'[bold cyan]Step 2 — Phase A regime estimation at {theta_init_seconds_interval}s '
-            'for a KM-based warm start'
+            f'[bold cyan]Step 2b — Phase A regime estimation at '
+            f'{theta_init_seconds_interval}s for the KM-based warm start'
         )
         run_phase_a(
             snapped_start, snapped_end,
@@ -154,31 +179,6 @@ def main() -> None:
             f"{snapped_end.strftime('%Y-%m-%d')}_"
             f"{theta_init_seconds_interval}s_{window_type}.csv",
         )
-
-    else:
-
-        console.rule('[bold cyan]Step 2 — Phase A: regime estimation for moments-based warm start')
-        labels_df = run_phase_a(
-            snapped_start, snapped_end,
-            seconds_interval,
-            kernel_half_width=kernel_half_width,
-            trim_quantile=trim_quantile,
-            n_bins=n_bins,
-            weight_threshold=weight_threshold,
-            detrend=detrend,
-            min_barrier_fraction=min_barrier_fraction,
-            min_well_separation=min_well_separation,
-            window_type=window_type,
-            output_dir=regime_dir,
-            console=console,
-        )
-        print_regime_table(labels_df, console=console)
-
-    labels_csv = os.path.join(
-        regime_dir,
-        f"regime_labels_{snapped_start.strftime('%Y-%m-%d')}_to_"
-        f"{snapped_end.strftime('%Y-%m-%d')}_{seconds_interval}s_{window_type}.csv",
-    )
 
 
     console.rule('[bold cyan]Step 3 — Phase B: empirical Markov chain')
