@@ -1010,98 +1010,6 @@ def run_phase_c_mcmc(
 # Standalone entry
 # ---------------------------------------------------------------------------
 
-def _plot_extreme_window_overlays_mcmc(
-    labels_csv,
-    start_date,
-    end_date,
-    seconds_interval,
-    window_type,
-    kernel_half_width,
-    trim_quantile,
-    detrend,
-    output_dir,
-    console,
-    n_per_class=2,
-):
-    """
-    MCMC twin of RunEM._plot_extreme_window_overlays — picks two clearest
-    single-well and two clearest multi-well windows and plots log-price +
-    rolling κ(t) restricted to each window. Lives under __main__ so the
-    plots are not produced when MCMC is imported by other code.
-    """
-    from ExpectationMaximisation import estimate_kappa_series, load_series
-
-    if not os.path.exists(labels_csv):
-        console.print(f'[yellow]Skipping MCMC window overlays: labels CSV missing ({labels_csv}).[/yellow]')
-        return
-
-    labels_df = pd.read_csv(labels_csv, parse_dates=['window_start', 'window_end'])
-    labels_df['seconds_interval'] = pd.to_numeric(
-        labels_df['seconds_interval'], errors='coerce'
-    ).astype('Int64')
-    sub = labels_df[labels_df['seconds_interval'] == int(seconds_interval)].copy()
-    sub = sub.dropna(subset=['p_multiwell'])
-    if sub.empty:
-        console.print('[yellow]No labelled windows with p_multiwell — skipping overlays.[/yellow]')
-        return
-
-    sub = sub.sort_values('p_multiwell')
-    single_pick = sub.head(n_per_class)
-    multi_pick = sub.tail(n_per_class).iloc[::-1]
-    picks = [('single-well', row) for _, row in single_pick.iterrows()] + \
-            [('multi-well',  row) for _, row in multi_pick.iterrows()]
-
-    interval_dir = os.path.join(output_dir, str(int(seconds_interval)))
-    plot_dir = os.path.join(interval_dir, 'window_overlays')
-    os.makedirs(plot_dir, exist_ok=True)
-
-    x_prev, dx, dt, dt_t = load_series(
-        start_date, end_date, seconds_interval,
-        kernel_half_width=kernel_half_width,
-        trim_quantile=trim_quantile,
-        detrend=detrend,
-        window_type=window_type,
-    )
-    df_kappa_full = estimate_kappa_series(x_prev, dx, float(dt), dt_t)
-    dt_t_series = pd.to_datetime(dt_t)
-
-    for label, row in picks:
-        w_start = pd.Timestamp(row['window_start'])
-        w_end   = pd.Timestamp(row['window_end'])
-        p_mw    = float(row['p_multiwell'])
-
-        mask = (dt_t_series >= w_start) & (dt_t_series <= w_end + pd.Timedelta(days=1))
-        if mask.sum() < 5:
-            console.print(f'[yellow]Window {w_start.date()}..{w_end.date()} too sparse — skipping.[/yellow]')
-            continue
-        x_win = x_prev[mask.values]
-        t_win = dt_t_series[mask.values]
-
-        if not df_kappa_full.empty:
-            kappa_mask = (
-                (df_kappa_full['datetime'] >= w_start)
-                & (df_kappa_full['datetime'] <= w_end + pd.Timedelta(days=1))
-            )
-            df_kappa_win = df_kappa_full[kappa_mask].reset_index(drop=True)
-        else:
-            df_kappa_win = df_kappa_full
-
-        out_path = os.path.join(
-            plot_dir,
-            f'mcmc_window_{label}_{w_start.strftime("%Y-%m-%d")}_pmw{p_mw:.2f}.png',
-        )
-        plots.plot_window_price_kappa(
-            datetimes=t_win,
-            log_prices=x_win,
-            df_kappa=df_kappa_win,
-            output_path=out_path,
-            title=(
-                f'MCMC | {label}  |  {w_start.date()} → {w_end.date()}  |  '
-                f'p_multiwell={p_mw:.2f}'
-            ),
-        )
-
-
 if __name__ == '__main__':
     from regime_estimation import normalize_window_boundaries
 
@@ -1150,15 +1058,15 @@ if __name__ == '__main__':
         console=_console,
     )
 
-    _plot_extreme_window_overlays_mcmc(
+    plots._plot_extreme_window_overlays(
         labels_csv=labels_csv,
         start_date=start_date,
         end_date=end_date,
         seconds_interval=seconds_interval,
-        window_type=window_type,
         kernel_half_width=5,
         trim_quantile=0.01,
         detrend=0,
+        window_type=window_type,
         output_dir='phase_c_results',
         console=_console,
     )
