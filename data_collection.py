@@ -169,7 +169,7 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_w
     return result_df, prev_log_last
 
 
-def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='data', kernel_half_width=0, trim_quantile=0.0, detrend=0):
+def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='data', kernel_half_width=0, trim_quantile=0.0):
     """
     Aggregate log returns for each CSV in a date range and export the combined results.
 
@@ -180,7 +180,6 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
         output_dir: Directory to write the combined CSV file
         kernel_half_width: Kernel width parameter
         trim_quantile: Fraction of data to trim from extremes (e.g., 0.01 for 1%)
-        detrend: 1 to remove a linear trend from log-prices before returning, 0 to leave raw
 
     Returns:
         The combined DataFrame of aggregated log returns for the range.
@@ -200,92 +199,212 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
 
     os.makedirs(output_dir, exist_ok=True)
 
-    trim_tag = f'_trim{trim_quantile}' if trim_quantile > 0 else ''
-    kernel_tag = f'_k{kernel_half_width}' if kernel_half_width > 0 else ''
-    detrend_tag = '_detrended' if detrend else ''
-    output_file = os.path.join(
-        output_dir,
-        f'ETHUSDT-aggReturns-{start_dt.strftime("%Y-%m-%d")}_to_{end_dt.strftime("%Y-%m-%d")}'
-        f'-{x_seconds}sec{kernel_tag}{trim_tag}{detrend_tag}.csv',
+    output_file = _aggregated_returns_path(
+        start_dt, end_dt, x_seconds, kernel_half_width, trim_quantile, data_dir=output_dir,
     )
     if os.path.exists(output_file):
-        cached = pd.read_csv(output_file, parse_dates=['datetime'])
-        return cached
+        return pd.read_csv(output_file, parse_dates=['datetime'])
+
+    current = start_dt
+    combined_frames = []
+    prev_log_last = None
+    while current <= end_dt:
+        date_str = current.strftime('%Y-%m-%d')
+        csv_path = os.path.join(output_dir, f'ETHUSDT-aggTrades-{date_str}.csv')
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f'Missing required CSV file: {csv_path}')
+
+        daily_df, prev_log_last = aggregate_log_returns(
+            csv_path,
+            x_seconds,
+            prev_log_last=prev_log_last,
+            kernel_half_width=kernel_half_width,
+        )
+        combined_frames.append(daily_df)
+        current += timedelta(days=1)
+
+    if combined_frames:
+        combined_df = pd.concat(combined_frames, ignore_index=True)
     else:
+        combined_df = pd.DataFrame(columns=['datetime', 'log_return'])
 
-        current = start_dt
-        combined_frames = []
+    if not combined_df.empty:
+        if not combined_df['datetime'].is_monotonic_increasing:
+            raise ValueError('Combined datetime values are not strictly increasing.')
 
-        prev_log_last = None
-        while current <= end_dt:
-            date_str = current.strftime('%Y-%m-%d')
-            csv_path = os.path.join(output_dir, f'ETHUSDT-aggTrades-{date_str}.csv')
-            if not os.path.exists(csv_path):
-                raise FileNotFoundError(f'Missing required CSV file: {csv_path}')
-
-            daily_df, prev_log_last = aggregate_log_returns(
-                csv_path, 
-                x_seconds, 
-                prev_log_last=prev_log_last, 
-                kernel_half_width=kernel_half_width
+        interval_seconds = combined_df['datetime'].diff().dt.total_seconds().iloc[1:]
+        if not np.allclose(interval_seconds, x_seconds, atol=1e-6):
+            bad_index = interval_seconds[~np.isclose(interval_seconds, x_seconds, atol=1e-6)].index[0]
+            bad_start = combined_df.loc[bad_index - 1, 'datetime']
+            bad_end = combined_df.loc[bad_index, 'datetime']
+            raise ValueError(
+                f'Uneven interval spacing detected between {bad_start} and {bad_end}: '
+                f'{interval_seconds.iloc[bad_index-1]} seconds (expected {x_seconds})'
             )
-            combined_frames.append(daily_df)
-            current += timedelta(days=1)
 
-        if combined_frames:
-            combined_df = pd.concat(combined_frames, ignore_index=True)
+    if trim_quantile > 0 and not combined_df.empty:
+        lower_q = combined_df['log_first_price'].quantile(trim_quantile / 2)
+        upper_q = combined_df['log_first_price'].quantile(1 - trim_quantile / 2)
+        combined_df = combined_df[
+            (combined_df['log_first_price'] >= lower_q) &
+            (combined_df['log_first_price'] <= upper_q)
+        ].copy()
+
+    combined_df.to_csv(output_file, index=False)
+    return combined_df
+
+
+# ---------------------------------------------------------------------------
+# Series loader (used by phase_GP)
+# ---------------------------------------------------------------------------
+
+def _aggregated_returns_path(
+    start_date, end_date, seconds_interval,
+    kernel_half_width, trim_quantile,
+    data_dir='data',
+):
+    """Path of the cached aggregated-returns CSV."""
+    def _to_dt(d):
+        if isinstance(d, str):
+            return datetime.strptime(d, '%Y-%m-%d')
+        return d
+
+    start_dt = _to_dt(start_date)
+    end_dt = _to_dt(end_date)
+    kernel_tag = f'_k{kernel_half_width}' if kernel_half_width > 0 else ''
+    trim_tag = f'_trim{trim_quantile}' if trim_quantile > 0 else ''
+    return os.path.join(
+        data_dir,
+        f'ETHUSDT-aggReturns-{start_dt.strftime("%Y-%m-%d")}_to_'
+        f'{end_dt.strftime("%Y-%m-%d")}-{seconds_interval}sec'
+        f'{kernel_tag}{trim_tag}.csv',
+    )
+
+
+def load_series(
+    start_date,
+    end_date,
+    seconds_interval,
+    kernel_half_width=5,
+    trim_quantile=0.01,
+    window_type=None,
+):
+    """
+    Load aggregated log-prices over [start_date, end_date] at one sampling
+    interval and emit (x_prev, dx, dt, dt_t) with cross-gap increments
+    dropped.
+
+    Two modes:
+      - window_type is None : read a single whole-range aggregated CSV.
+      - window_type set     : read per-window CSVs (matching Phase A's window
+        type) and concatenate. Increments that span two windows are dropped.
+
+    Returns
+    -------
+    x_prev : (N,) log-price at t-1
+    dx     : (N,) increment x_t - x_{t-1}
+    dt     : float, nominal step in seconds (seconds_interval)
+    dt_t   : (N,) datetime of x_t aligned with dx
+    """
+    if window_type is None:
+        cached_path = _aggregated_returns_path(
+            start_date, end_date, seconds_interval,
+            kernel_half_width, trim_quantile,
+        )
+        if os.path.exists(cached_path):
+            df = pd.read_csv(cached_path, parse_dates=['datetime'])
+            if df.empty:
+                df = aggregate_log_returns_range(
+                    start_date, end_date, seconds_interval,
+                    kernel_half_width=kernel_half_width,
+                    trim_quantile=trim_quantile,
+                )
         else:
-            combined_df = pd.DataFrame(columns=['datetime', 'log_return'])
-
-        # Validate evenly spaced intervals across the full stacked range
-        if not combined_df.empty:
-            if not combined_df['datetime'].is_monotonic_increasing:
-                raise ValueError('Combined datetime values are not strictly increasing.')
-
-            interval_seconds = combined_df['datetime'].diff().dt.total_seconds().iloc[1:]
-            if not np.allclose(interval_seconds, x_seconds, atol=1e-6):
-                bad_index = interval_seconds[~np.isclose(interval_seconds, x_seconds, atol=1e-6)].index[0]
-                bad_start = combined_df.loc[bad_index - 1, 'datetime']
-                bad_end = combined_df.loc[bad_index, 'datetime']
-                raise ValueError(
-                    f'Uneven interval spacing detected between {bad_start} and {bad_end}: '
-                    f'{interval_seconds.iloc[bad_index-1]} seconds (expected {x_seconds})'
+            df = aggregate_log_returns_range(
+                start_date, end_date, seconds_interval,
+                kernel_half_width=kernel_half_width,
+                trim_quantile=trim_quantile,
+            )
+        if df.empty:
+            raise ValueError('Empty aggregated returns dataframe.')
+        df = df.sort_values('datetime').reset_index(drop=True)
+        df['__window_idx'] = 0
+    else:
+        # Imported lazily to avoid a circular import (regime_estimation imports
+        # data_collection at module load).
+        from regime_estimation import iter_windows
+        frames = []
+        for w_idx, (window_start, window_end) in enumerate(
+            iter_windows(start_date, end_date, window_type)
+        ):
+            cached_path = _aggregated_returns_path(
+                window_start, window_end, seconds_interval,
+                kernel_half_width, trim_quantile,
+            )
+            if os.path.exists(cached_path):
+                df_w = pd.read_csv(cached_path, parse_dates=['datetime'])
+                if df_w.empty:
+                    df_w = aggregate_log_returns_range(
+                        window_start, window_end, seconds_interval,
+                        kernel_half_width=kernel_half_width,
+                        trim_quantile=trim_quantile,
+                    )
+            else:
+                df_w = aggregate_log_returns_range(
+                    window_start, window_end, seconds_interval,
+                    kernel_half_width=kernel_half_width,
+                    trim_quantile=trim_quantile,
                 )
-            
-        # Trim extreme log prices if requested
-        if trim_quantile > 0 and not combined_df.empty:
-            lower_q = combined_df['log_first_price'].quantile(trim_quantile / 2)
-            upper_q = combined_df['log_first_price'].quantile(1 - trim_quantile / 2)
-            combined_df = combined_df[(combined_df['log_first_price'] >= lower_q) & 
-                                    (combined_df['log_first_price'] <= upper_q)].copy()    
-                
-        # Detrend the *drift*, not the price level. We compute the per-bar
-        # drift mu_w = mean(diff(log_first_price)) within the window and
-        # subtract mu_w * (k - k_mean) from both log-price columns. That
-        # operation:
-        #   - leaves the within-window mean log-price intact (well positions
-        #     in absolute log-price space are preserved),
-        #   - zeroes the mean of dx = diff(log_first_price) within the
-        #     window (the drift is demeaned),
-        #   - keeps log_return = log_last_price - log_first_price unchanged
-        #     (the same shift is applied to both columns).
-        if detrend and not combined_df.empty:
-            valid_first = combined_df['log_first_price'].notna()
-            if int(valid_first.sum()) >= 2:
-                x_first = combined_df.loc[valid_first, 'log_first_price'].to_numpy()
-                mean_dx = float(np.mean(np.diff(x_first)))   # per-bar drift
-                t = np.arange(len(combined_df), dtype=np.float64)
-                k_mean = float(t[valid_first].mean())
-                adjustment = mean_dx * (t - k_mean)
-                for col in ('log_first_price', 'log_last_price'):
-                    combined_df[col] = combined_df[col] - adjustment
-                combined_df['log_return'] = (
-                    combined_df['log_last_price'] - combined_df['log_first_price']
-                )
+            if df_w is None or df_w.empty:
+                continue
+            df_w = df_w.copy()
+            df_w['__window_idx'] = w_idx
+            frames.append(df_w)
+        if not frames:
+            raise ValueError(
+                f'No per-window aggregated CSVs available for '
+                f'{start_date}..{end_date} at {seconds_interval}s '
+                f'({window_type}).'
+            )
+        df = pd.concat(frames, ignore_index=True).sort_values('datetime')
+        df = df.reset_index(drop=True)
+
+    x = df['log_first_price'].values.astype(float)
+    ts = pd.to_datetime(df['datetime']).values
+    win_idx = df['__window_idx'].values.astype(int)
+
+    dt_arr = (np.diff(ts) / np.timedelta64(1, 's')).astype(float)
+    finite = np.isfinite(np.diff(x)) & np.isfinite(x[:-1])
+    same_window = (win_idx[:-1] == win_idx[1:])
+    valid = (dt_arr > 0) & (dt_arr <= 1.5 * seconds_interval) & finite & same_window
+
+    x_prev = x[:-1][valid]
+    dx = np.diff(x)[valid]
+    dt_t = ts[1:][valid]
+
+    return x_prev, dx, float(seconds_interval), dt_t
 
 
-        combined_df.to_csv(output_file, index=False)
-        return combined_df
+def ema_demean_drift(r, dt_t, halflife_days=14.0):
+    """
+    Causal EMA demeaning of the scaled increment r = dx/dt. Halflife is
+    interpreted in wall-clock time (essential at 30-second sampling).
+
+    Returns
+    -------
+    r_hat : (N,) demeaned increment (r - EMA(r))
+    r_bar : (N,) the EMA trend that was removed
+    """
+    halflife_str = f'{halflife_days * 24 * 3600:.0f}s'
+    r_series = pd.Series(r, index=pd.to_datetime(dt_t))
+    r_bar_series = r_series.ewm(
+        halflife=halflife_str,
+        times=r_series.index,
+        adjust=False,
+    ).mean()
+    r_bar = r_bar_series.values
+    r_hat = r - r_bar
+    return r_hat, r_bar
 
 
 # ---------------------------------------------------------------------------
