@@ -251,6 +251,13 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
                     f'Uneven interval spacing detected between {bad_start} and {bad_end}: '
                     f'{interval_seconds.iloc[bad_index-1]} seconds (expected {x_seconds})'
                 )
+            
+        # Trim extreme log prices if requested
+        if trim_quantile > 0 and not combined_df.empty:
+            lower_q = combined_df['log_first_price'].quantile(trim_quantile / 2)
+            upper_q = combined_df['log_first_price'].quantile(1 - trim_quantile / 2)
+            combined_df = combined_df[(combined_df['log_first_price'] >= lower_q) & 
+                                    (combined_df['log_first_price'] <= upper_q)].copy()    
                 
         # Detrend the *drift*, not the price level. We compute the per-bar
         # drift mu_w = mean(diff(log_first_price)) within the window and
@@ -276,12 +283,6 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
                     combined_df['log_last_price'] - combined_df['log_first_price']
                 )
 
-        # Trim extreme log prices if requested
-        if trim_quantile > 0 and not combined_df.empty:
-            lower_q = combined_df['log_first_price'].quantile(trim_quantile / 2)
-            upper_q = combined_df['log_first_price'].quantile(1 - trim_quantile / 2)
-            combined_df = combined_df[(combined_df['log_first_price'] >= lower_q) & 
-                                    (combined_df['log_first_price'] <= upper_q)].copy()
 
         combined_df.to_csv(output_file, index=False)
         return combined_df

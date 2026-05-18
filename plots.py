@@ -696,7 +696,7 @@ def _plot_extreme_window_overlays(
             plot_dir,
             f'window_{label}_{w_start.strftime("%Y-%m-%d")}_pmw{p_mw:.2f}.png',
         )
-        plots.plot_window_price_kappa(
+        plot_window_price_kappa(
             datetimes=t_win,
             log_prices=x_win,
             df_kappa=df_kappa_win,
