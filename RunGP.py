@@ -35,15 +35,20 @@ from phase_GP import run_phase_gp
 
 # --- Date range ---------------------------------------------------------------
 start_date = datetime(2025, 1, 1)
-end_date   = datetime(2025, 12, 31)
+end_date   = datetime(2025, 5, 25)
 
 # --- Data aggregation ---------------------------------------------------------
-seconds_interval  = 30      # sampling interval in seconds
-kernel_half_width = 5       # smoothing half-width for the log-price aggregator
-trim_quantile     = 0.01    # symmetric tail trim on log-prices (0 to disable)
+# Phase A (Kramers–Moyal) prefers small dt (30–300 s): KM is O(dt)-biased and
+# large dt blurs well structure via inter-basin jumps.
+# Phase GP (Kalman filter) prefers large dt (1800–3600 s): same SNR but fewer
+# iterations, smaller per-step obs_noise, and better numerical stability.
+phase_a_seconds_interval  = 300    # Phase A sampling interval (seconds)
+phase_gp_seconds_interval = 1800   # Phase GP sampling interval (seconds)
+kernel_half_width = 50             # smoothing half-width for the log-price aggregator
+trim_quantile     = 0.01           # symmetric tail trim on log-prices (0 to disable)
 
 # --- Phase A topology classifier ---------------------------------------------
-window_type          = 'weekly'   # 'weekly' | 'biweekly' | 'monthly'
+window_type          = 'monthly'   # 'weekly' | 'biweekly' | 'monthly'
 n_bins               = 200        # number of KM bins per window
 weight_threshold     = 5          # minimum bin occupancy for a usable KM cell
 min_barrier_fraction = 0.1        # keep a well only if barrier >= this * U_range
@@ -106,18 +111,19 @@ def main() -> None:
     # -------------------------------------------------------------------------
     console.rule('[bold cyan]Step 2 — Aggregate log-returns (per window)')
     window_list = list(iter_windows(snapped_start, snapped_end, window_type))
-    for window_start, window_end in window_list:
-        dc.aggregate_log_returns_range(
-            window_start, window_end, seconds_interval,
-            kernel_half_width=kernel_half_width,
-            trim_quantile=trim_quantile,
-        )
+    for si in sorted({phase_a_seconds_interval, phase_gp_seconds_interval}):
+        for window_start, window_end in window_list:
+            dc.aggregate_log_returns_range(
+                window_start, window_end, si,
+                kernel_half_width=kernel_half_width,
+                trim_quantile=trim_quantile,
+            )
 
     # -------------------------------------------------------------------------
     console.rule('[bold cyan]Step 3 — Phase A: regime topology classification')
     labels_df = run_phase_a(
         snapped_start, snapped_end,
-        seconds_interval,
+        phase_a_seconds_interval,
         kernel_half_width=kernel_half_width,
         trim_quantile=trim_quantile,
         n_bins=n_bins,
@@ -133,19 +139,20 @@ def main() -> None:
     labels_csv = os.path.join(
         output_dir,
         f"regime_labels_{snapped_start.strftime('%Y-%m-%d')}_to_"
-        f"{snapped_end.strftime('%Y-%m-%d')}_{seconds_interval}s_{window_type}.csv",
+        f"{snapped_end.strftime('%Y-%m-%d')}_{phase_a_seconds_interval}s_{window_type}.csv",
     )
 
     # -------------------------------------------------------------------------
     # Phase B and Phase GP run inside run_phase_gp. Phase B is called via
     # _phase_b_dwell_days; because labels_csv is provided it is never re-run.
-    topology_every_n_obs = 7 * 24 * 3600 // seconds_interval  # one topology snapshot per week
+    topology_every_n_obs = 7 * 24 * 3600 // phase_gp_seconds_interval  # one topology snapshot per week
 
     console.rule('[bold cyan]Step 4–5 — Phase B (dwell times) → Phase GP')
     run_phase_gp(
         start_date=snapped_start,
         end_date=snapped_end,
-        seconds_interval=seconds_interval,
+        seconds_interval=phase_gp_seconds_interval,
+        phase_a_seconds_interval=phase_a_seconds_interval,
         window_type=window_type,
         labels_csv=labels_csv,
         sigma2=sigma2,

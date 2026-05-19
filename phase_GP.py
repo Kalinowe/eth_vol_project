@@ -22,6 +22,7 @@ Outputs (under output_dir):
 """
 
 import os
+import warnings
 import numpy as np
 import pandas as pd
 from scipy.integrate import cumulative_trapezoid
@@ -144,6 +145,12 @@ class KalmanGPDriftModel:
         self.inducing_x = np.linspace(x_range[0], x_range[1], n_inducing)
         self.M = n_inducing
 
+        # Spatial kernel matrix — cached so _obs_matrix pays no per-step cost.
+        K_zz = rbf_kernel(self.inducing_x, self.inducing_x,
+                          self.spatial_ls, self.spatial_var)
+        K_zz_jit = K_zz + 1e-6 * np.eye(self.M)
+        self._K_zz_inv = solve(K_zz_jit, np.eye(self.M), assume_a='pos')
+
         dt_days = self.dt / 86400.0
         F, L, Qc, _H_1d, P_inf = matern32_sde(
             self.temporal_ls, sigma2=self.spatial_var,
@@ -154,7 +161,16 @@ class KalmanGPDriftModel:
         self.Q_block = np.kron(np.eye(self.M), Q_1)
 
         self.state_mean = np.zeros(2 * self.M)
-        P_inf_block = np.kron(np.eye(self.M), P_inf)
+
+        # P_inf: f block = K_zz (GP spatial prior), f' block = lam² × K_zz.
+        # predict() uses K_qq - K_qz @ K_ZZ^{-1} @ K_qz.T + posterior term,
+        # which recovers K(x,x) only when P_ff starts at K_ZZ.
+        lam_sq = P_inf[1, 1] / P_inf[0, 0]   # lam² from Matern SDE
+        idx_f  = np.arange(0, 2 * self.M, 2)
+        idx_fp = np.arange(1, 2 * self.M, 2)
+        P_inf_block = np.zeros((2 * self.M, 2 * self.M))
+        P_inf_block[np.ix_(idx_f,  idx_f )] = K_zz_jit
+        P_inf_block[np.ix_(idx_fp, idx_fp)] = lam_sq * K_zz_jit
         self.state_cov = P_inf_block.copy()
 
         self._F = F
@@ -172,8 +188,12 @@ class KalmanGPDriftModel:
             self.spatial_ls,
             self.spatial_var,
         ).flatten()
+        # H = K_{xZ} @ K_{ZZ}^{-1}: consistent with predict(), which computes
+        # mu(x) = K_{xZ} @ K_{ZZ}^{-1} @ f.  Using raw K_{xZ} here inflates
+        # the effective observation magnitude relative to what predict() reads
+        # back, causing over-aggressive Kalman gain and eventual FP instability.
         H = np.zeros((1, 2 * self.M))
-        H[0, 0::2] = k_vec
+        H[0, 0::2] = self._K_zz_inv @ k_vec
         return H
 
     def update(self, x_prev, r_hat, t_seconds):
@@ -203,19 +223,46 @@ class KalmanGPDriftModel:
             m_pred = A_block_i @ self.state_mean
             P_pred = A_block_i @ self.state_cov @ A_block_i.T + Q_block_i
 
+            if not (np.isfinite(m_pred).all() and np.isfinite(P_pred).all()):
+                warnings.warn(
+                    f'KalmanGP: state overflow at observation {i} '
+                    f'(max |m_pred|={np.max(np.abs(m_pred)):.3e}, '
+                    f'max |P_pred|={np.max(np.abs(P_pred)):.3e}). '
+                    'Aborting update, log_lik set to -inf.',
+                    RuntimeWarning, stacklevel=2,
+                )
+                self._log_lik = -np.inf
+                break
+
             H = self._obs_matrix(x_prev[i])
             S = H @ P_pred @ H.T + self.obs_noise
-            K = P_pred @ H.T / S[0, 0]
+            raw_s = float(S[0, 0])
+            if raw_s < 1e-15:
+                warnings.warn(
+                    f'KalmanGP: innovation variance S={raw_s:.3e} at observation {i} '
+                    f'(obs_noise={self.obs_noise:.3e}). Flooring to 1e-15. '
+                    'P_pred may have lost positive-definiteness.',
+                    RuntimeWarning, stacklevel=2,
+                )
+            s_val = max(raw_s, 1e-15)
+            K = P_pred @ H.T / s_val
             innov = r_hat[i] - (H @ m_pred)[0]
 
             self.state_mean = m_pred + K[:, 0] * innov
             IKH = np.eye(2 * self.M) - K @ H
-            self.state_cov = (IKH @ P_pred @ IKH.T
-                              + self.obs_noise * K @ K.T)
+            P_post = IKH @ P_pred @ IKH.T + self.obs_noise * K @ K.T
+            P_sym = (P_post + P_post.T) * 0.5
+            asym = np.max(np.abs(P_post - P_sym))
+            if asym > 1e-10 * np.max(np.abs(P_post)):
+                warnings.warn(
+                    f'KalmanGP: P asymmetry {asym:.3e} at observation {i}. Symmetrising.',
+                    RuntimeWarning, stacklevel=2,
+                )
+            self.state_cov = P_sym
 
             self._log_lik += (
-                -0.5 * np.log(2 * np.pi * S[0, 0])
-                - 0.5 * innov ** 2 / S[0, 0]
+                -0.5 * np.log(2 * np.pi * s_val)
+                - 0.5 * innov ** 2 / s_val
             )
             self._n_obs += 1
             prev_t = t_seconds[i]
@@ -228,22 +275,18 @@ class KalmanGPDriftModel:
 
         K_qz = rbf_kernel(x_grid, self.inducing_x,
                           self.spatial_ls, self.spatial_var)
-        K_zz = rbf_kernel(self.inducing_x, self.inducing_x,
-                          self.spatial_ls, self.spatial_var)
 
-        K_zz_jit = K_zz + 1e-6 * np.eye(self.M)
-
-        alpha = solve(K_zz_jit, f_mean, assume_a='pos')
+        alpha = self._K_zz_inv @ f_mean
         mu_mean = K_qz @ alpha
 
-        V = solve(K_zz_jit, K_qz.T, assume_a='pos')
+        V = self._K_zz_inv @ K_qz.T
 
         if full_cov:
             K_qq = rbf_kernel(x_grid, x_grid,
                               self.spatial_ls, self.spatial_var)
             mu_cov = (K_qq
                       - K_qz @ V
-                      + K_qz @ solve(K_zz_jit, P_ff @ V, assume_a='pos'))
+                      + K_qz @ (self._K_zz_inv @ P_ff @ V))
             # Jitter proportional to prior variance: robust when K_qq is nearly
             # singular (dense grid relative to small spatial_ls).
             mu_cov += max(1e-6 * self.spatial_var, 1e-10) * np.eye(len(x_grid))
@@ -251,8 +294,7 @@ class KalmanGPDriftModel:
             K_qq_diag = self.spatial_var * np.ones(len(x_grid))
             mu_cov = (K_qq_diag
                       - np.sum(K_qz * V.T, axis=1)
-                      + np.sum((K_qz @ solve(K_zz_jit, P_ff,
-                                             assume_a='pos')) * K_qz, axis=1))
+                      + np.sum((K_qz @ self._K_zz_inv @ P_ff) * K_qz, axis=1))
             mu_cov = np.maximum(mu_cov, 0.0)
 
         return mu_mean, mu_cov
@@ -399,7 +441,16 @@ class KalmanGPDriftModel:
             )
             m.initialise(x_range, n_inducing=n_ind)
             m.update(x_prev_subset, r_hat_subset, t_seconds_subset)
-            return -m._log_lik
+            ll = m._log_lik
+            if not np.isfinite(ll):
+                warnings.warn(
+                    f'HP opt: non-finite log_lik={ll} at '
+                    f'sp_ls={np.exp(log_params[0]):.4f} '
+                    f'tmp_ls={np.exp(log_params[1]):.2f}d '
+                    f'sp_var={np.exp(log_params[2]):.4f}. Returning penalty.',
+                    RuntimeWarning, stacklevel=2,
+                )
+            return 1e10 if not np.isfinite(ll) else -ll
 
         best_nll = np.inf
         best_pars = np.log([self.spatial_ls, self.temporal_ls, self.spatial_var])
@@ -594,6 +645,7 @@ def forecast_topology(
         )
         fwd_model.inducing_x = model.inducing_x
         fwd_model.M = model.M
+        fwd_model._K_zz_inv = model._K_zz_inv
         fwd_model.A_block = model.A_block
         fwd_model.Q_block = model.Q_block
         fwd_model._F = model._F
@@ -757,6 +809,7 @@ def run_phase_gp(
     start_date,
     end_date,
     seconds_interval,
+    phase_a_seconds_interval=None,
     window_type='weekly',
     labels_csv=None,
     sigma2=None,
@@ -792,6 +845,7 @@ def run_phase_gp(
     console = console or Console()
     rng = np.random.default_rng(seed)
     seconds_interval = int(seconds_interval)
+    _phase_a_si = int(phase_a_seconds_interval) if phase_a_seconds_interval else seconds_interval
 
     # --- Snap window boundaries (Phase A uses the same rule) ---
     start_date, end_date = normalize_window_boundaries(
@@ -801,7 +855,7 @@ def run_phase_gp(
     # --- Phase A: produce regime labels if missing ---
     if labels_csv is None:
         labels_csv = _ensure_phase_a_labels(
-            start_date, end_date, seconds_interval, window_type,
+            start_date, end_date, _phase_a_si, window_type,
             kernel_half_width, trim_quantile, output_dir, console,
         )
 
@@ -872,7 +926,7 @@ def run_phase_gp(
         labels_csv, parse_dates=['window_start', 'window_end']
     )
     labels_df = labels_df[
-        labels_df['seconds_interval'] == seconds_interval
+        labels_df['seconds_interval'] == _phase_a_si
     ].copy().reset_index(drop=True)
 
     dt_series = pd.Series(pd.to_datetime(dt_t))
