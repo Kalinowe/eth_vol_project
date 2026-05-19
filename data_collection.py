@@ -417,6 +417,9 @@ def window_seconds(window_type):
     elif window_type == 'biweekly':
         return 14 * 24 * 3600
     elif window_type == 'monthly':
-        return 30 * 24 * 3600
+        # iter_month_windows yields calendar months (28–31 days); use the
+        # Julian-year mean month length so dwell-time conversions stay
+        # consistent across phases.
+        return int(round(365.25 / 12 * 86400))
     else:
         raise ValueError(f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'.")

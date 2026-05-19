@@ -7,65 +7,6 @@ import numpy as np
 import pandas as pd
 from scipy.integrate import cumulative_trapezoid
 
-from force_field_estimation import integrate_drift_to_potential
-
-
-# ---------------------------------------------------------------------------
-# Phase A / KM plots
-# ---------------------------------------------------------------------------
-
-def plot_potentials_from_km_results(results_by_interval, output_dir='plots', range_label=None, detrend=False):
-    """
-    Plot integrated potential functions for precomputed KM results.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    detrend_label = ' [detrended]' if detrend else ''
-    detrend_suffix = '_detrended' if detrend else ''
-    sec_per_year = 365.25 * 24 * 3600
-
-    plt.figure(figsize=(12, 7))
-    for x_seconds, result_df in results_by_interval.items():
-        potential_df = integrate_drift_to_potential(result_df[['bin_center', 'drift']])
-        plt.plot(potential_df['bin_center'], potential_df['potential'], label=f'{x_seconds}s interval')
-    plt.title(f'Integrated Potentials Comparison - {range_label}{detrend_label}')
-    plt.xlabel('Log price bin center')
-    plt.ylabel('Potential U(x)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    output_path = os.path.join(output_dir, f'combined_potentials_{range_label}{detrend_suffix}.png')
-    plt.savefig(output_path, dpi=150)
-    plt.close()
-    print(f'Saved {output_path}')
-
-    plt.figure(figsize=(12, 7))
-    for x_seconds, result_df in results_by_interval.items():
-        ann_drift = result_df['drift'] * sec_per_year
-        plt.plot(result_df['bin_center'], ann_drift, label=f'{x_seconds}s interval')
-    plt.title(f'Annualized Drift ($D_1$) Comparison - {range_label}')
-    plt.xlabel('Log price bin center')
-    plt.ylabel('Annualized Expected Return')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    output_path_drift = os.path.join(output_dir, f'drift_comparison_{range_label}.png')
-    plt.savefig(output_path_drift, dpi=150)
-    plt.close()
-    print(f'Saved {output_path_drift}')
-
-    plt.figure(figsize=(12, 7))
-    for x_seconds, result_df in results_by_interval.items():
-        ann_vol = np.sqrt(2 * result_df['diffusion'] * sec_per_year)
-        plt.plot(result_df['bin_center'], ann_vol, label=f'{x_seconds}s interval')
-    plt.title(f'Annualized Volatility ($\\sigma$) Comparison - {range_label}')
-    plt.xlabel('Log price bin center')
-    plt.ylabel('Annualized Volatility')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    output_path_vol = os.path.join(output_dir, f'volatility_comparison_{range_label}.png')
-    plt.savefig(output_path_vol, dpi=150)
-    plt.close()
-    print(f'Saved {output_path_vol}')
-
 
 def plot_price_series(df, output_dir='plots', range_label=None, smooth_window=20, detrend=False):
     """ETH price over time with a rolling-mean smoothing overlay."""
@@ -247,14 +188,17 @@ def plot_gp_topology_series(df_topology, out_path):
     print(f'Saved {out_path}')
 
 
-def plot_gp_potential_snapshots(model, x_range, snapshots, out_path, n_snapshots=6):
+def plot_gp_potential_snapshots(model, x_range, snapshots, out_path,
+                                n_snapshots=6, n_samples=200):
     """
-    Grid of U(x) snapshots reconstructed from saved Kalman states.
+    Grid of U(x) snapshots reconstructed from saved Kalman states, overlaid
+    with the ±2σ posterior envelope from joint drift samples.
 
     snapshots is a list of (datetime, state_mean, state_cov) tuples appended
     during run_phase_gp's main loop. Each panel restores the saved state on
-    the supplied model, predicts the posterior-mean drift, and integrates
-    to U(x).
+    the supplied model, predicts the posterior-mean drift, integrates to
+    U(x), and draws posterior samples to expose the band that drives
+    p_multiwell.
     """
     if not snapshots:
         print(f'[plot_gp_potential_snapshots] no snapshots; skipping {out_path}')
@@ -280,19 +224,36 @@ def plot_gp_potential_snapshots(model, x_range, snapshots, out_path, n_snapshots
         dt_q, sm, sc = snapshots[idx[k]]
         model.state_mean = sm
         model.state_cov = sc
+
         mu_mean, _ = model.predict(x_grid, full_cov=False)
-        U = -cumulative_trapezoid(mu_mean, x_grid, initial=0.0)
-        U -= U.min()
-        ax.plot(x_grid, U, color='steelblue', linewidth=1.2)
+        U_mean = -cumulative_trapezoid(mu_mean, x_grid, initial=0.0)
+        U_mean -= U_mean.min()
+
+        # Posterior samples → integrate → per-sample baseline-shift → std.
+        # Same construction the topology stats use, so the envelope reflects
+        # exactly the uncertainty that p_multiwell is integrating over.
+        rng = np.random.default_rng(42)
+        f_samples = model.sample_drift(x_grid, n_samples=n_samples, rng=rng)
+        U_samples = -cumulative_trapezoid(f_samples, x_grid, axis=0, initial=0.0)
+        U_samples = U_samples - U_samples.min(axis=0, keepdims=True)
+        U_std = U_samples.std(axis=1)
+
+        ax.fill_between(
+            x_grid, U_mean - 2 * U_std, U_mean + 2 * U_std,
+            color='steelblue', alpha=0.2, linewidth=0, label='±2σ',
+        )
+        ax.plot(x_grid, U_mean, color='steelblue', linewidth=1.2, label='mean')
         ax.set_title(str(pd.Timestamp(dt_q).date()), fontsize=8)
         ax.set_xlabel('log-price', fontsize=7)
         ax.set_ylabel('U(x)', fontsize=7)
         ax.tick_params(labelsize=6)
+        if k == 0:
+            ax.legend(fontsize=6, loc='upper right')
 
     model.state_mean = saved_mean
     model.state_cov = saved_cov
 
-    fig.suptitle('GP posterior mean potential U(x) — snapshots', fontsize=10)
+    fig.suptitle('GP posterior mean potential U(x) with ±2σ envelope', fontsize=10)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)

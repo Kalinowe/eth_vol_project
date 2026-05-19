@@ -55,11 +55,12 @@ min_barrier_fraction = 0.1        # keep a well only if barrier >= this * U_rang
 min_well_separation  = 0.0        # minimum separation between wells (log-price units)
 
 # --- Phase GP — spatial kernel -----------------------------------------------
-spatial_lengthscale = 0.05   # RBF lengthscale over log-price (initial; refined by HP opt)
+# None -> derived from data as 0.15 × std(x_prev) (half of Phase A's 0.3×std heuristic)
+spatial_lengthscale = None
 spatial_variance    = 1.0    # GP prior variance (initial; refined by HP opt)
 
 # --- Phase GP — temporal kernel (Matern 3/2) ----------------------------------
-# None -> derived from Phase B mean dwell time
+# None -> half of Phase B mean dwell time (Phase A regimes resolve faster than dwell)
 temporal_lengthscale_days = None
 
 # --- Phase GP — EMA drift demeaning ------------------------------------------
@@ -71,12 +72,12 @@ ema_halflife_days = None
 sigma2 = None
 
 # --- Phase GP — Kalman state --------------------------------------------------
-n_inducing = 20     # number of inducing points; Kalman state dim = 2 * n_inducing
+n_inducing = 8      # number of inducing points; Kalman state dim = 2 * n_inducing
 
 # --- Phase GP — HP optimisation ----------------------------------------------
 hp_opt_after_n_windows = 2        # optimise HPs after this many Phase-A windows
 hp_opt_n_restarts      = 3        # L-BFGS-B restarts ('scipy' method only)
-hp_opt_method          = 'scipy'  # 'scipy' (multi-restart L-BFGS-B) or 'gpflow' (SGPR)
+hp_opt_method          = 'gpflow'  # 'scipy' (multi-restart L-BFGS-B) or 'gpflow' (SGPR)
 
 # --- Phase GP — topology extraction ------------------------------------------
 n_grid           = 200   # grid points for the posterior drift field
@@ -90,7 +91,8 @@ forecast_horizons_days = (1.0, 3.0, 7.0, 14.0)   # Kalman rollout horizons (days
 seed = 42
 
 # --- Output ------------------------------------------------------------------
-output_dir = 'regime_results'   # all artefacts written here
+output_dir = 'regime_results'   # Phase A / Phase B artefacts
+gp_output_dir_root = 'gp_results'   # Phase GP artefacts; each phase_gp_seconds_interval gets its own subfolder
 
 
 # =============================================================================
@@ -173,6 +175,7 @@ def main() -> None:
         min_crossing_sep=min_crossing_sep,
         min_barrier_fraction=min_barrier_fraction,
         output_dir=output_dir,
+        gp_output_dir=os.path.join(gp_output_dir_root, f'{phase_gp_seconds_interval}s'),
         seed=seed,
         console=console,
     )

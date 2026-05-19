@@ -137,46 +137,67 @@ class KalmanGPDriftModel:
 
         self.A_block = None
         self.Q_block = None
+        self._K_zz_inv = None
+        self._K_zz_jit = None
+        self._I_2M = None
 
         self._log_lik = 0.0
         self._n_obs = 0
 
-    def initialise(self, x_range, n_inducing=20):
-        self.inducing_x = np.linspace(x_range[0], x_range[1], n_inducing)
-        self.M = n_inducing
-
-        # Spatial kernel matrix — cached so _obs_matrix pays no per-step cost.
+    def _recompute_hp_dependent(self):
+        """Refresh HP-dependent caches (K_zz_inv, A_block, Q_block, SDE matrices)
+        without touching state_mean / state_cov. Used by HP optimisation to swap
+        in new kernel parameters while preserving the accumulated Kalman state.
+        """
         K_zz = rbf_kernel(self.inducing_x, self.inducing_x,
                           self.spatial_ls, self.spatial_var)
-        K_zz_jit = K_zz + 1e-6 * np.eye(self.M)
-        self._K_zz_inv = solve(K_zz_jit, np.eye(self.M), assume_a='pos')
+        self._K_zz_jit = K_zz + 1e-6 * np.eye(self.M)
+        self._K_zz_inv = solve(self._K_zz_jit, np.eye(self.M), assume_a='pos')
 
         dt_days = self.dt / 86400.0
         F, L, Qc, _H_1d, P_inf = matern32_sde(
             self.temporal_ls, sigma2=self.spatial_var,
         )
         A_1, Q_1 = matern32_discrete(F, L, Qc, dt_days)
-
-        self.A_block = np.kron(np.eye(self.M), A_1)
-        self.Q_block = np.kron(np.eye(self.M), Q_1)
-
-        self.state_mean = np.zeros(2 * self.M)
-
-        # P_inf: f block = K_zz (GP spatial prior), f' block = lam² × K_zz.
-        # predict() uses K_qq - K_qz @ K_ZZ^{-1} @ K_qz.T + posterior term,
-        # which recovers K(x,x) only when P_ff starts at K_ZZ.
-        lam_sq = P_inf[1, 1] / P_inf[0, 0]   # lam² from Matern SDE
-        idx_f  = np.arange(0, 2 * self.M, 2)
-        idx_fp = np.arange(1, 2 * self.M, 2)
-        P_inf_block = np.zeros((2 * self.M, 2 * self.M))
-        P_inf_block[np.ix_(idx_f,  idx_f )] = K_zz_jit
-        P_inf_block[np.ix_(idx_fp, idx_fp)] = lam_sq * K_zz_jit
-        self.state_cov = P_inf_block.copy()
-
+        eye_M = np.eye(self.M)
+        self.A_block = np.kron(eye_M, A_1)
+        self.Q_block = np.kron(eye_M, Q_1)
         self._F = F
         self._L = L
         self._Qc = Qc
         self._P_inf_1d = P_inf
+
+    def initialise(self, x_range, n_inducing=20, data_x=None):
+        """
+        Place inducing points across x_range. If `data_x` is supplied, drop
+        inducing points outside the observed [min, max] of `data_x` so empty
+        regions of input space do not waste filter capacity.
+        """
+        inducing = np.linspace(x_range[0], x_range[1], n_inducing)
+        if data_x is not None and len(data_x) > 0:
+            d_lo, d_hi = float(np.min(data_x)), float(np.max(data_x))
+            keep = (inducing >= d_lo) & (inducing <= d_hi)
+            inducing = inducing[keep]
+            if len(inducing) < 2:
+                inducing = np.linspace(d_lo, d_hi, max(2, n_inducing))
+        self.inducing_x = inducing
+        self.M = len(self.inducing_x)
+
+        self._recompute_hp_dependent()
+        self._I_2M = np.eye(2 * self.M)
+
+        # P_inf: f block = K_zz (GP spatial prior), f' block = lam² × K_zz.
+        # predict() uses K_qq - K_qz @ K_ZZ^{-1} @ K_qz.T + posterior term,
+        # which recovers K(x,x) only when P_ff starts at K_ZZ.
+        lam_sq = self._P_inf_1d[1, 1] / self._P_inf_1d[0, 0]
+        idx_f  = np.arange(0, 2 * self.M, 2)
+        idx_fp = np.arange(1, 2 * self.M, 2)
+        P_inf_block = np.zeros((2 * self.M, 2 * self.M))
+        P_inf_block[np.ix_(idx_f,  idx_f )] = self._K_zz_jit
+        P_inf_block[np.ix_(idx_fp, idx_fp)] = lam_sq * self._K_zz_jit
+
+        self.state_mean = np.zeros(2 * self.M)
+        self.state_cov = P_inf_block.copy()
 
         self._log_lik = 0.0
         self._n_obs = 0
@@ -249,7 +270,7 @@ class KalmanGPDriftModel:
             innov = r_hat[i] - (H @ m_pred)[0]
 
             self.state_mean = m_pred + K[:, 0] * innov
-            IKH = np.eye(2 * self.M) - K @ H
+            IKH = self._I_2M - K @ H
             P_post = IKH @ P_pred @ IKH.T + self.obs_noise * K @ K.T
             P_sym = (P_post + P_post.T) * 0.5
             asym = np.max(np.abs(P_post - P_sym))
@@ -390,12 +411,13 @@ class KalmanGPDriftModel:
         # Unscale kernel variance back to original units
         new_spatial_var = float(k_spatial.variance.numpy()) * y_scale**2
 
-        self.spatial_ls  = float(np.clip(new_spatial_ls,  1e-3, 2.0))
+        self.spatial_ls  = float(np.clip(new_spatial_ls,  1e-3, 0.1))
         self.temporal_ls = float(np.clip(new_temporal_ls, 0.5,  180.0))
         self.spatial_var = float(np.clip(new_spatial_var, 1e-6, 1e2))
 
-        x_range = (float(x_prev_subset.min()), float(x_prev_subset.max()))
-        self.initialise(x_range, n_inducing=self.M if self.M is not None else 20)
+        # Refresh HP-dependent caches in-place; keep accumulated state_mean /
+        # state_cov from the pre-HP-opt Kalman filter rather than resetting.
+        self._recompute_hp_dependent()
 
         console.print(
             f'[green]GPflow HP optimised:[/green] '
@@ -411,24 +433,28 @@ class KalmanGPDriftModel:
         t_seconds_subset,
         n_restarts=3,
         method='scipy',
+        x_range=None,
         console=None,
     ):
         """Maximise the marginal log-likelihood over kernel HPs.
 
         method='scipy'  — multi-restart L-BFGS-B (default, no extra deps)
         method='gpflow' — GPflow SGPR with separable kernel (requires gpflow)
+        x_range — inducing-point bracket (typically the full series percentile
+                  range); falls back to the subset's min/max when omitted.
         """
         if method == 'gpflow':
             return self.optimise_hp_gpflow(
                 x_prev_subset, r_hat_subset, t_seconds_subset, console=console,
             )
         console = console or Console()
-        x_range = (float(x_prev_subset.min()), float(x_prev_subset.max()))
+        if x_range is None:
+            x_range = (float(x_prev_subset.min()), float(x_prev_subset.max()))
         n_ind = self.M if self.M is not None else 20
 
         def _neg_log_lik(log_params):
             sp_ls, tmp_ls, sp_var = np.exp(log_params)
-            sp_ls = np.clip(sp_ls, 1e-3, 2.0)
+            sp_ls = np.clip(sp_ls, 1e-3, 0.1)
             tmp_ls = np.clip(tmp_ls, 0.5, 180.0)
             sp_var = np.clip(sp_var, 1e-6, 1e2)
 
@@ -439,7 +465,7 @@ class KalmanGPDriftModel:
                 sigma2=self.sigma2,
                 dt=self.dt,
             )
-            m.initialise(x_range, n_inducing=n_ind)
+            m.initialise(x_range, n_inducing=n_ind, data_x=x_prev_subset)
             m.update(x_prev_subset, r_hat_subset, t_seconds_subset)
             ll = m._log_lik
             if not np.isfinite(ll):
@@ -461,7 +487,7 @@ class KalmanGPDriftModel:
                 p0 = np.log([self.spatial_ls, self.temporal_ls, self.spatial_var])
             else:
                 p0 = np.log([
-                    rng_hp.uniform(0.01, 0.5),
+                    rng_hp.uniform(0.005, 0.1),
                     rng_hp.uniform(2.0, 60.0),
                     rng_hp.uniform(0.01, 10.0),
                 ])
@@ -471,7 +497,7 @@ class KalmanGPDriftModel:
                     _neg_log_lik, p0,
                     method='L-BFGS-B',
                     bounds=[
-                        (np.log(1e-3), np.log(2.0)),
+                        (np.log(1e-3), np.log(0.1)),
                         (np.log(0.5),  np.log(180.0)),
                         (np.log(1e-6), np.log(1e2)),
                     ],
@@ -493,7 +519,8 @@ class KalmanGPDriftModel:
         self.spatial_ls = float(np.exp(best_pars[0]))
         self.temporal_ls = float(np.exp(best_pars[1]))
         self.spatial_var = float(np.exp(best_pars[2]))
-        self.initialise(x_range, n_inducing=n_ind)
+        # Swap in new HPs while keeping the accumulated Kalman state.
+        self._recompute_hp_dependent()
 
         console.print(
             f'[green]HP optimised:[/green] '
@@ -529,29 +556,50 @@ def topology_from_gp(
     rng = rng or np.random.default_rng(42)
     x_grid = np.linspace(x_range[0], x_range[1], n_grid)
 
-    mu_mean, _ = model.predict(x_grid, full_cov=False)
+    mu_mean, mu_var = model.predict(x_grid, full_cov=False)
     f_samples = model.sample_drift(x_grid, n_samples=n_samples, rng=rng)
 
     sec_per_year = 365.25 * 24 * 3600
     if annualize:
         mu_mean = mu_mean * sec_per_year
         f_samples = f_samples * sec_per_year
+        mu_var = mu_var * (sec_per_year ** 2)
 
-    n_stable = np.empty(n_samples, dtype=int)
-    for j in range(n_samples):
-        cross_idx = np.where(np.diff(np.sign(f_samples[:, j])) < 0)[0]
-        if len(cross_idx) > 1 and min_crossing_sep > 0:
-            gaps = np.diff(cross_idx)
-            keep = np.concatenate([[True], gaps >= min_crossing_sep])
-            cross_idx = cross_idx[keep]
-        n_stable[j] = len(cross_idx)
-
-    p_multiwell = float(np.mean(n_stable >= 2))
-    mean_n_wells = float(np.mean(n_stable))
+    # Identifiability diagnostic: mean posterior std vs mean |drift|. A value
+    # ≳1 means p_multiwell is mostly tracking posterior uncertainty rather
+    # than mean-field structure.
+    mu_std_mean = float(np.mean(np.sqrt(np.maximum(mu_var, 0.0))))
+    mu_mag_mean = float(np.mean(np.abs(mu_mean)))
+    mu_std_to_mean = (
+        float(mu_std_mean / mu_mag_mean) if mu_mag_mean > 0 else float('inf')
+    )
 
     U_mean = -cumulative_trapezoid(mu_mean, x_grid, initial=0.0)
     U_mean -= U_mean.min()
     u_range = float(U_mean.max())
+
+    # Per-sample well count and barrier — both use the same greedy filter so
+    # p_multiwell and barrier_mean speak about the same topological features.
+    n_stable = np.empty(n_samples, dtype=int)
+    barrier_samples = np.empty(n_samples)
+    for j in range(n_samples):
+        U_j = -cumulative_trapezoid(f_samples[:, j], x_grid, initial=0.0)
+        U_j -= U_j.min()
+        u_range_j = float(U_j.max())
+        if u_range_j < 1e-9:
+            n_stable[j] = 0
+            barrier_samples[j] = 0.0
+            continue
+        kept_idx_j, bars_j = _greedy_well_filter(
+            x_grid, U_j,
+            threshold=min_barrier_fraction * u_range_j,
+            min_well_separation=0.0,
+        )
+        n_stable[j] = len(kept_idx_j)
+        barrier_samples[j] = max(bars_j) if bars_j else 0.0
+
+    p_multiwell = float(np.mean(n_stable >= 2))
+    mean_n_wells = float(np.mean(n_stable))
 
     if u_range < 1e-12:
         return {
@@ -560,6 +608,7 @@ def topology_from_gp(
             'barrier_mean': 0.0, 'barrier_std': 0.0,
             'kramers_mean': 0.0, 'kramers_std': 0.0,
             'well_locations': [], 'u_range': 0.0,
+            'mu_std_to_mean': round(mu_std_to_mean, 4),
         }
 
     kept_idx, _ = _greedy_well_filter(
@@ -569,25 +618,14 @@ def topology_from_gp(
     )
     well_locations = [float(x_grid[i]) for i in kept_idx]
 
-    barrier_samples = np.empty(n_samples)
-    for j in range(n_samples):
-        U_j = -cumulative_trapezoid(f_samples[:, j], x_grid, initial=0.0)
-        U_j -= U_j.min()
-        u_range_j = float(U_j.max())
-        if u_range_j < 1e-9:
-            barrier_samples[j] = 0.0
-            continue
-        _, bars_j = _greedy_well_filter(
-            x_grid, U_j,
-            threshold=min_barrier_fraction * u_range_j,
-            min_well_separation=0.0,
-        )
-        barrier_samples[j] = max(bars_j) if bars_j else 0.0
-
     barrier_mean = float(np.mean(barrier_samples))
     barrier_std = float(np.std(barrier_samples))
 
+    # D shares units with the barrier: annualise both or neither, so the
+    # Arrhenius exponent stays dimensionless.
     D = model.sigma2 / 2.0
+    if annualize:
+        D = D * sec_per_year
     if D > 0:
         kramers_samples = np.exp(-barrier_samples / D)
     else:
@@ -604,6 +642,7 @@ def topology_from_gp(
         'kramers_std':   round(kramers_std, 8),
         'well_locations': well_locations,
         'u_range':        round(u_range, 4),
+        'mu_std_to_mean': round(mu_std_to_mean, 4),
     }
 
 
@@ -830,6 +869,7 @@ def run_phase_gp(
     min_crossing_sep=10,
     min_barrier_fraction=0.1,
     output_dir='regime_results',
+    gp_output_dir=None,
     seed=42,
     console=None,
 ):
@@ -840,8 +880,16 @@ def run_phase_gp(
     run_phase_a; if no temporal lengthscale / EMA halflife is supplied they are
     drawn from Phase B (markov_chain) mean dwell times. Raw data is downloaded
     on demand via data_collection.ensure_data through Phase A.
+
+    output_dir    — where Phase A labels and Phase B chains live (read/written).
+    gp_output_dir — where Phase GP artefacts (topology / forecast / params /
+                    plots) are written. Defaults to output_dir for backwards
+                    compatibility.
     """
     os.makedirs(output_dir, exist_ok=True)
+    if gp_output_dir is None:
+        gp_output_dir = output_dir
+    os.makedirs(gp_output_dir, exist_ok=True)
     console = console or Console()
     rng = np.random.default_rng(seed)
     seconds_interval = int(seconds_interval)
@@ -864,7 +912,10 @@ def run_phase_gp(
         labels_csv, window_type, output_dir, console,
     )
     if temporal_lengthscale_days is None:
-        temporal_lengthscale_days = mean_dwell_days
+        # Half of Phase B mean dwell — Phase A regime transitions resolve on
+        # roughly half the dwell horizon, so a tighter temporal kernel tracks
+        # them better than the full-dwell value.
+        temporal_lengthscale_days = mean_dwell_days / 2.0
     if ema_halflife_days is None:
         ema_halflife_days = mean_dwell_days
     console.print(
@@ -888,16 +939,18 @@ def run_phase_gp(
 
     r = dx / dt
 
-    if sigma2 is None:
-        sigma2 = float(np.var(dx) / dt)
-    console.print(f'  sigma2          = {sigma2:.4e}')
-    console.print(f'  obs_noise       = {sigma2/dt:.4e}  (sigma2/dt)')
-
     # --- EMA drift demeaning (Phase B-derived halflife) ---
     r_hat, r_bar = ema_demean_drift(r, dt_t, halflife_days=ema_halflife_days)
     console.print(
         f'  drift mean before: {r.mean():.4e}  after: {r_hat.mean():.4e}'
     )
+
+    if sigma2 is None:
+        # Use the post-EMA residual (in dx-units: r_hat * dt) so the drift
+        # component is removed before estimating the diffusion variance.
+        sigma2 = float(np.var(r_hat * dt) / dt)
+    console.print(f'  sigma2          = {sigma2:.4e}')
+    console.print(f'  obs_noise       = {sigma2/dt:.4e}  (sigma2/dt)')
 
     t_seconds = (
         pd.to_datetime(dt_t).astype(np.int64) / 1e9
@@ -908,6 +961,15 @@ def run_phase_gp(
     x_range = (x_min, x_max)
     console.print(f'  x range         = [{x_min:.4f}, {x_max:.4f}]')
 
+    if spatial_lengthscale is None:
+        # Half of Phase A's 0.3 × std(x) heuristic — keeps the spatial GP
+        # tight enough to resolve features at the weekly excursion scale.
+        spatial_lengthscale = 0.15 * float(np.std(x_prev))
+        console.print(
+            f'  spatial_ls      = {spatial_lengthscale:.4f}  '
+            f'(0.15 × std(x_prev); derived from data)'
+        )
+
     model = KalmanGPDriftModel(
         spatial_lengthscale=spatial_lengthscale,
         temporal_lengthscale_days=temporal_lengthscale_days,
@@ -915,10 +977,10 @@ def run_phase_gp(
         sigma2=sigma2,
         dt=float(dt),
     )
-    model.initialise(x_range=x_range, n_inducing=n_inducing)
+    model.initialise(x_range=x_range, n_inducing=n_inducing, data_x=x_prev)
     console.print(
-        f'  Kalman state dim = {2 * n_inducing}  '
-        f'(2 x {n_inducing} inducing points)'
+        f'  Kalman state dim = {2 * model.M}  '
+        f'({model.M} inducing points; requested {n_inducing})'
     )
 
     # --- Phase A labels for downstream comparison ---
@@ -986,6 +1048,7 @@ def run_phase_gp(
                     hp_x, hp_r, hp_t,
                     n_restarts=hp_opt_n_restarts,
                     method=hp_opt_method,
+                    x_range=x_range,
                     console=console,
                 )
                 hp_done = True
@@ -1020,6 +1083,7 @@ def run_phase_gp(
                     'kramers':        topo['kramers_mean'],
                     'kramers_std':    topo['kramers_std'],
                     'u_range':        topo['u_range'],
+                    'mu_std_to_mean': topo['mu_std_to_mean'],
                     'window_start':   str(pd.Timestamp(row['window_start']).date()),
                 })
                 snapshots.append(
@@ -1052,29 +1116,41 @@ def run_phase_gp(
         f"{pd.Timestamp(end_date).strftime('%Y-%m-%d')}_{seconds_interval}s"
     )
 
-    topo_path = os.path.join(output_dir, f'{stem}_topology.csv')
+    topo_path = os.path.join(gp_output_dir, f'{stem}_topology.csv')
     df_topology.to_csv(topo_path, index=False)
     console.print(f'[green]Wrote[/green] {topo_path}')
 
-    fc_path = os.path.join(output_dir, f'{stem}_forecast.csv')
+    fc_path = os.path.join(gp_output_dir, f'{stem}_forecast.csv')
     df_forecast.to_csv(fc_path, index=False)
     console.print(f'[green]Wrote[/green] {fc_path}')
 
-    params_path = os.path.join(output_dir, f'{stem}_params.csv')
+    params_path = os.path.join(gp_output_dir, f'{stem}_params.csv')
     df_params.to_csv(params_path, index=False)
     console.print(f'[green]Wrote[/green] {params_path}')
 
     if not df_topology.empty:
         plots.plot_gp_topology_series(
             df_topology,
-            os.path.join(output_dir, f'{stem}_topology.png'),
+            os.path.join(gp_output_dir, f'{stem}_topology.png'),
         )
         plots.plot_gp_potential_snapshots(
             model, x_range,
             snapshots,
-            os.path.join(output_dir, f'{stem}_potential.png'),
+            os.path.join(gp_output_dir, f'{stem}_potential.png'),
             n_snapshots=6,
         )
+
+    if not df_topology.empty and 'mu_std_to_mean' in df_topology.columns:
+        finite_ratio = df_topology['mu_std_to_mean'].replace(
+            [np.inf, -np.inf], np.nan,
+        ).dropna()
+        if len(finite_ratio) > 0:
+            console.print(
+                f'[bold]Posterior σ(μ) / |μ| ratio[/bold]  '
+                f'mean={finite_ratio.mean():.2f}  '
+                f'median={finite_ratio.median():.2f}  '
+                f'(≳1 means p_multiwell is uncertainty-driven)'
+            )
 
     corr = check_topology_correlation(df_topology, console=console)
 
