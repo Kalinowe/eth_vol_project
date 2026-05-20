@@ -274,7 +274,7 @@ class KalmanGPDriftModel:
             P_post = IKH @ P_pred @ IKH.T + self.obs_noise * K @ K.T
             P_sym = (P_post + P_post.T) * 0.5
             asym = np.max(np.abs(P_post - P_sym))
-            if asym > 1e-10 * np.max(np.abs(P_post)):
+            if asym > 1e-8 * np.max(np.abs(P_post)):
                 warnings.warn(
                     f'KalmanGP: P asymmetry {asym:.3e} at observation {i}. Symmetrising.',
                     RuntimeWarning, stacklevel=2,
@@ -413,7 +413,11 @@ class KalmanGPDriftModel:
 
         self.spatial_ls  = float(np.clip(new_spatial_ls,  1e-3, 0.1))
         self.temporal_ls = float(np.clip(new_temporal_ls, 0.5,  180.0))
-        self.spatial_var = float(np.clip(new_spatial_var, 1e-6, 1e2))
+        # spatial_var lower clip relaxed to 1e-12: per-second drift is O(1e-8),
+        # so a meaningful prior on var(mu) lives near 1e-16 in per-second units.
+        # The old 1e-6 floor left HP opt with a ~10^10-too-wide prior, collapsing
+        # posterior mean toward 0 and inflating sigma/mu ratio.
+        self.spatial_var = float(np.clip(new_spatial_var, 1e-12, 1e2))
 
         # Refresh HP-dependent caches in-place; keep accumulated state_mean /
         # state_cov from the pre-HP-opt Kalman filter rather than resetting.
@@ -456,7 +460,7 @@ class KalmanGPDriftModel:
             sp_ls, tmp_ls, sp_var = np.exp(log_params)
             sp_ls = np.clip(sp_ls, 1e-3, 0.1)
             tmp_ls = np.clip(tmp_ls, 0.5, 180.0)
-            sp_var = np.clip(sp_var, 1e-6, 1e2)
+            sp_var = np.clip(sp_var, 1e-12, 1e2)
 
             m = KalmanGPDriftModel(
                 spatial_lengthscale=sp_ls,
@@ -497,9 +501,9 @@ class KalmanGPDriftModel:
                     _neg_log_lik, p0,
                     method='L-BFGS-B',
                     bounds=[
-                        (np.log(1e-3), np.log(0.1)),
-                        (np.log(0.5),  np.log(180.0)),
-                        (np.log(1e-6), np.log(1e2)),
+                        (np.log(1e-3),  np.log(0.1)),
+                        (np.log(0.5),   np.log(180.0)),
+                        (np.log(1e-12), np.log(1e2)),
                     ],
                     options={'maxiter': 100, 'ftol': 1e-6},
                 )
@@ -917,11 +921,16 @@ def run_phase_gp(
         # them better than the full-dwell value.
         temporal_lengthscale_days = mean_dwell_days / 2.0
     if ema_halflife_days is None:
-        ema_halflife_days = mean_dwell_days
+        ema_halflife_days = mean_dwell_days * 4.0
+    ema_str = (
+        f'{ema_halflife_days:.2f}d'
+        if ema_halflife_days and np.isfinite(ema_halflife_days)
+        else 'DISABLED'
+    )
     console.print(
         f'[cyan]Phase B mean dwell:[/cyan] {mean_dwell_days:.2f} days  '
         f'-> temporal_ls={temporal_lengthscale_days:.2f}d, '
-        f'ema_halflife={ema_halflife_days:.2f}d'
+        f'ema_halflife={ema_str}'
     )
 
     # --- Load full per-window series ---
@@ -1137,6 +1146,15 @@ def run_phase_gp(
             model, x_range,
             snapshots,
             os.path.join(gp_output_dir, f'{stem}_potential.png'),
+            n_snapshots=6,
+        )
+        plots.plot_km_vs_gp_overlay(
+            model, x_range,
+            snapshots,
+            labels_df=labels_df,
+            km_dir=os.path.join(output_dir, 'km'),
+            phase_a_seconds_interval=_phase_a_si,
+            out_path=os.path.join(gp_output_dir, f'{stem}_km_vs_gp.png'),
             n_snapshots=6,
         )
 

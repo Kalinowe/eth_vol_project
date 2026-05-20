@@ -260,5 +260,102 @@ def plot_gp_potential_snapshots(model, x_range, snapshots, out_path,
     print(f'Saved {out_path}')
 
 
+def plot_km_vs_gp_overlay(model, x_range, snapshots, labels_df, km_dir,
+                          phase_a_seconds_interval, out_path,
+                          n_snapshots=6, n_grid=200):
+    """
+    Per-snapshot overlay of Phase A KM drift (scatter, annualised) on top of
+    the GP posterior drift (mean ± 2σ, annualised) at the snapshot state.
+
+    Diagnostic for the KM-vs-GP shape disagreement: if the GP mean tracks the
+    KM scatter, the two estimators agree and any remaining mismatch is
+    posterior uncertainty. If GP is flat while KM is multi-well, the GP isn't
+    seeing the spatial signal (typically because preprocessing has removed it).
+    """
+    if not snapshots:
+        print(f'[plot_km_vs_gp_overlay] no snapshots; skipping {out_path}')
+        return
+
+    sec_per_year = 365.25 * 24 * 3600
+    n = min(n_snapshots, len(snapshots))
+    idx = np.linspace(0, len(snapshots) - 1, n, dtype=int)
+
+    rows = max(1, n // 3) if n > 2 else 1
+    cols = max(1, int(np.ceil(n / rows)))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 3.2 * rows),
+                             squeeze=False)
+    axes = axes.flatten()
+
+    x_grid = np.linspace(x_range[0], x_range[1], n_grid)
+    saved_mean = model.state_mean.copy()
+    saved_cov = model.state_cov.copy()
+
+    df_lbl = labels_df.copy()
+    df_lbl['window_start'] = pd.to_datetime(df_lbl['window_start'])
+    df_lbl['window_end']   = pd.to_datetime(df_lbl['window_end'])
+
+    for k, ax in enumerate(axes):
+        if k >= n:
+            ax.axis('off')
+            continue
+        dt_q, sm, sc = snapshots[idx[k]]
+        model.state_mean = sm
+        model.state_cov  = sc
+
+        mu_mean, mu_var = model.predict(x_grid, full_cov=False)
+        mu_mean = mu_mean * sec_per_year
+        mu_std  = np.sqrt(np.maximum(mu_var, 0.0)) * sec_per_year
+
+        dt_q_pd = pd.Timestamp(dt_q)
+        mask = (df_lbl['window_start'] <= dt_q_pd) & (
+            df_lbl['window_end'] + pd.Timedelta(days=1) > dt_q_pd
+        )
+        match = df_lbl[mask]
+
+        km_df = None
+        if not match.empty:
+            row = match.iloc[0]
+            ws = row['window_start'].strftime('%Y-%m-%d')
+            we = row['window_end'].strftime('%Y-%m-%d')
+            km_path = os.path.join(
+                km_dir, f'km_{ws}_to_{we}_{phase_a_seconds_interval}s.csv',
+            )
+            if os.path.exists(km_path):
+                km_df = pd.read_csv(km_path).dropna(subset=['drift'])
+
+        ax.axhline(0.0, color='grey', linewidth=0.5)
+        ax.fill_between(x_grid, mu_mean - 2 * mu_std, mu_mean + 2 * mu_std,
+                        color='steelblue', alpha=0.2, linewidth=0,
+                        label='GP ±2σ')
+        ax.plot(x_grid, mu_mean, color='steelblue', linewidth=1.2,
+                label='GP mean')
+
+        if km_df is not None and not km_df.empty:
+            km_drift = km_df['drift'].values * sec_per_year
+            w = km_df['weight'].values.astype(float)
+            w_norm = w / w.max() if w.max() > 0 else w
+            sizes = 5 + 25 * w_norm
+            ax.scatter(km_df['bin_center'].values, km_drift,
+                       s=sizes, color='crimson', alpha=0.55,
+                       edgecolors='none', label='Phase A KM')
+
+        ax.set_title(str(dt_q_pd.date()), fontsize=8)
+        ax.set_xlabel('log-price', fontsize=7)
+        ax.set_ylabel('drift (ann.)', fontsize=7)
+        ax.tick_params(labelsize=6)
+        if k == 0:
+            ax.legend(fontsize=6, loc='best')
+
+    model.state_mean = saved_mean
+    model.state_cov  = saved_cov
+
+    fig.suptitle('Phase A KM drift vs Phase GP posterior drift (annualised)',
+                 fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f'Saved {out_path}')
+
+
 if __name__ == '__main__':
     print('This module exposes plotting helpers; import its functions from the pipeline scripts.')

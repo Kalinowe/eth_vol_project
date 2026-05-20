@@ -67,24 +67,35 @@ def ensure_data(start_date, end_date):
 
 def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_width=0):
     """
-    Read a CSV file and aggregate log returns over X second intervals starting from midnight.
+    Aggregate log returns over x_seconds intervals for one day's Binance aggTrades CSV.
+
+    Each bar boundary t_k = midnight + k * x_seconds gets a backward moving average
+    price: BMA(t_k) = mean of all raw trades in [t_k - 2*kernel_half_width, t_k].
+    Log-return for bar k = log(BMA(t_{k+1})) - log(BMA(t_k)).
+
+    Avoids materialising a per-second timeseries: uses searchsorted + cumsum so
+    only the bar-boundary points are evaluated regardless of interval length.
 
     Args:
-        csv_path: Path to the CSV file
-        x_seconds: Interval length in seconds
-        prev_log_last: Previous interval log price carried from an earlier day
-        kernel_half_width: Number of seconds to each side for the rolling mean kernel
+        csv_path:           Path to a daily Binance aggTrades CSV.
+        x_seconds:          Bar length in seconds.
+        prev_log_last:      log(BMA) carried from the previous day; used to seed
+                            the midnight boundary when no trades fall in its window.
+        kernel_half_width:  Backward smoothing half-width in seconds. BMA window
+                            spans [t - 2*kernel_half_width, t]. 0 = single second.
 
     Returns:
-        Tuple[DataFrame, float|None]: DataFrame with 'datetime', 'log_return',
-            'log_first_price', 'log_last_price' and the last log price from the file.
+        (DataFrame, float|None): columns datetime/log_return/log_first_price/
+            log_last_price, and log(BMA) at the last boundary of the day.
     """
-    # Extract date from filename
     filename = os.path.basename(csv_path)
     date_parts = filename.split('-')
     date_str = f"{date_parts[-3]}-{date_parts[-2]}-{date_parts[-1].split('.')[0]}"
     dt = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
     midnight = int(dt.timestamp())
+
+    day_seconds = 24 * 3600
+    num_intervals = int(day_seconds // x_seconds)
 
     df = pd.read_csv(csv_path, header=None, usecols=[1, 5])
     df = df.rename(columns={1: 'price', 5: 'timestamp_us'})
@@ -93,80 +104,71 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_w
     df = df.dropna(subset=['price', 'timestamp_us'])
 
     if df.empty:
-        day_seconds = 24 * 3600
-        num_intervals = int(day_seconds // x_seconds)
-        intervals = np.arange(midnight, midnight + day_seconds, x_seconds, dtype=np.int64)
-        result_df = pd.DataFrame({
-            'datetime': pd.to_datetime(intervals, unit='s'),
-            'log_return': np.nan,
+        bar_starts = np.arange(midnight, midnight + day_seconds, x_seconds, dtype=np.int64)
+        return pd.DataFrame({
+            'datetime':        pd.to_datetime(bar_starts, unit='s'),
+            'log_return':      np.nan,
             'log_first_price': np.nan,
-            'log_last_price': np.nan
-        })
-        return result_df, prev_log_last
+            'log_last_price':  np.nan,
+        }), prev_log_last
 
     df['timestamp_us'] = df['timestamp_us'].astype(np.int64)
     # Binance uses μs in recent data (~1.7e15) and ms in older data (~1.7e12).
-    # Divide accordingly so timestamp_s is always Unix seconds.
     sample_ts = int(df['timestamp_us'].iloc[0])
     if sample_ts > 1e15:
-        df['timestamp_s'] = df['timestamp_us'] // 1_000_000  # microseconds
+        df['timestamp_s'] = df['timestamp_us'] // 1_000_000
     else:
-        df['timestamp_s'] = df['timestamp_us'] // 1_000      # milliseconds
+        df['timestamp_s'] = df['timestamp_us'] // 1_000
     df = df.sort_values('timestamp_s')
 
-    day_seconds = 24 * 3600
-    full_day_range = np.arange(midnight, midnight + day_seconds, dtype=np.int64)
-    
-    # Group by second and average
-    per_second_raw = df.groupby('timestamp_s')['price'].mean()
-    
-    # Reindex to include every second of the day and fill NaNs
-    per_second = per_second_raw.reindex(full_day_range)
-    
-    # Initial fill: if the very first second is NaN, use the previous day's last price
-    if pd.isna(per_second.iloc[0]) and prev_log_last is not None:
-        per_second.iloc[0] = np.exp(prev_log_last)
-        
-    per_second = per_second.ffill().bfill() # bfill handles cases with no prev_log_last
+    ts_arr  = df['timestamp_s'].values.astype(np.int64)
+    px_arr  = df['price'].values.astype(np.float64)
 
-    # Apply kernel rolling mean (Uniform Kernel / SMA)
-    if kernel_half_width > 0:
-        window_size = 2 * kernel_half_width + 1
-        per_second = per_second.rolling(window=window_size, center=False, min_periods=1).mean()
+    # Bar boundaries: t_k = midnight + k * x_seconds, k = 0 .. num_intervals
+    boundaries = (midnight + np.arange(num_intervals + 1, dtype=np.int64) * x_seconds)
+    window_secs = int(kernel_half_width)  # backward window width in seconds
 
-    prices_array = per_second.values
-    
-    num_intervals = int(day_seconds // x_seconds)
-    intervals = []
-    log_returns = []
-    log_first_prices = []
-    log_last_prices = []
+    # Vectorised BMA computation via cumsum + searchsorted.
+    # cum_sum[i] = sum(px_arr[:i]) so sum(px_arr[a:b]) = cum_sum[b] - cum_sum[a].
+    cum_sum = np.empty(len(px_arr) + 1, dtype=np.float64)
+    cum_sum[0] = 0.0
+    np.cumsum(px_arr, out=cum_sum[1:])
 
-    for i in range(num_intervals):
-        start_idx = i * x_seconds
-        end_idx = min((i + 1) * x_seconds, day_seconds - 1)
+    idx_lo = np.searchsorted(ts_arr, boundaries - window_secs, side='left')
+    idx_hi = np.searchsorted(ts_arr, boundaries,               side='right')
+    count  = idx_hi - idx_lo
+    valid  = count > 0
+    bma    = np.full(len(boundaries), np.nan)
+    bma[valid] = (cum_sum[idx_hi[valid]] - cum_sum[idx_lo[valid]]) / count[valid]
 
-        first_price = prices_array[start_idx]
-        last_price = prices_array[end_idx]
+    # Seed the midnight boundary with the previous day's BMA when no trades fall
+    # in its kernel window (window spans across midnight into the prior day's data).
+    if np.isnan(bma[0]) and prev_log_last is not None:
+        bma[0] = np.exp(prev_log_last)
 
-        log_first = np.log(first_price)
-        log_last = np.log(last_price)
-        log_ret = log_last - log_first
-        prev_log_last = log_last
+    # Forward-fill price gaps (market halts, low-liquidity seconds), then
+    # backward-fill the leading edge if midnight was empty and prev_log_last absent.
+    bma = pd.Series(bma).ffill().bfill().values
 
-        intervals.append(midnight + start_idx)
-        log_returns.append(log_ret)
-        log_first_prices.append(log_first)
-        log_last_prices.append(log_last)
+    if np.any(~np.isfinite(bma)) or np.all(bma <= 0):
+        bar_starts = boundaries[:-1]
+        return pd.DataFrame({
+            'datetime':        pd.to_datetime(bar_starts, unit='s'),
+            'log_return':      np.nan,
+            'log_first_price': np.nan,
+            'log_last_price':  np.nan,
+        }), prev_log_last
 
-    result_df = pd.DataFrame({
-        'datetime': pd.to_datetime(intervals, unit='s'),
-        'log_return': log_returns,
-        'log_first_price': log_first_prices,
-        'log_last_price': log_last_prices
-    })
+    log_bma = np.log(bma)
+    log_first = log_bma[:-1]
+    log_last  = log_bma[1:]
 
-    return result_df, prev_log_last
+    return pd.DataFrame({
+        'datetime':        pd.to_datetime(boundaries[:-1], unit='s'),
+        'log_return':      log_last - log_first,
+        'log_first_price': log_first,
+        'log_last_price':  log_last,
+    }), float(log_bma[-1])
 
 
 def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='data', kernel_half_width=0, trim_quantile=0.0):
@@ -390,11 +392,18 @@ def ema_demean_drift(r, dt_t, halflife_days=14.0):
     Causal EMA demeaning of the scaled increment r = dx/dt. Halflife is
     interpreted in wall-clock time (essential at 30-second sampling).
 
+    Pass halflife_days = 0 (or None, or non-finite) to disable demeaning —
+    used by Phase GP when the spatial signal is fragile against an EMA
+    whose halflife is comparable to the regime dwell time.
+
     Returns
     -------
     r_hat : (N,) demeaned increment (r - EMA(r))
     r_bar : (N,) the EMA trend that was removed
     """
+    r = np.asarray(r, dtype=float)
+    if halflife_days is None or not np.isfinite(halflife_days) or halflife_days <= 0:
+        return r.copy(), np.zeros_like(r)
     halflife_str = f'{halflife_days * 24 * 3600:.0f}s'
     r_series = pd.Series(r, index=pd.to_datetime(dt_t))
     r_bar_series = r_series.ewm(

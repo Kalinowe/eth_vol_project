@@ -1,21 +1,21 @@
 # Core scientific stack
-numpy==1.26.4               # tensorflow 2.x requires numpy <2
-pandas==3.0.3
-scipy==1.17.1
-scikit-learn==1.8.0
-matplotlib==3.10.9
+numpy>=1.24,<2              # tensorflow 2.x requires numpy <2
+pandas>=1.5
+scipy>=1.10
+scikit-learn>=1.2
+matplotlib>=3.6
 
 # Kramers-Moyal drift estimation
-kramersmoyal==0.4.1
+kramersmoyal>=0.4
 
 # GP / Kalman model
 gpflow==2.10.0
-tensorflow==2.21.0
-tensorflow-probability==0.25.0
-tf_keras==2.21.0
+tensorflow>=2.16,<2.22
+tensorflow-probability>=0.24
+tf_keras>=2.16
 
 # CLI output
-rich==15.0.0
+rich>=13.0
 
 # gpflow uses pkg_resources, which was dropped in setuptools>=72
 setuptools<72

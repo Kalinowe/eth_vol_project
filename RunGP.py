@@ -65,7 +65,9 @@ temporal_lengthscale_days = None
 
 # --- Phase GP — EMA drift demeaning ------------------------------------------
 # None -> derived from Phase B mean dwell time (same value as temporal_lengthscale_days)
-ema_halflife_days = None
+# 0    -> EMA disabled; r_hat = r. Use this when the dwell-scale EMA would
+#         smear the spatial drift structure the GP is supposed to detect.
+ema_halflife_days = 0.0
 
 # --- Phase GP — observation noise --------------------------------------------
 # None -> estimated as var(dx) / dt from the data
