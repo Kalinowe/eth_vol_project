@@ -7,11 +7,15 @@ is continuously updated as new observations arrive. The GP factors as a
 spatial RBF kernel over log-price times an exact Matern 3/2 state-space
 representation in time, giving O(N) inference and a constant-size state.
 
-    r_t      = dx_t / dt                                 scaled increment
+    r_t      = (dx_t / dt) * sec_per_year                annualised drift [/year]
     r_hat_t  = r_t - EMA(r_t, halflife=tau_ema)          causal EMA demean
     r_hat_t ~ mu(x_{t-1}, t) + eps_t
     eps_t   ~ N(0, sigma2 / dt)                          Euler-Maruyama noise
     mu(x,t) ~ GP(0, k_rbf(x, x') * k_matern32(t, t'))
+
+All Kalman state, sigma2, and topology outputs are in annualised units
+(/year for drift, /year² for variance). spatial_var=1.0 is calibrated to
+this convention.
 
 Outputs (under output_dir):
     phase_gp_<stem>_topology.csv     p_multiwell(t), barrier(t), kramers(t)
@@ -41,6 +45,9 @@ from regime_estimation import (
 )
 from markov_chain import run_markov_chain
 import plots
+
+
+_SEC_PER_YEAR = 365.25 * 24 * 3600
 
 
 # ---------------------------------------------------------------------------
@@ -615,21 +622,18 @@ def topology_from_gp(
     n_samples=200,
     min_crossing_sep=10,
     min_barrier_fraction=0.1,
-    annualize=True,
     rng=None,
 ):
-    """Topology statistics from the current GP posterior — p_multiwell, barrier, Kramers."""
+    """Topology statistics from the current GP posterior — p_multiwell, barrier, Kramers.
+
+    Assumes the GP state is already in annualised units (mu in /year, mu_var in
+    /year²); see run_phase_gp where r is multiplied by _SEC_PER_YEAR.
+    """
     rng = rng or np.random.default_rng(42)
     x_grid = np.linspace(x_range[0], x_range[1], n_grid)
 
     mu_mean, mu_var = model.predict(x_grid, full_cov=False)
     f_samples = model.sample_drift(x_grid, n_samples=n_samples, rng=rng)
-
-    sec_per_year = 365.25 * 24 * 3600
-    if annualize:
-        mu_mean = mu_mean * sec_per_year
-        f_samples = f_samples * sec_per_year
-        mu_var = mu_var * (sec_per_year ** 2)
 
     # Identifiability diagnostic: mean posterior std vs mean |drift|. A value
     # ≳1 means p_multiwell is mostly tracking posterior uncertainty rather
@@ -687,11 +691,11 @@ def topology_from_gp(
     barrier_mean = float(np.mean(barrier_samples))
     barrier_std = float(np.std(barrier_samples))
 
-    # D shares units with the barrier: annualise both or neither, so the
-    # Arrhenius exponent stays dimensionless.
-    D = model.sigma2 / 2.0
-    if annualize:
-        D = D * sec_per_year
+    # Kramers exponent barrier/D must be dimensionless.
+    # sigma2 is stored as var(r_hat_ann) * dt_sec with units [/year]² · sec, so
+    # D_year = sigma2 / (2 · sec_per_year) brings D into [/year], matching the
+    # barrier units (U = -∫mu dx with mu in /year).
+    D = model.sigma2 / (2.0 * _SEC_PER_YEAR)
     if D > 0:
         kramers_samples = np.exp(-barrier_samples / D)
     else:
@@ -724,7 +728,6 @@ def forecast_topology(
     n_samples=200,
     min_crossing_sep=10,
     min_barrier_fraction=0.1,
-    annualize=True,
     rng=None,
 ):
     """Forecast topology at each horizon by propagating the Kalman state forward."""
@@ -765,7 +768,6 @@ def forecast_topology(
             n_grid=n_grid, n_samples=n_samples,
             min_crossing_sep=min_crossing_sep,
             min_barrier_fraction=min_barrier_fraction,
-            annualize=annualize,
             rng=rng,
         )
 
@@ -1008,7 +1010,6 @@ def run_phase_gp(
     )
     console.print(f'  {len(dx)} increments loaded.')
 
-    _SEC_PER_YEAR = 365.25 * 24 * 3600
     # Annualise so observations are O(1) and spatial_var=1.0 is calibrated.
     # All downstream Kalman updates, sigma2, and topology work in [/year].
     r = (dx / dt) * _SEC_PER_YEAR
@@ -1155,7 +1156,6 @@ def run_phase_gp(
                     n_grid=n_grid, n_samples=n_samples,
                     min_crossing_sep=min_crossing_sep,
                     min_barrier_fraction=min_barrier_fraction,
-                    annualize=False,  # GP state already in [/year]
                     rng=rng,
                 )
                 topology_rows.append({
@@ -1186,7 +1186,6 @@ def run_phase_gp(
                 n_grid=n_grid, n_samples=n_samples,
                 min_crossing_sep=min_crossing_sep,
                 min_barrier_fraction=min_barrier_fraction,
-                annualize=False,  # GP state already in [/year]
                 rng=rng,
             )
             df_fc['window_end'] = str(pd.Timestamp(row['window_end']).date())

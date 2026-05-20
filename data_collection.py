@@ -70,7 +70,7 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_w
     Aggregate log returns over x_seconds intervals for one day's Binance aggTrades CSV.
 
     Each bar boundary t_k = midnight + k * x_seconds gets a backward moving average
-    price: BMA(t_k) = mean of all raw trades in [t_k - 2*kernel_half_width, t_k].
+    price: BMA(t_k) = mean of all raw trades in [t_k - kernel_half_width, t_k].
     Log-return for bar k = log(BMA(t_{k+1})) - log(BMA(t_k)).
 
     Avoids materialising a per-second timeseries: uses searchsorted + cumsum so
@@ -81,8 +81,8 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_w
         x_seconds:          Bar length in seconds.
         prev_log_last:      log(BMA) carried from the previous day; used to seed
                             the midnight boundary when no trades fall in its window.
-        kernel_half_width:  Backward smoothing half-width in seconds. BMA window
-                            spans [t - 2*kernel_half_width, t]. 0 = single second.
+        kernel_half_width:  Backward smoothing window in seconds. BMA window
+                            spans [t - kernel_half_width, t]. 0 = single trade lookup.
 
     Returns:
         (DataFrame, float|None): columns datetime/log_return/log_first_price/
@@ -127,10 +127,6 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_w
     # Bar boundaries: t_k = midnight + k * x_seconds, k = 0 .. num_intervals
     boundaries = (midnight + np.arange(num_intervals + 1, dtype=np.int64) * x_seconds)
     window_secs = int(kernel_half_width)  # backward window width in seconds
-    # Apply kernel rolling mean (Uniform Kernel / SMA)
-    if kernel_half_width > 0:
-        window_size = kernel_half_width + 1
-        per_second = per_second.rolling(window=window_size, center=False, min_periods=1).mean()
 
     # Vectorised BMA computation via cumsum + searchsorted.
     # cum_sum[i] = sum(px_arr[:i]) so sum(px_arr[a:b]) = cum_sum[b] - cum_sum[a].
