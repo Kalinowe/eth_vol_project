@@ -202,6 +202,72 @@ class KalmanGPDriftModel:
         self._log_lik = 0.0
         self._n_obs = 0
 
+    def reproject_to_range(self, x_lo, x_hi, n_inducing=None):
+        """
+        Move all inducing points into [x_lo, x_hi] while preserving the
+        accumulated Kalman posterior via GP interpolation.
+
+        After this call the filter is ready to process a new window whose
+        observations lie in [x_lo, x_hi].  All n_inducing points are now
+        concentrated in the live price region, giving full spatial resolution
+        for topology detection regardless of how wide the full historical
+        x-range is.
+
+        When the new range has low overlap with the old one (price has drifted
+        far in x) K_{new,old} ≈ 0 and the state reverts toward the GP prior —
+        the honest "no prior information here" behaviour.
+        """
+        if n_inducing is None:
+            n_inducing = self.M
+
+        Z_old        = self.inducing_x.copy()
+        M_old        = self.M
+        K_zz_old_inv = self._K_zz_inv.copy()
+
+        idx_f  = np.arange(0, 2 * M_old, 2)
+        idx_fp = np.arange(1, 2 * M_old, 2)
+        f_mean  = self.state_mean[idx_f]
+        fp_mean = self.state_mean[idx_fp]
+        P_ff   = self.state_cov[np.ix_(idx_f,  idx_f )]
+        P_fpfp = self.state_cov[np.ix_(idx_fp, idx_fp)]
+        P_ffp  = self.state_cov[np.ix_(idx_f,  idx_fp)]
+
+        # New inducing layout and HP-dependent caches
+        self.inducing_x = np.linspace(x_lo, x_hi, n_inducing)
+        self.M          = n_inducing
+        self._recompute_hp_dependent()
+        self._I_2M = np.eye(2 * self.M)
+
+        # GP interpolation weights: W = K(Z_new, Z_old) @ K(Z_old)^{-1}
+        K_new_old = rbf_kernel(self.inducing_x, Z_old,
+                               self.spatial_ls, self.spatial_var)
+        W = K_new_old @ K_zz_old_inv       # (M_new, M_old)
+
+        # Residual prior covariance not explained by the old inducing points
+        prior_resid = self._K_zz_jit - K_new_old @ K_zz_old_inv @ K_new_old.T
+        lam_sq = self._P_inf_1d[1, 1] / self._P_inf_1d[0, 0]
+
+        # Projected state mean
+        idx_f_new  = np.arange(0, 2 * self.M, 2)
+        idx_fp_new = np.arange(1, 2 * self.M, 2)
+        new_mean = np.zeros(2 * self.M)
+        new_mean[idx_f_new]  = W @ f_mean
+        new_mean[idx_fp_new] = W @ fp_mean
+
+        # Projected state covariance
+        P_ff_new   = prior_resid             + W @ P_ff   @ W.T
+        P_fpfp_new = lam_sq * prior_resid    + W @ P_fpfp @ W.T
+        P_ffp_new  =                           W @ P_ffp  @ W.T
+
+        new_cov = np.zeros((2 * self.M, 2 * self.M))
+        new_cov[np.ix_(idx_f_new,  idx_f_new )] = P_ff_new
+        new_cov[np.ix_(idx_fp_new, idx_fp_new)] = P_fpfp_new
+        new_cov[np.ix_(idx_f_new,  idx_fp_new)] = P_ffp_new
+        new_cov[np.ix_(idx_fp_new, idx_f_new )] = P_ffp_new.T
+
+        self.state_mean = new_mean
+        self.state_cov  = (new_cov + new_cov.T) * 0.5
+
     def _obs_matrix(self, x_obs):
         k_vec = rbf_kernel(
             np.array([x_obs]),
@@ -1037,6 +1103,16 @@ def run_phase_gp(
             t_w = t_seconds[obs_mask]
             dt_w = dt_t[obs_mask]
 
+            # Reproject all inducing points into this window's observed x-range.
+            # A 10 % margin on each side ensures the boundary inducing points are
+            # not at the extreme edge of the data; the floor guards flat markets.
+            range_w = max(float(x_w.max() - x_w.min()), 1e-4)
+            margin  = 0.1 * range_w
+            x_w_lo  = float(x_w.min()) - margin
+            x_w_hi  = float(x_w.max()) + margin
+            topo_x_range = (x_w_lo, x_w_hi)
+            model.reproject_to_range(x_w_lo, x_w_hi, n_inducing=n_inducing)
+
             hp_x_accum.append(x_w)
             hp_r_accum.append(r_hat_w)
             hp_t_accum.append(t_w)
@@ -1057,7 +1133,7 @@ def run_phase_gp(
                     hp_x, hp_r, hp_t,
                     n_restarts=hp_opt_n_restarts,
                     method=hp_opt_method,
-                    x_range=x_range,
+                    x_range=topo_x_range,
                     console=console,
                 )
                 hp_done = True
@@ -1076,7 +1152,7 @@ def run_phase_gp(
             for local_i in eval_idx:
                 dt_query = pd.Timestamp(dt_w[local_i])
                 topo = topology_from_gp(
-                    model, x_range,
+                    model, topo_x_range,
                     n_grid=n_grid, n_samples=n_samples,
                     min_crossing_sep=min_crossing_sep,
                     min_barrier_fraction=min_barrier_fraction,
@@ -1095,14 +1171,18 @@ def run_phase_gp(
                     'mu_std_to_mean': topo['mu_std_to_mean'],
                     'window_start':   str(pd.Timestamp(row['window_start']).date()),
                 })
-                snapshots.append(
-                    (dt_query, model.state_mean.copy(), model.state_cov.copy())
-                )
+                # Store topo_x_range in snapshot so plots use the right grid
+                snapshots.append((
+                    dt_query,
+                    model.state_mean.copy(),
+                    model.state_cov.copy(),
+                    topo_x_range,
+                ))
 
             df_fc = forecast_topology(
                 model,
                 forecast_horizons_days=list(forecast_horizons_days),
-                x_range=x_range,
+                x_range=topo_x_range,
                 n_grid=n_grid, n_samples=n_samples,
                 min_crossing_sep=min_crossing_sep,
                 min_barrier_fraction=min_barrier_fraction,

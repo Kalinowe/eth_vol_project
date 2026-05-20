@@ -213,7 +213,6 @@ def plot_gp_potential_snapshots(model, x_range, snapshots, out_path,
                              squeeze=False)
     axes = axes.flatten()
 
-    x_grid = np.linspace(x_range[0], x_range[1], 200)
     saved_mean = model.state_mean.copy()
     saved_cov = model.state_cov.copy()
 
@@ -221,7 +220,11 @@ def plot_gp_potential_snapshots(model, x_range, snapshots, out_path,
         if k >= n_snapshots:
             ax.axis('off')
             continue
-        dt_q, sm, sc = snapshots[idx[k]]
+        snap = snapshots[idx[k]]
+        dt_q, sm, sc = snap[0], snap[1], snap[2]
+        snap_x_range = snap[3] if len(snap) > 3 else x_range
+        x_grid = np.linspace(snap_x_range[0], snap_x_range[1], 200)
+
         model.state_mean = sm
         model.state_cov = sc
 
@@ -286,7 +289,6 @@ def plot_km_vs_gp_overlay(model, x_range, snapshots, labels_df, km_dir,
                              squeeze=False)
     axes = axes.flatten()
 
-    x_grid = np.linspace(x_range[0], x_range[1], n_grid)
     saved_mean = model.state_mean.copy()
     saved_cov = model.state_cov.copy()
 
@@ -298,7 +300,11 @@ def plot_km_vs_gp_overlay(model, x_range, snapshots, labels_df, km_dir,
         if k >= n:
             ax.axis('off')
             continue
-        dt_q, sm, sc = snapshots[idx[k]]
+        snap = snapshots[idx[k]]
+        dt_q, sm, sc = snap[0], snap[1], snap[2]
+        snap_x_range = snap[3] if len(snap) > 3 else x_range
+        x_grid = np.linspace(snap_x_range[0], snap_x_range[1], n_grid)
+
         model.state_mean = sm
         model.state_cov  = sc
 
