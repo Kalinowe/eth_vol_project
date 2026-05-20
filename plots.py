@@ -309,8 +309,8 @@ def plot_km_vs_gp_overlay(model, x_range, snapshots, labels_df, km_dir,
         model.state_cov  = sc
 
         mu_mean, mu_var = model.predict(x_grid, full_cov=False)
-        mu_mean = mu_mean * sec_per_year
-        mu_std  = np.sqrt(np.maximum(mu_var, 0.0)) * sec_per_year
+        # GP state is already stored in [/year]; no further scaling needed.
+        mu_std  = np.sqrt(np.maximum(mu_var, 0.0))
 
         dt_q_pd = pd.Timestamp(dt_q)
         mask = (df_lbl['window_start'] <= dt_q_pd) & (

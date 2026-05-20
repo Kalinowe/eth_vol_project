@@ -75,7 +75,7 @@ ema_halflife_days = 0.0
 sigma2 = None
 
 # --- Phase GP — Kalman state --------------------------------------------------
-n_inducing = 8      # number of inducing points; Kalman state dim = 2 * n_inducing
+n_inducing = 20     # number of inducing points; Kalman state dim = 2 * n_inducing
 
 # --- Phase GP — HP optimisation ----------------------------------------------
 hp_opt_after_n_windows = 2        # optimise HPs after this many Phase-A windows

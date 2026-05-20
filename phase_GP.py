@@ -479,10 +479,6 @@ class KalmanGPDriftModel:
 
         self.spatial_ls  = float(np.clip(new_spatial_ls,  1e-3, 0.1))
         self.temporal_ls = float(np.clip(new_temporal_ls, 0.5,  180.0))
-        # spatial_var lower clip relaxed to 1e-12: per-second drift is O(1e-8),
-        # so a meaningful prior on var(mu) lives near 1e-16 in per-second units.
-        # The old 1e-6 floor left HP opt with a ~10^10-too-wide prior, collapsing
-        # posterior mean toward 0 and inflating sigma/mu ratio.
         self.spatial_var = float(np.clip(new_spatial_var, 1e-12, 1e2))
 
         # Refresh HP-dependent caches in-place; keep accumulated state_mean /
@@ -1012,20 +1008,23 @@ def run_phase_gp(
     )
     console.print(f'  {len(dx)} increments loaded.')
 
-    r = dx / dt
+    _SEC_PER_YEAR = 365.25 * 24 * 3600
+    # Annualise so observations are O(1) and spatial_var=1.0 is calibrated.
+    # All downstream Kalman updates, sigma2, and topology work in [/year].
+    r = (dx / dt) * _SEC_PER_YEAR
 
     # --- EMA drift demeaning (Phase B-derived halflife) ---
     r_hat, r_bar = ema_demean_drift(r, dt_t, halflife_days=ema_halflife_days)
     console.print(
-        f'  drift mean before: {r.mean():.4e}  after: {r_hat.mean():.4e}'
+        f'  drift mean before: {r.mean():.4e}  after: {r_hat.mean():.4e}  [/year]'
     )
 
     if sigma2 is None:
-        # Use the post-EMA residual (in dx-units: r_hat * dt) so the drift
-        # component is removed before estimating the diffusion variance.
+        # Euler-Maruyama in annualised units: r_hat ~ N(0, sigma2/dt).
+        # sigma2 = var(r_hat) * dt  (units: [/year]^2 * sec)
         sigma2 = float(np.var(r_hat * dt) / dt)
-    console.print(f'  sigma2          = {sigma2:.4e}')
-    console.print(f'  obs_noise       = {sigma2/dt:.4e}  (sigma2/dt)')
+    console.print(f'  sigma2          = {sigma2:.4e}  [/year^2 * sec]')
+    console.print(f'  obs_noise       = {sigma2/dt:.4e}  (sigma2/dt) [/year^2]')
 
     t_seconds = (
         pd.to_datetime(dt_t).astype(np.int64) / 1e9
@@ -1104,8 +1103,8 @@ def run_phase_gp(
             dt_w = dt_t[obs_mask]
 
             # Reproject all inducing points into this window's observed x-range.
-            # A 10 % margin on each side ensures the boundary inducing points are
-            # not at the extreme edge of the data; the floor guards flat markets.
+            # A 10 % margin on each side ensures boundary inducing points are not
+            # at the extreme edge of the data; the floor guards flat markets.
             range_w = max(float(x_w.max() - x_w.min()), 1e-4)
             margin  = 0.1 * range_w
             x_w_lo  = float(x_w.min()) - margin
@@ -1156,6 +1155,7 @@ def run_phase_gp(
                     n_grid=n_grid, n_samples=n_samples,
                     min_crossing_sep=min_crossing_sep,
                     min_barrier_fraction=min_barrier_fraction,
+                    annualize=False,  # GP state already in [/year]
                     rng=rng,
                 )
                 topology_rows.append({
@@ -1186,6 +1186,7 @@ def run_phase_gp(
                 n_grid=n_grid, n_samples=n_samples,
                 min_crossing_sep=min_crossing_sep,
                 min_barrier_fraction=min_barrier_fraction,
+                annualize=False,  # GP state already in [/year]
                 rng=rng,
             )
             df_fc['window_end'] = str(pd.Timestamp(row['window_end']).date())
