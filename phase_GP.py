@@ -167,8 +167,9 @@ class KalmanGPDriftModel:
         )
         A_1, Q_1 = matern32_discrete(F, L, Qc, dt_days)
         eye_M = np.eye(self.M)
+        K_zz_norm = self._K_zz_jit / self.spatial_var   # correlation matrix, diag ≈ 1
         self.A_block = np.kron(eye_M, A_1)
-        self.Q_block = np.kron(eye_M, Q_1)
+        self.Q_block = np.kron(K_zz_norm, Q_1)
         self._F = F
         self._L = L
         self._Qc = Qc
@@ -305,8 +306,9 @@ class KalmanGPDriftModel:
                     A_i, Q_i = matern32_discrete(
                         self._F, self._L, self._Qc, actual_dt_days,
                     )
+                    K_zz_norm_i = self._K_zz_jit / self.spatial_var
                     A_block_i = np.kron(np.eye(self.M), A_i)
-                    Q_block_i = np.kron(np.eye(self.M), Q_i)
+                    Q_block_i = np.kron(K_zz_norm_i, Q_i)
                 else:
                     A_block_i = self.A_block
                     Q_block_i = self.Q_block
@@ -385,10 +387,14 @@ class KalmanGPDriftModel:
             # singular (dense grid relative to small spatial_ls).
             mu_cov += max(1e-6 * self.spatial_var, 1e-10) * np.eye(len(x_grid))
         else:
+            # diag(K_qz K_zz^-1 P_ff K_zz^-1 K_qz^T) = diag(V.T P_ff V)
+            # since V = K_zz^-1 K_qz.T (and K_zz^-1 is symmetric).
+            # The previous form omitted the right-hand K_zz^-1, inflating
+            # the posterior variance by ~spatial_var.
             K_qq_diag = self.spatial_var * np.ones(len(x_grid))
             mu_cov = (K_qq_diag
                       - np.sum(K_qz * V.T, axis=1)
-                      + np.sum((K_qz @ self._K_zz_inv @ P_ff) * K_qz, axis=1))
+                      + np.sum(V * (P_ff @ V), axis=0))
             mu_cov = np.maximum(mu_cov, 0.0)
 
         return mu_mean, mu_cov
@@ -486,7 +492,7 @@ class KalmanGPDriftModel:
 
         self.spatial_ls  = float(np.clip(new_spatial_ls,  1e-3, 0.1))
         self.temporal_ls = float(np.clip(new_temporal_ls, 0.5,  180.0))
-        self.spatial_var = float(np.clip(new_spatial_var, 1e-12, 1e2))
+        self.spatial_var = float(np.clip(new_spatial_var, 1e-12, 1e6))
 
         # Refresh HP-dependent caches in-place; keep accumulated state_mean /
         # state_cov from the pre-HP-opt Kalman filter rather than resetting.
@@ -529,7 +535,7 @@ class KalmanGPDriftModel:
             sp_ls, tmp_ls, sp_var = np.exp(log_params)
             sp_ls = np.clip(sp_ls, 1e-3, 0.1)
             tmp_ls = np.clip(tmp_ls, 0.5, 180.0)
-            sp_var = np.clip(sp_var, 1e-12, 1e2)
+            sp_var = np.clip(sp_var, 1e-12, 1e6)
 
             m = KalmanGPDriftModel(
                 spatial_lengthscale=sp_ls,
@@ -572,7 +578,7 @@ class KalmanGPDriftModel:
                     bounds=[
                         (np.log(1e-3),  np.log(0.1)),
                         (np.log(0.5),   np.log(180.0)),
-                        (np.log(1e-12), np.log(1e2)),
+                        (np.log(1e-12), np.log(1e6)),
                     ],
                     options={'maxiter': 100, 'ftol': 1e-6},
                 )
@@ -1017,15 +1023,15 @@ def run_phase_gp(
     # --- EMA drift demeaning (Phase B-derived halflife) ---
     r_hat, r_bar = ema_demean_drift(r, dt_t, halflife_days=ema_halflife_days)
     console.print(
-        f'  drift mean before: {r.mean():.4e}  after: {r_hat.mean():.4e}  [/year]'
+        rf'  drift mean before: {r.mean():.4e}  after: {r_hat.mean():.4e}  \[/year]'
     )
 
     if sigma2 is None:
         # Euler-Maruyama in annualised units: r_hat ~ N(0, sigma2/dt).
         # sigma2 = var(r_hat) * dt  (units: [/year]^2 * sec)
         sigma2 = float(np.var(r_hat * dt) / dt)
-    console.print(f'  sigma2          = {sigma2:.4e}  [/year^2 * sec]')
-    console.print(f'  obs_noise       = {sigma2/dt:.4e}  (sigma2/dt) [/year^2]')
+    console.print(rf'  sigma2          = {sigma2:.4e}  \[/year^2 * sec]')
+    console.print(rf'  obs_noise       = {sigma2/dt:.4e}  (sigma2/dt) \[/year^2]')
 
     t_seconds = (
         pd.to_datetime(dt_t).astype(np.int64) / 1e9

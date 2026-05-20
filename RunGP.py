@@ -43,7 +43,7 @@ end_date   = datetime(2025, 12, 31)
 # Phase GP (Kalman filter) prefers large dt (1800–3600 s): same SNR but fewer
 # iterations, smaller per-step obs_noise, and better numerical stability.
 phase_a_seconds_interval  = 30    # Phase A sampling interval (seconds)
-phase_gp_seconds_interval = 900   # Phase GP sampling interval (seconds)
+phase_gp_seconds_interval = 600   # Phase GP sampling interval (seconds)
 kernel_half_width = 50
 kernel_half_width_phase_a = 3              # smoothing half-width for the log-price aggregator
 trim_quantile     = 0.01           # symmetric tail trim on log-prices (0 to disable)
@@ -58,7 +58,11 @@ min_well_separation  = 0.0        # minimum separation between wells (log-price 
 # --- Phase GP — spatial kernel -----------------------------------------------
 # None -> derived from data as 0.15 × std(x_prev) (half of Phase A's 0.3×std heuristic)
 spatial_lengthscale = None
-spatial_variance    = 1.0    # GP prior variance (initial; refined by HP opt)
+spatial_variance    = 1e4   # GP prior variance (initial; refined by HP opt).
+                             # Must be ~obs_noise/N_per_inducing for posterior
+                             # mean to track empirical drift. Per-obs noise on
+                             # annualised r_hat is O(2e4 /yr²); a tight prior
+                             # (var=1) shrinks the posterior 600x toward zero.
 
 # --- Phase GP — temporal kernel (Matern 3/2) ----------------------------------
 # None -> half of Phase B mean dwell time (Phase A regimes resolve faster than dwell)
@@ -75,7 +79,7 @@ ema_halflife_days = 0.0
 sigma2 = None
 
 # --- Phase GP — Kalman state --------------------------------------------------
-n_inducing = 20     # number of inducing points; Kalman state dim = 2 * n_inducing
+n_inducing = 8     # number of inducing points; Kalman state dim = 2 * n_inducing
 
 # --- Phase GP — HP optimisation ----------------------------------------------
 hp_opt_after_n_windows = 2        # optimise HPs after this many Phase-A windows
