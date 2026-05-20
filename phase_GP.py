@@ -856,7 +856,7 @@ def run_phase_gp(
     window_type='weekly',
     labels_csv=None,
     sigma2=None,
-    spatial_lengthscale=0.05,
+    spatial_lengthscale=0.03,
     temporal_lengthscale_days=None,
     spatial_variance=1.0,
     ema_halflife_days=None,
@@ -928,7 +928,7 @@ def run_phase_gp(
         else 'DISABLED'
     )
     console.print(
-        f'[cyan]Phase B mean dwell:[/cyan] {mean_dwell_days:.2f} days  '
+        f'[cyan]Phase B mean dwell:[/cyan] {ema_halflife_days:.2f} days  '
         f'-> temporal_ls={temporal_lengthscale_days:.2f}d, '
         f'ema_halflife={ema_str}'
     )

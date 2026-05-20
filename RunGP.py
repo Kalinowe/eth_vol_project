@@ -34,17 +34,18 @@ from phase_GP import run_phase_gp
 # =============================================================================
 
 # --- Date range ---------------------------------------------------------------
-start_date = datetime(2025, 1, 1)
-end_date   = datetime(2025, 5, 25)
+start_date = datetime(2024, 1, 1)
+end_date   = datetime(2025, 12, 31)
 
 # --- Data aggregation ---------------------------------------------------------
 # Phase A (Kramers–Moyal) prefers small dt (30–300 s): KM is O(dt)-biased and
 # large dt blurs well structure via inter-basin jumps.
 # Phase GP (Kalman filter) prefers large dt (1800–3600 s): same SNR but fewer
 # iterations, smaller per-step obs_noise, and better numerical stability.
-phase_a_seconds_interval  = 300    # Phase A sampling interval (seconds)
-phase_gp_seconds_interval = 1800   # Phase GP sampling interval (seconds)
-kernel_half_width = 50             # smoothing half-width for the log-price aggregator
+phase_a_seconds_interval  = 30    # Phase A sampling interval (seconds)
+phase_gp_seconds_interval = 900   # Phase GP sampling interval (seconds)
+kernel_half_width = 50
+kernel_half_width_phase_a = 3              # smoothing half-width for the log-price aggregator
 trim_quantile     = 0.01           # symmetric tail trim on log-prices (0 to disable)
 
 # --- Phase A topology classifier ---------------------------------------------
@@ -79,7 +80,7 @@ n_inducing = 8      # number of inducing points; Kalman state dim = 2 * n_induci
 # --- Phase GP — HP optimisation ----------------------------------------------
 hp_opt_after_n_windows = 2        # optimise HPs after this many Phase-A windows
 hp_opt_n_restarts      = 3        # L-BFGS-B restarts ('scipy' method only)
-hp_opt_method          = 'gpflow'  # 'scipy' (multi-restart L-BFGS-B) or 'gpflow' (SGPR)
+hp_opt_method          = 'scipy'  # 'scipy' (multi-restart L-BFGS-B) or 'gpflow' (SGPR)
 
 # --- Phase GP — topology extraction ------------------------------------------
 n_grid           = 200   # grid points for the posterior drift field
@@ -87,7 +88,7 @@ n_samples        = 200   # Monte-Carlo samples for topology statistics
 min_crossing_sep = 10    # minimum grid-point separation between zero crossings
 
 # --- Phase GP — topology forecasting -----------------------------------------
-forecast_horizons_days = (1.0, 3.0, 7.0, 14.0)   # Kalman rollout horizons (days)
+forecast_horizons_days = (1.0, 3.0, 7.0)   # Kalman rollout horizons (days)
 
 # --- Reproducibility ---------------------------------------------------------
 seed = 42
@@ -128,7 +129,7 @@ def main() -> None:
     labels_df = run_phase_a(
         snapped_start, snapped_end,
         phase_a_seconds_interval,
-        kernel_half_width=kernel_half_width,
+        kernel_half_width=kernel_half_width_phase_a,
         trim_quantile=trim_quantile,
         n_bins=n_bins,
         weight_threshold=weight_threshold,
