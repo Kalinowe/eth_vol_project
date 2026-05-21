@@ -35,7 +35,7 @@ from phase_GP import run_phase_gp
 
 # --- Date range ---------------------------------------------------------------
 start_date = datetime(2024, 1, 1)
-end_date   = datetime(2025, 12, 31)
+end_date   = datetime(2024, 12, 31)
 
 # --- Data aggregation ---------------------------------------------------------
 # Phase A (Kramers–Moyal) prefers small dt (30–300 s): KM is O(dt)-biased and
