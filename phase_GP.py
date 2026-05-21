@@ -422,121 +422,54 @@ class KalmanGPDriftModel:
         z = rng.standard_normal((len(x_grid), n_samples))
         return mu_mean[:, None] + L_chol @ z
 
-    def optimise_hp_gpflow(
-        self,
-        x_prev_subset,
-        r_hat_subset,
-        t_seconds_subset,
-        console=None,
-    ):
-        """
-        Alternative HP optimisation using GPflow SGPR with a separable
-        SquaredExponential(x) × Matern32(t) kernel.
-
-        The temporal input is in days; spatial input is log-price.
-        Likelihood variance is fixed to sigma2/dt (known from Euler-Maruyama).
-        """
-        try:
-            import gpflow
-        except ImportError:
-            raise ImportError('gpflow is required for this method: pip install gpflow')
-
-        console = console or Console()
-
-        t_days = t_seconds_subset / 86400.0
-        X = np.column_stack([x_prev_subset, t_days]).astype(np.float64)
-        Y_raw = r_hat_subset.reshape(-1, 1).astype(np.float64)
-
-        if len(X) > 5000:
-            idx = np.linspace(0, len(X) - 1, 5000, dtype=int)
-            X, Y_raw = X[idx], Y_raw[idx]
-
-        # Normalise targets to O(1) so kernel/noise variances are numerically
-        # well-conditioned in GPflow's Softplus transform.
-        y_scale = float(np.std(Y_raw)) or 1.0
-        Y = Y_raw / y_scale
-
-        x_ind = np.linspace(X[:, 0].min(), X[:, 0].max(), 10)
-        t_ind = np.linspace(X[:, 1].min(), X[:, 1].max(), 5)
-        xx, tt = np.meshgrid(x_ind, t_ind)
-        Z = np.column_stack([xx.ravel(), tt.ravel()]).astype(np.float64)
-
-        k_spatial = gpflow.kernels.SquaredExponential(
-            variance=1.0,  # in normalised-Y space; rescaled back after opt
-            lengthscales=float(self.spatial_ls),
-            active_dims=[0],
-        )
-        k_temporal = gpflow.kernels.Matern32(
-            variance=1.0,
-            lengthscales=float(self.temporal_ls),
-            active_dims=[1],
-        )
-        gpflow.set_trainable(k_temporal.variance, False)
-
-        gp = gpflow.models.SGPR(
-            data=(X, Y),
-            kernel=k_spatial * k_temporal,
-            inducing_variable=Z,
-        )
-
-        gpflow.optimizers.Scipy().minimize(
-            gp.training_loss,
-            gp.trainable_variables,
-            options={'maxiter': 200},
-        )
-
-        new_spatial_ls  = float(k_spatial.lengthscales.numpy())
-        new_temporal_ls = float(k_temporal.lengthscales.numpy())
-        # Unscale kernel variance back to original units
-        new_spatial_var = float(k_spatial.variance.numpy()) * y_scale**2
-
-        self.spatial_ls  = float(np.clip(new_spatial_ls,  1e-3, 0.1))
-        self.temporal_ls = float(np.clip(new_temporal_ls, 0.5,  180.0))
-        self.spatial_var = float(np.clip(new_spatial_var, 1e-12, 1e6))
-
-        # Refresh HP-dependent caches in-place; keep accumulated state_mean /
-        # state_cov from the pre-HP-opt Kalman filter rather than resetting.
-        self._recompute_hp_dependent()
-
-        console.print(
-            f'[green]GPflow HP optimised:[/green] '
-            f'spatial_ls={self.spatial_ls:.4f}  '
-            f'temporal_ls={self.temporal_ls:.2f}d  '
-            f'spatial_var={self.spatial_var:.4f}'
-        )
-
     def optimise_hp(
         self,
         x_prev_subset,
         r_hat_subset,
         t_seconds_subset,
         n_restarts=3,
-        method='scipy',
         x_range=None,
+        bounds_range=None,
+        fix_spatial_var=False,
         console=None,
     ):
-        """Maximise the marginal log-likelihood over kernel HPs.
+        """Maximise the marginal log-likelihood over kernel HPs via multi-restart L-BFGS-B.
 
-        method='scipy'  — multi-restart L-BFGS-B (default, no extra deps)
-        method='gpflow' — GPflow SGPR with separable kernel (requires gpflow)
-        x_range — inducing-point bracket (typically the full series percentile
-                  range); falls back to the subset's min/max when omitted.
+        x_range       — inducing-point bracket for MLL evaluation; falls back
+                        to the subset's min/max.
+        bounds_range  — x-range used ONLY for computing ls_lo/ls_hi bounds.
+                        Defaults to x_range. Pass the typical per-window range
+                        here when x_range covers the full multi-year history so
+                        that the bounds are calibrated to the scale at which
+                        topology is actually evaluated (per window after reproject).
+        fix_spatial_var — when True, optimise only spatial_ls and temporal_ls
+            (2-parameter MLE). self.spatial_var is held fixed throughout.
+            Use this when spatial_var has been set externally from KM data,
+            since the MLL is nearly flat in spatial_var at typical crypto SNR.
+            When False (default), all three HPs are jointly optimised.
         """
-        if method == 'gpflow':
-            return self.optimise_hp_gpflow(
-                x_prev_subset, r_hat_subset, t_seconds_subset, console=console,
-            )
         console = console or Console()
         if x_range is None:
             x_range = (float(x_prev_subset.min()), float(x_prev_subset.max()))
         n_ind = self.M if self.M is not None else 20
 
-        def _neg_log_lik(log_params):
-            sp_ls, tmp_ls, sp_var = np.exp(log_params)
-            sp_ls = np.clip(sp_ls, 1e-3, 0.1)
-            tmp_ls = np.clip(tmp_ls, 0.5, 180.0)
-            sp_var = np.clip(sp_var, 1e-12, 1e6)
+        # Lower bound on spatial_ls = inducing spacing: going below this lets
+        # the GP mean wiggle freely between inducing points, creating fake
+        # multi-well structure unrelated to the data (sigma/mu blows up).
+        # Upper bound = half the x-range, capped at 0.1: a lengthscale equal
+        # to the full window range makes the GP nearly constant (p_multi → 0).
+        # bounds_range should be the WINDOW-scale range, not the global range,
+        # so that the bounds are calibrated to where topology is evaluated.
+        _brange = bounds_range if bounds_range is not None else x_range
+        x_width = _brange[1] - _brange[0]
+        ls_lo = max(x_width / n_ind, 1e-4)
+        ls_hi = max(min(x_width / 2.0, 0.1), ls_lo * 1.5)
 
+        # --- shared inner model factory ---
+        def _run_model(sp_ls, tmp_ls, sp_var):
+            sp_ls  = np.clip(sp_ls,  ls_lo,  ls_hi)
+            tmp_ls = np.clip(tmp_ls, 0.5,  180.0)
+            sp_var = np.clip(sp_var, 1e-12,  1e6)
             m = KalmanGPDriftModel(
                 spatial_lengthscale=sp_ls,
                 temporal_lengthscale_days=tmp_ls,
@@ -546,67 +479,135 @@ class KalmanGPDriftModel:
             )
             m.initialise(x_range, n_inducing=n_ind, data_x=x_prev_subset)
             m.update(x_prev_subset, r_hat_subset, t_seconds_subset)
-            ll = m._log_lik
-            if not np.isfinite(ll):
-                warnings.warn(
-                    f'HP opt: non-finite log_lik={ll} at '
-                    f'sp_ls={np.exp(log_params[0]):.4f} '
-                    f'tmp_ls={np.exp(log_params[1]):.2f}d '
-                    f'sp_var={np.exp(log_params[2]):.4f}. Returning penalty.',
-                    RuntimeWarning, stacklevel=2,
+            return m._log_lik
+
+        if fix_spatial_var:
+            # --- 2-parameter optimisation: spatial_ls, temporal_ls only ---
+            # spatial_var is fixed at self.spatial_var and not updated.
+            fixed_sp_var = self.spatial_var
+
+            def _neg_log_lik_2(log_params):
+                sp_ls, tmp_ls = np.exp(log_params)
+                ll = _run_model(sp_ls, tmp_ls, fixed_sp_var)
+                if not np.isfinite(ll):
+                    warnings.warn(
+                        f'HP opt (ls-only): non-finite log_lik={ll} at '
+                        f'sp_ls={sp_ls:.4f} tmp_ls={tmp_ls:.2f}d. '
+                        'Returning penalty.',
+                        RuntimeWarning, stacklevel=2,
+                    )
+                return 1e10 if not np.isfinite(ll) else -ll
+
+            best_nll  = np.inf
+            best_pars = np.log([self.spatial_ls, self.temporal_ls])
+            rng_hp    = np.random.default_rng(0)
+
+            for restart in range(n_restarts):
+                p0 = (
+                    np.log([self.spatial_ls, self.temporal_ls])
+                    if restart == 0
+                    else np.log([
+                        rng_hp.uniform(ls_lo, ls_hi),
+                        rng_hp.uniform(2.0, 60.0),
+                    ])
                 )
-            return 1e10 if not np.isfinite(ll) else -ll
+                try:
+                    res = minimize(
+                        _neg_log_lik_2, p0,
+                        method='L-BFGS-B',
+                        bounds=[
+                            (np.log(ls_lo), np.log(ls_hi)),
+                            (np.log(0.5),   np.log(180.0)),
+                        ],
+                        options={'maxiter': 100, 'ftol': 1e-6},
+                    )
+                    if res.fun < best_nll:
+                        best_nll  = res.fun
+                        best_pars = res.x
+                    console.print(
+                        f'  [cyan]HP opt (ls-only) restart {restart+1}/{n_restarts}[/cyan]  '
+                        f'nll={res.fun:.4e}  '
+                        f'sp_ls={np.exp(res.x[0]):.4f}  '
+                        f'tmp_ls={np.exp(res.x[1]):.2f}d  '
+                        f'sp_var={fixed_sp_var:.4g} [fixed]'
+                    )
+                except Exception as exc:
+                    console.print(f'  [yellow]Restart {restart+1} failed: {exc}[/yellow]')
 
-        best_nll = np.inf
-        best_pars = np.log([self.spatial_ls, self.temporal_ls, self.spatial_var])
+            self.spatial_ls  = float(np.exp(best_pars[0]))
+            self.temporal_ls = float(np.exp(best_pars[1]))
+            # spatial_var intentionally NOT updated here.
+            self._recompute_hp_dependent()
+            console.print(
+                f'[green]HP optimised (ls-only):[/green] '
+                f'spatial_ls={self.spatial_ls:.4f}  '
+                f'temporal_ls={self.temporal_ls:.2f}d  '
+                f'spatial_var={self.spatial_var:.4g} [unchanged]'
+            )
 
-        rng_hp = np.random.default_rng(0)
-        for restart in range(n_restarts):
-            if restart == 0:
-                p0 = np.log([self.spatial_ls, self.temporal_ls, self.spatial_var])
-            else:
-                p0 = np.log([
-                    rng_hp.uniform(0.005, 0.1),
-                    rng_hp.uniform(2.0, 60.0),
-                    rng_hp.uniform(0.01, 10.0),
-                ])
+        else:
+            # --- 3-parameter optimisation: spatial_ls, temporal_ls, spatial_var ---
+            def _neg_log_lik_3(log_params):
+                sp_ls, tmp_ls, sp_var = np.exp(log_params)
+                ll = _run_model(sp_ls, tmp_ls, sp_var)
+                if not np.isfinite(ll):
+                    warnings.warn(
+                        f'HP opt: non-finite log_lik={ll} at '
+                        f'sp_ls={sp_ls:.4f} '
+                        f'tmp_ls={tmp_ls:.2f}d '
+                        f'sp_var={sp_var:.4f}. Returning penalty.',
+                        RuntimeWarning, stacklevel=2,
+                    )
+                return 1e10 if not np.isfinite(ll) else -ll
 
-            try:
-                res = minimize(
-                    _neg_log_lik, p0,
-                    method='L-BFGS-B',
-                    bounds=[
-                        (np.log(1e-3),  np.log(0.1)),
-                        (np.log(0.5),   np.log(180.0)),
-                        (np.log(1e-12), np.log(1e6)),
-                    ],
-                    options={'maxiter': 100, 'ftol': 1e-6},
+            best_nll  = np.inf
+            best_pars = np.log([self.spatial_ls, self.temporal_ls, self.spatial_var])
+            rng_hp    = np.random.default_rng(0)
+
+            for restart in range(n_restarts):
+                p0 = (
+                    np.log([self.spatial_ls, self.temporal_ls, self.spatial_var])
+                    if restart == 0
+                    else np.log([
+                        rng_hp.uniform(ls_lo, ls_hi),
+                        rng_hp.uniform(2.0, 60.0),
+                        rng_hp.uniform(0.01, 10.0),
+                    ])
                 )
-                if res.fun < best_nll:
-                    best_nll = res.fun
-                    best_pars = res.x
-                console.print(
-                    f'  [cyan]HP opt restart {restart+1}/{n_restarts}[/cyan]  '
-                    f'nll={res.fun:.4e}  '
-                    f'sp_ls={np.exp(res.x[0]):.4f}  '
-                    f'tmp_ls={np.exp(res.x[1]):.2f}d  '
-                    f'sp_var={np.exp(res.x[2]):.4f}'
-                )
-            except Exception as exc:
-                console.print(f'  [yellow]Restart {restart+1} failed: {exc}[/yellow]')
+                try:
+                    res = minimize(
+                        _neg_log_lik_3, p0,
+                        method='L-BFGS-B',
+                        bounds=[
+                            (np.log(ls_lo),  np.log(ls_hi)),
+                            (np.log(0.5),    np.log(180.0)),
+                            (np.log(1e-12),  np.log(1e6)),
+                        ],
+                        options={'maxiter': 100, 'ftol': 1e-6},
+                    )
+                    if res.fun < best_nll:
+                        best_nll  = res.fun
+                        best_pars = res.x
+                    console.print(
+                        f'  [cyan]HP opt restart {restart+1}/{n_restarts}[/cyan]  '
+                        f'nll={res.fun:.4e}  '
+                        f'sp_ls={np.exp(res.x[0]):.4f}  '
+                        f'tmp_ls={np.exp(res.x[1]):.2f}d  '
+                        f'sp_var={np.exp(res.x[2]):.4f}'
+                    )
+                except Exception as exc:
+                    console.print(f'  [yellow]Restart {restart+1} failed: {exc}[/yellow]')
 
-        self.spatial_ls = float(np.exp(best_pars[0]))
-        self.temporal_ls = float(np.exp(best_pars[1]))
-        self.spatial_var = float(np.exp(best_pars[2]))
-        # Swap in new HPs while keeping the accumulated Kalman state.
-        self._recompute_hp_dependent()
-
-        console.print(
-            f'[green]HP optimised:[/green] '
-            f'spatial_ls={self.spatial_ls:.4f}  '
-            f'temporal_ls={self.temporal_ls:.2f}d  '
-            f'spatial_var={self.spatial_var:.4f}'
-        )
+            self.spatial_ls  = float(np.exp(best_pars[0]))
+            self.temporal_ls = float(np.exp(best_pars[1]))
+            self.spatial_var = float(np.exp(best_pars[2]))
+            self._recompute_hp_dependent()
+            console.print(
+                f'[green]HP optimised:[/green] '
+                f'spatial_ls={self.spatial_ls:.4f}  '
+                f'temporal_ls={self.temporal_ls:.2f}d  '
+                f'spatial_var={self.spatial_var:.4f}'
+            )
 
     def get_params(self):
         return {
@@ -935,7 +936,6 @@ def run_phase_gp(
     n_samples=200,
     hp_opt_after_n_windows=2,
     hp_opt_n_restarts=3,
-    hp_opt_method='scipy',
     forecast_horizons_days=(1.0, 3.0, 7.0, 14.0),
     topology_every_n_obs=500,
     kernel_half_width=5,
@@ -1138,7 +1138,6 @@ def run_phase_gp(
                 model.optimise_hp(
                     hp_x, hp_r, hp_t,
                     n_restarts=hp_opt_n_restarts,
-                    method=hp_opt_method,
                     x_range=topo_x_range,
                     console=console,
                 )

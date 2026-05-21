@@ -9,8 +9,11 @@ claude/
 # Regime results data and plots
 regime_results/
 
-# Regime results data and plots
+# GP results data and plots
 gp_results/
+
+# dynamic GP results data and plots
+gp_results_dynamic/
 
 # Python bytecode
 __pycache__/

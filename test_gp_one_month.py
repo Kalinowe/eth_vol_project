@@ -33,12 +33,12 @@ warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 
 # --- Configuration ------------------------------------------------------------
-START          = datetime(2025, 3, 1)
+START          = datetime(2025, 2, 1)
 END            = datetime(2025, 3, 31)
 SECONDS        = 900                  # same as RunGP.py phase_gp_seconds_interval
 KERNEL_HW      = 50
 TRIM_QUANTILE  = 0.01
-N_INDUCING     = 20
+N_INDUCING     = 8
 
 SPATIAL_VARS   = [1.0, 1e2, 1e4, 'hp_opt']   # 'hp_opt' = start at 1e4 and run scipy HP opt
 TEMPORAL_LS_D  = 5.0                  # days
