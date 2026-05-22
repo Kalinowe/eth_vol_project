@@ -453,16 +453,17 @@ class KalmanGPDriftModel:
             x_range = (float(x_prev_subset.min()), float(x_prev_subset.max()))
         n_ind = self.M if self.M is not None else 20
 
-        # Lower bound on spatial_ls = inducing spacing: going below this lets
-        # the GP mean wiggle freely between inducing points, creating fake
-        # multi-well structure unrelated to the data (sigma/mu blows up).
+        # Lower bound on spatial_ls: 1/3 of the inducing spacing.  Allowing ls
+        # below the inducing gap risks free wiggle between inducing points, but
+        # with a dense grid (N_INDUCING≥40) this rarely causes fake multi-well
+        # artefacts while letting the optimizer capture KM-like fine structure.
         # Upper bound = half the x-range, capped at 0.1: a lengthscale equal
         # to the full window range makes the GP nearly constant (p_multi → 0).
         # bounds_range should be the WINDOW-scale range, not the global range,
         # so that the bounds are calibrated to where topology is evaluated.
         _brange = bounds_range if bounds_range is not None else x_range
         x_width = _brange[1] - _brange[0]
-        ls_lo = max(x_width / n_ind, 1e-4)
+        ls_lo = max(x_width / (3 * n_ind), 1e-4)
         ls_hi = max(min(x_width / 2.0, 0.1), ls_lo * 1.5)
 
         # --- shared inner model factory ---

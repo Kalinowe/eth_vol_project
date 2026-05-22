@@ -35,6 +35,7 @@ from force_field_estimation import estimate_km
 # Window iteration
 # ---------------------------------------------------------------------------
 
+
 def iter_month_windows(start_date, end_date):
     """
     Yield (window_start, window_end) for each calendar month overlapping
@@ -67,7 +68,7 @@ def iter_fixed_windows(start_date, end_date, days):
         current = window_end + timedelta(days=1)
 
 
-def iter_windows(start_date, end_date, window_type='monthly'):
+def iter_windows(start_date, end_date, window_type="monthly"):
     """
     Dispatch to the appropriate window iterator.
 
@@ -75,14 +76,16 @@ def iter_windows(start_date, end_date, window_type='monthly'):
         window_type: 'weekly' (7 days), 'biweekly' (14 days), or 'monthly'
                      (calendar-aligned).
     """
-    if window_type == 'weekly':
+    if window_type == "weekly":
         return iter_fixed_windows(start_date, end_date, 7)
-    elif window_type == 'biweekly':
+    elif window_type == "biweekly":
         return iter_fixed_windows(start_date, end_date, 14)
-    elif window_type == 'monthly':
+    elif window_type == "monthly":
         return iter_month_windows(start_date, end_date)
     else:
-        raise ValueError(f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'.")
+        raise ValueError(
+            f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'."
+        )
 
 
 def normalize_window_boundaries(
@@ -104,23 +107,25 @@ def normalize_window_boundaries(
     """
     orig_start, orig_end = start_date, end_date
 
-    if window_type in ('weekly', 'biweekly'):
+    if window_type in ("weekly", "biweekly"):
         # floor start to Monday (weekday() == 0)
         start_date = start_date - timedelta(days=start_date.weekday())
-        if window_type == 'weekly':
+        if window_type == "weekly":
             # ceil end to Sunday (weekday() == 6)
             end_date = end_date + timedelta(days=(6 - end_date.weekday()) % 7)
         else:
             # ceil end to the Sunday that closes the biweekly period from snapped start
             days_span = (end_date - start_date).days + 1
-            n_windows = (days_span + 13) // 14   # ceiling division
+            n_windows = (days_span + 13) // 14  # ceiling division
             end_date = start_date + timedelta(days=14 * n_windows - 1)
-    elif window_type == 'monthly':
+    elif window_type == "monthly":
         start_date = start_date.replace(day=1)
         if end_date.month == 12:
             end_date = datetime(end_date.year + 1, 1, 1) - timedelta(days=1)
         else:
-            end_date = datetime(end_date.year, end_date.month + 1, 1) - timedelta(days=1)
+            end_date = datetime(end_date.year, end_date.month + 1, 1) - timedelta(
+                days=1
+            )
     else:
         raise ValueError(
             f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'."
@@ -130,11 +135,16 @@ def normalize_window_boundaries(
         _console = console or Console()
         parts = []
         if start_date != orig_start:
-            parts.append(f"start [cyan]{orig_start.date()}[/cyan] → [cyan]{start_date.date()}[/cyan]")
+            parts.append(
+                f"start [cyan]{orig_start.date()}[/cyan] → [cyan]{start_date.date()}[/cyan]"
+            )
         if end_date != orig_end:
-            parts.append(f"end [cyan]{orig_end.date()}[/cyan] → [cyan]{end_date.date()}[/cyan]")
+            parts.append(
+                f"end [cyan]{orig_end.date()}[/cyan] → [cyan]{end_date.date()}[/cyan]"
+            )
         _console.print(
-            f"[yellow]Window boundary correction ({window_type}):[/yellow] " + "  |  ".join(parts)
+            f"[yellow]Window boundary correction ({window_type}):[/yellow] "
+            + "  |  ".join(parts)
         )
 
     return start_date, end_date
@@ -143,6 +153,7 @@ def normalize_window_boundaries(
 # ---------------------------------------------------------------------------
 # Topological classifier
 # ---------------------------------------------------------------------------
+
 
 def _greedy_well_filter(x, U, threshold, min_well_separation):
     """
@@ -156,7 +167,7 @@ def _greedy_well_filter(x, U, threshold, min_well_separation):
 
     def barrier_between_indices(ia, ib):
         lo, hi = min(ia, ib), max(ia, ib)
-        U_peak = U[lo:hi + 1].max()
+        U_peak = U[lo : hi + 1].max()
         return float(U_peak - max(U[ia], U[ib]))
 
     kept_idx = [min_idx[0]]
@@ -204,32 +215,34 @@ def classify_potential_topology(
             scale per-bin GP noise as alpha = weight_threshold / weights
             (capped at 10.0 for numerical stability in tail bins).
     """
-    df = km_result_df.dropna(subset=['drift']).reset_index(drop=True)
+    df = km_result_df.dropna(subset=["drift"]).reset_index(drop=True)
     if len(df) < 5:
         return {
-            'n_wells': 0.0, 'p_multiwell': 0.0,
-            'well_locations': [], 'barriers': [],
-            'u_range': 0.0, 'regime': 'no-equilibrium',
+            "n_wells": 0.0,
+            "p_multiwell": 0.0,
+            "well_locations": [],
+            "barriers": [],
+            "u_range": 0.0,
+            "regime": "no-equilibrium",
         }
 
     sec_per_year = 365.25 * 24 * 3600
-    x = df['bin_center'].values.astype(float)
-    f = df['drift'].values.astype(float)
+    x = df["bin_center"].values.astype(float)
+    f = df["drift"].values.astype(float)
     if annualize_drift:
         f = f * sec_per_year
 
     # Per-bin noise variance: bins with low counts get larger alpha. The
     # weight column survives the dropna above because we only filtered on
     # 'drift' (NaN where weight <= weight_threshold in estimate_km).
-    weights = df['weight'].values.astype(float)
+    weights = df["weight"].values.astype(float)
     weights = np.maximum(weights, 1.0)
     alpha = np.minimum(weight_threshold / weights, 10.0)
 
     x_std = float(np.std(x)) if np.std(x) > 0 else 1.0
-    kernel = (
-        RBF(length_scale=x_std * 0.3, length_scale_bounds=(1e-3, 10.0))
-        + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-10, 1e3))
-    )
+    kernel = RBF(
+        length_scale=x_std * 0.3, length_scale_bounds=(1e-3, 10.0)
+    ) + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-10, 1e3))
     gp = GaussianProcessRegressor(
         kernel=kernel,
         alpha=alpha,
@@ -241,12 +254,14 @@ def classify_potential_topology(
     # any residual convergence warning is benign and suppressed here so the
     # per-window console output stays clean.
     with warnings.catch_warnings():
-        warnings.simplefilter('ignore', ConvergenceWarning)
+        warnings.simplefilter("ignore", ConvergenceWarning)
         gp.fit(x.reshape(-1, 1), f)
 
     x_grid = np.linspace(x.min(), x.max(), n_grid)
     f_samples = gp.sample_y(
-        x_grid.reshape(-1, 1), n_samples=n_samples, random_state=random_state,
+        x_grid.reshape(-1, 1),
+        n_samples=n_samples,
+        random_state=random_state,
     )  # shape (n_grid, n_samples)
 
     # Integrate each drift sample into a potential and count wells.
@@ -275,40 +290,46 @@ def classify_potential_topology(
     mean_n_wells = float(np.mean(n_wells_samples))
 
     if mean_n_wells < 1.3:
-        regime = 'single-well'
+        regime = "single-well"
     elif mean_n_wells < 1.7:
-        regime = 'uncertain'
+        regime = "uncertain"
     else:
-        regime = 'multi-well'
+        regime = "multi-well"
 
     if u_range_mean == 0.0:
         return {
-            'n_wells': round(mean_n_wells, 2),
-            'p_multiwell': round(p_multiwell, 4),
-            'well_locations': [], 'barriers': [],
-            'u_range': 0.0, 'regime': regime,
+            "n_wells": round(mean_n_wells, 2),
+            "p_multiwell": round(p_multiwell, 4),
+            "well_locations": [],
+            "barriers": [],
+            "u_range": 0.0,
+            "regime": regime,
         }
 
     threshold_mean = min_barrier_fraction * u_range_mean
     kept_idx_mean, barriers_mean = _greedy_well_filter(
-        x_grid, U_mean, threshold_mean, min_well_separation,
+        x_grid,
+        U_mean,
+        threshold_mean,
+        min_well_separation,
     )
     well_locations = [float(x_grid[i]) for i in kept_idx_mean]
     barriers = [round(b, 6) for b in barriers_mean]
 
     return {
-        'n_wells': round(mean_n_wells, 2),
-        'p_multiwell': round(p_multiwell, 4),
-        'well_locations': well_locations,
-        'barriers': barriers,
-        'u_range': round(u_range_mean, 4),
-        'regime': regime,
+        "n_wells": round(mean_n_wells, 2),
+        "p_multiwell": round(p_multiwell, 4),
+        "well_locations": well_locations,
+        "barriers": barriers,
+        "u_range": round(u_range_mean, 4),
+        "regime": regime,
     }
 
 
 # ---------------------------------------------------------------------------
 # Per-window driver
 # ---------------------------------------------------------------------------
+
 
 def analyze_window(
     window_start,
@@ -332,14 +353,14 @@ def analyze_window(
     # If the aggregated CSV for this (window, interval) already exists we can
     # skip the download and unzip entirely — aggregate_log_returns_range will
     # load it from disk.
-    trim_tag = f'_trim{trim_quantile}' if trim_quantile > 0 else ''
-    kernel_tag = f'_k{kernel_half_width}' if kernel_half_width > 0 else ''
-    detrend_tag = '_detrended' if detrend else ''
+    trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
+    kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
+    detrend_tag = "_detrended" if detrend else ""
     agg_file = os.path.join(
-        'data',
-        f'ETHUSDT-aggReturns-{window_start.strftime("%Y-%m-%d")}'
-        f'_to_{window_end.strftime("%Y-%m-%d")}'
-        f'-{seconds_interval}sec{kernel_tag}{trim_tag}{detrend_tag}.csv',
+        "data",
+        f"ETHUSDT-aggReturns-{window_start.strftime('%Y-%m-%d')}"
+        f"_to_{window_end.strftime('%Y-%m-%d')}"
+        f"-{seconds_interval}sec{kernel_tag}{trim_tag}{detrend_tag}.csv",
     )
     if not os.path.exists(agg_file):
         try:
@@ -358,17 +379,21 @@ def analyze_window(
             detrend=detrend,
         )
     except Exception as exc:
-        print(f"[skip] aggregation failed for {window_start.date()}..{window_end.date()}: {exc}")
+        print(
+            f"[skip] aggregation failed for {window_start.date()}..{window_end.date()}: {exc}"
+        )
         return None
 
     if df.empty:
         return None
 
-    log_prices = df['log_first_price'].dropna().values
+    log_prices = df["log_first_price"].dropna().values
     if len(log_prices) < min_observations:
         return None
 
-    km_df = estimate_km(log_prices, seconds_interval, n_bins=n_bins, weight_threshold=weight_threshold)
+    km_df = estimate_km(
+        log_prices, seconds_interval, n_bins=n_bins, weight_threshold=weight_threshold
+    )
     topo = classify_potential_topology(
         km_df,
         min_barrier_fraction=min_barrier_fraction,
@@ -377,11 +402,11 @@ def analyze_window(
     )
 
     return {
-        'window_start': window_start,
-        'window_end': window_end,
-        'seconds_interval': seconds_interval,
-        'n_observations': int(len(log_prices)),
-        'km_df': km_df,
+        "window_start": window_start,
+        "window_end": window_end,
+        "seconds_interval": seconds_interval,
+        "n_observations": int(len(log_prices)),
+        "km_df": km_df,
         **topo,
     }
 
@@ -389,6 +414,7 @@ def analyze_window(
 # ---------------------------------------------------------------------------
 # Partial-cache helper
 # ---------------------------------------------------------------------------
+
 
 def _load_cached_windows(
     output_dir: str,
@@ -409,20 +435,20 @@ def _load_cached_windows(
     """
     pattern = os.path.join(
         output_dir,
-        f'regime_labels_*_{int(seconds_interval)}s_{window_type}.csv',
+        f"regime_labels_*_{int(seconds_interval)}s_{window_type}.csv",
     )
     csv_files = glob.glob(pattern)
     if not csv_files:
         return pd.DataFrame(), set()
 
-    start_str = start_date.strftime('%Y-%m-%d')
-    end_str = end_date.strftime('%Y-%m-%d')
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
 
     frames = []
     for path in csv_files:
         try:
-            df = pd.read_csv(path, dtype={'window_start': str, 'window_end': str})
-            mask = (df['window_start'] >= start_str) & (df['window_end'] <= end_str)
+            df = pd.read_csv(path, dtype={"window_start": str, "window_end": str})
+            mask = (df["window_start"] >= start_str) & (df["window_end"] <= end_str)
             sub = df[mask]
             if not sub.empty:
                 frames.append(sub)
@@ -434,18 +460,19 @@ def _load_cached_windows(
 
     cached_df = pd.concat(frames, ignore_index=True)
     cached_df = cached_df.drop_duplicates(
-        subset=['window_start', 'window_end'], keep='first'
+        subset=["window_start", "window_end"], keep="first"
     )
 
     # Rows from before p_multiwell was added are missing or NaN there —
     # drop them so freshly computed rows can take their place.
-    if 'p_multiwell' not in cached_df.columns:
-        cached_df['p_multiwell'] = np.nan
-    valid_rows = cached_df[cached_df['p_multiwell'].notna()
-                           | (cached_df['regime'] == 'unavailable')].copy()
+    if "p_multiwell" not in cached_df.columns:
+        cached_df["p_multiwell"] = np.nan
+    valid_rows = cached_df[
+        cached_df["p_multiwell"].notna() | (cached_df["regime"] == "unavailable")
+    ].copy()
 
     covered = set()
-    for (ws, we), _ in valid_rows.groupby(['window_start', 'window_end']):
+    for (ws, we), _ in valid_rows.groupby(["window_start", "window_end"]):
         covered.add((ws, we))
 
     return valid_rows, covered
@@ -454,6 +481,7 @@ def _load_cached_windows(
 # ---------------------------------------------------------------------------
 # Phase A driver
 # ---------------------------------------------------------------------------
+
 
 def run_phase_a(
     start_date,
@@ -466,8 +494,8 @@ def run_phase_a(
     detrend=0,
     min_barrier_fraction=0.1,
     min_well_separation=0.0,
-    output_dir='regime_results',
-    window_type='monthly',
+    output_dir="regime_results",
+    window_type="monthly",
     console=None,
 ):
     """
@@ -503,39 +531,44 @@ def run_phase_a(
     # p_multiwell (older CSVs written before that column existed force a rerun).
     if os.path.exists(out_path):
         cached = pd.read_csv(out_path)
-        good_regimes = ['single-well', 'multi-well', 'uncertain']
+        good_regimes = ["single-well", "multi-well", "uncertain"]
         has_pmulti = (
-            'p_multiwell' in cached.columns
-            and cached[cached['regime'].isin(good_regimes)]['p_multiwell'].notna().all()
+            "p_multiwell" in cached.columns
+            and cached[cached["regime"].isin(good_regimes)]["p_multiwell"].notna().all()
         )
         if has_pmulti:
             console.print(
-                f'[green]Labels CSV already exists:[/green] {fname} — loading from disk.'
+                f"[green]Labels CSV already exists:[/green] {fname} — loading from disk."
             )
             return cached
         console.print(
-            f'[yellow]Cached labels CSV {fname} predates p_multiwell — '
-            'recomputing missing windows.[/yellow]'
+            f"[yellow]Cached labels CSV {fname} predates p_multiwell — "
+            "recomputing missing windows.[/yellow]"
         )
 
     # Partial cache: collect rows already computed in other files at this interval.
     cached_df, covered_windows = _load_cached_windows(
-        output_dir, window_type, seconds_interval, start_date, end_date,
+        output_dir,
+        window_type,
+        seconds_interval,
+        start_date,
+        end_date,
     )
 
     all_windows = list(iter_windows(start_date, end_date, window_type))
     missing_windows = [
-        (ws, we) for ws, we in all_windows
-        if (ws.strftime('%Y-%m-%d'), we.strftime('%Y-%m-%d')) not in covered_windows
+        (ws, we)
+        for ws, we in all_windows
+        if (ws.strftime("%Y-%m-%d"), we.strftime("%Y-%m-%d")) not in covered_windows
     ]
 
     if covered_windows:
         console.print(
-            f'[green]Partial cache:[/green] {len(covered_windows)} window(s) reused from existing files, '
-            f'[yellow]{len(missing_windows)}[/yellow] window(s) to compute.'
+            f"[green]Partial cache:[/green] {len(covered_windows)} window(s) reused from existing files, "
+            f"[yellow]{len(missing_windows)}[/yellow] window(s) to compute."
         )
 
-    km_dir = os.path.join(output_dir, 'km')
+    km_dir = os.path.join(output_dir, "km")
     os.makedirs(km_dir, exist_ok=True)
 
     rows = []
@@ -553,36 +586,40 @@ def run_phase_a(
             min_well_separation=min_well_separation,
         )
         if result is None:
-            rows.append({
-                'window_start': window_start.strftime('%Y-%m-%d'),
-                'window_end': window_end.strftime('%Y-%m-%d'),
-                'seconds_interval': seconds_interval,
-                'regime': 'unavailable',
-                'n_wells': None,
-                'p_multiwell': None,
-                'well_locations': None,
-                'barriers': None,
-                'n_observations': 0,
-            })
+            rows.append(
+                {
+                    "window_start": window_start.strftime("%Y-%m-%d"),
+                    "window_end": window_end.strftime("%Y-%m-%d"),
+                    "seconds_interval": seconds_interval,
+                    "regime": "unavailable",
+                    "n_wells": None,
+                    "p_multiwell": None,
+                    "well_locations": None,
+                    "barriers": None,
+                    "n_observations": 0,
+                }
+            )
             continue
         km_path = os.path.join(
             km_dir,
             f"km_{result['window_start'].strftime('%Y-%m-%d')}_to_"
             f"{result['window_end'].strftime('%Y-%m-%d')}_{seconds_interval}s.csv",
         )
-        result['km_df'].to_csv(km_path, index=False)
-        rows.append({
-            'window_start': result['window_start'].strftime('%Y-%m-%d'),
-            'window_end': result['window_end'].strftime('%Y-%m-%d'),
-            'seconds_interval': seconds_interval,
-            'regime': result['regime'],
-            'n_wells': result['n_wells'],
-            'p_multiwell': result.get('p_multiwell', np.nan),
-            'well_locations': [round(x, 6) for x in result['well_locations']],
-            'barriers': [round(b, 6) for b in result['barriers']],
-            'u_range': result['u_range'],
-            'n_observations': result['n_observations'],
-        })
+        result["km_df"].to_csv(km_path, index=False)
+        rows.append(
+            {
+                "window_start": result["window_start"].strftime("%Y-%m-%d"),
+                "window_end": result["window_end"].strftime("%Y-%m-%d"),
+                "seconds_interval": seconds_interval,
+                "regime": result["regime"],
+                "n_wells": result["n_wells"],
+                "p_multiwell": result.get("p_multiwell", np.nan),
+                "well_locations": [round(x, 6) for x in result["well_locations"]],
+                "barriers": [round(b, 6) for b in result["barriers"]],
+                "u_range": result["u_range"],
+                "n_observations": result["n_observations"],
+            }
+        )
 
     # Merge cached and newly computed rows.
     parts = []
@@ -595,51 +632,54 @@ def run_phase_a(
 
     # Deduplicate; prefer freshly computed rows (keep='last') so a stale cache
     # entry cannot shadow an updated p_multiwell or regime label.
-    out_df = out_df.drop_duplicates(
-        subset=['window_start', 'window_end'], keep='last'
-    )
-    out_df = out_df.sort_values('window_start').reset_index(drop=True)
+    out_df = out_df.drop_duplicates(subset=["window_start", "window_end"], keep="last")
+    out_df = out_df.sort_values("window_start").reset_index(drop=True)
     out_df.to_csv(out_path, index=False)
     return out_df
 
 
 def print_regime_table(labels_df, console=None):
     console = console or Console()
-    intervals = sorted(set(pd.to_numeric(labels_df.get('seconds_interval', []),
-                                         errors='coerce').dropna().astype(int)))
-    interval_label = f'{intervals[0]}s' if len(intervals) == 1 else 'mixed'
-    table = Table(title=f'Phase A regime labels — Δt = {interval_label}')
-    table.add_column('Start', style='cyan')
-    table.add_column('End', style='cyan')
-    table.add_column('Regime', style='green')
-    table.add_column('Wells', justify='right', style='magenta')
-    table.add_column('p_multiwell', justify='right', style='magenta')
-    table.add_column('U range (ann.)', justify='right', style='yellow')
-    table.add_column('Barriers', style='yellow')
-    table.add_column('# obs', justify='right')
+    intervals = sorted(
+        set(
+            pd.to_numeric(labels_df.get("seconds_interval", []), errors="coerce")
+            .dropna()
+            .astype(int)
+        )
+    )
+    interval_label = f"{intervals[0]}s" if len(intervals) == 1 else "mixed"
+    table = Table(title=f"Phase A regime labels — Δt = {interval_label}")
+    table.add_column("Start", style="cyan")
+    table.add_column("End", style="cyan")
+    table.add_column("Regime", style="green")
+    table.add_column("Wells", justify="right", style="magenta")
+    table.add_column("p_multiwell", justify="right", style="magenta")
+    table.add_column("U range (ann.)", justify="right", style="yellow")
+    table.add_column("Barriers", style="yellow")
+    table.add_column("# obs", justify="right")
 
-    has_pmulti = 'p_multiwell' in labels_df.columns
+    has_pmulti = "p_multiwell" in labels_df.columns
 
     for _, r in labels_df.iterrows():
-        u_range_str = f"{r['u_range']:.2f}" if pd.notna(r.get('u_range')) else ''
-        n_wells_val = r['n_wells']
+        u_range_str = f"{r['u_range']:.2f}" if pd.notna(r.get("u_range")) else ""
+        n_wells_val = r["n_wells"]
         if pd.isna(n_wells_val):
-            n_wells_str = ''
+            n_wells_str = ""
         else:
-            n_wells_str = f'{float(n_wells_val):.1f}'
-        if has_pmulti and pd.notna(r.get('p_multiwell')):
+            n_wells_str = f"{float(n_wells_val):.1f}"
+        if has_pmulti and pd.notna(r.get("p_multiwell")):
             pmulti_str = f"{float(r['p_multiwell']):.2f}"
         else:
-            pmulti_str = ''
+            pmulti_str = ""
         table.add_row(
-            str(r['window_start']),
-            str(r['window_end']),
-            str(r['regime']),
+            str(r["window_start"]),
+            str(r["window_end"]),
+            str(r["regime"]),
             n_wells_str,
             pmulti_str,
             u_range_str,
-            str(r['barriers']) if r['barriers'] is not None else '',
-            str(r['n_observations']),
+            str(r["barriers"]) if r["barriers"] is not None else "",
+            str(r["n_observations"]),
         )
     console.print(table)
 
@@ -648,14 +688,10 @@ def print_regime_table(labels_df, console=None):
 # Standalone entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Standalone execution is intentionally disabled: this module is part of
     # the pipeline and its parameters live in RunEM.py. Running it directly
     # would silently fall back to the old hardcoded config and quietly
     # diverge from whatever RunEM is currently configured to do.
-    Console().print(
-        '[yellow]regime_estimation.py is part of the pipeline; '
-        'run [bold]python RunEM.py[/bold] to execute Phase A with the '
-        'centrally-configured parameters.[/yellow]'
-    )
+    Console().print("[yellow]regime_estimation.py is part of the pipeline; ")
     raise SystemExit(0)
