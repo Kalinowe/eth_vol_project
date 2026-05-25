@@ -10,10 +10,23 @@ claude/
 regime_results/
 
 # GP results data and plots
+GP_updates/
+
+# GP results data and plots
 gp_results/
 
 # dynamic GP results data and plots
 gp_results_dynamic/
+
+# update results
+update/
+
+# Claude session handoff notes
+.md
+
+# Backtest results and data
+backtests/
+backtest_results/
 
 # Python bytecode
 __pycache__/

@@ -339,7 +339,6 @@ def analyze_window(
     trim_quantile=0.01,
     n_bins=200,
     weight_threshold=5,
-    detrend=0,
     min_barrier_fraction=0.1,
     min_well_separation=0.0,
     min_observations=100,
@@ -355,12 +354,11 @@ def analyze_window(
     # load it from disk.
     trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
     kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
-    detrend_tag = "_detrended" if detrend else ""
     agg_file = os.path.join(
         "data",
         f"ETHUSDT-aggReturns-{window_start.strftime('%Y-%m-%d')}"
         f"_to_{window_end.strftime('%Y-%m-%d')}"
-        f"-{seconds_interval}sec{kernel_tag}{trim_tag}{detrend_tag}.csv",
+        f"-{seconds_interval}sec{kernel_tag}{trim_tag}.csv",
     )
     if not os.path.exists(agg_file):
         try:
@@ -376,7 +374,6 @@ def analyze_window(
             seconds_interval,
             kernel_half_width=kernel_half_width,
             trim_quantile=trim_quantile,
-            detrend=detrend,
         )
     except Exception as exc:
         print(
@@ -491,7 +488,6 @@ def run_phase_a(
     trim_quantile=0.01,
     n_bins=200,
     weight_threshold=5,
-    detrend=0,
     min_barrier_fraction=0.1,
     min_well_separation=0.0,
     output_dir="regime_results",
@@ -581,7 +577,6 @@ def run_phase_a(
             trim_quantile=trim_quantile,
             n_bins=n_bins,
             weight_threshold=weight_threshold,
-            detrend=detrend,
             min_barrier_fraction=min_barrier_fraction,
             min_well_separation=min_well_separation,
         )

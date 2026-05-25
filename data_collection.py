@@ -5,6 +5,7 @@ import zipfile
 import pandas as pd
 import numpy as np
 
+
 def ensure_data(start_date, end_date):
     """
     Ensure that extracted CSV files exist for every day in [start_date, end_date].
@@ -23,10 +24,10 @@ def ensure_data(start_date, end_date):
         FileNotFoundError: If a day's CSV cannot be obtained (download failed
             and no existing zip or CSV was found).
     """
-    os.makedirs('data', exist_ok=True)
+    os.makedirs("data", exist_ok=True)
     current = start_date
     while current <= end_date:
-        date_str = current.strftime('%Y-%m-%d')
+        date_str = current.strftime("%Y-%m-%d")
         zip_path = f"data/ETHUSDT-aggTrades-{date_str}.zip"
         csv_path = f"data/ETHUSDT-aggTrades-{date_str}.csv"
 
@@ -39,7 +40,7 @@ def ensure_data(start_date, end_date):
                 try:
                     response = requests.get(url)
                     if response.status_code == 200:
-                        with open(zip_path, 'wb') as f:
+                        with open(zip_path, "wb") as f:
                             f.write(response.content)
                         print(f"Downloaded {date_str}")
                     else:
@@ -49,8 +50,8 @@ def ensure_data(start_date, end_date):
 
             if os.path.exists(zip_path):
                 try:
-                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                        zip_ref.extractall('data')
+                    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                        zip_ref.extractall("data")
                     print(f"Extracted {date_str}")
                 except Exception as e:
                     raise Exception(f"Error unzipping {date_str}: {e}")
@@ -64,6 +65,7 @@ def ensure_data(start_date, end_date):
             os.remove(zip_path)
 
         current += timedelta(days=1)
+
 
 def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_width=0):
     """
@@ -89,43 +91,47 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_w
             log_last_price, and log(BMA) at the last boundary of the day.
     """
     filename = os.path.basename(csv_path)
-    date_parts = filename.split('-')
+    date_parts = filename.split("-")
     date_str = f"{date_parts[-3]}-{date_parts[-2]}-{date_parts[-1].split('.')[0]}"
-    dt = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     midnight = int(dt.timestamp())
 
     day_seconds = 24 * 3600
     num_intervals = int(day_seconds // x_seconds)
 
     df = pd.read_csv(csv_path, header=None, usecols=[1, 5])
-    df = df.rename(columns={1: 'price', 5: 'timestamp_us'})
-    df['price'] = pd.to_numeric(df['price'], errors='coerce')
-    df['timestamp_us'] = pd.to_numeric(df['timestamp_us'], errors='coerce')
-    df = df.dropna(subset=['price', 'timestamp_us'])
+    df = df.rename(columns={1: "price", 5: "timestamp_us"})
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["timestamp_us"] = pd.to_numeric(df["timestamp_us"], errors="coerce")
+    df = df.dropna(subset=["price", "timestamp_us"])
 
     if df.empty:
-        bar_starts = np.arange(midnight, midnight + day_seconds, x_seconds, dtype=np.int64)
-        return pd.DataFrame({
-            'datetime':        pd.to_datetime(bar_starts, unit='s'),
-            'log_return':      np.nan,
-            'log_first_price': np.nan,
-            'log_last_price':  np.nan,
-        }), prev_log_last
+        bar_starts = np.arange(
+            midnight, midnight + day_seconds, x_seconds, dtype=np.int64
+        )
+        return pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(bar_starts, unit="s"),
+                "log_return": np.nan,
+                "log_first_price": np.nan,
+                "log_last_price": np.nan,
+            }
+        ), prev_log_last
 
-    df['timestamp_us'] = df['timestamp_us'].astype(np.int64)
+    df["timestamp_us"] = df["timestamp_us"].astype(np.int64)
     # Binance uses μs in recent data (~1.7e15) and ms in older data (~1.7e12).
-    sample_ts = int(df['timestamp_us'].iloc[0])
+    sample_ts = int(df["timestamp_us"].iloc[0])
     if sample_ts > 1e15:
-        df['timestamp_s'] = df['timestamp_us'] // 1_000_000
+        df["timestamp_s"] = df["timestamp_us"] // 1_000_000
     else:
-        df['timestamp_s'] = df['timestamp_us'] // 1_000
-    df = df.sort_values('timestamp_s')
+        df["timestamp_s"] = df["timestamp_us"] // 1_000
+    df = df.sort_values("timestamp_s")
 
-    ts_arr  = df['timestamp_s'].values.astype(np.int64)
-    px_arr  = df['price'].values.astype(np.float64)
+    ts_arr = df["timestamp_s"].values.astype(np.int64)
+    px_arr = df["price"].values.astype(np.float64)
 
     # Bar boundaries: t_k = midnight + k * x_seconds, k = 0 .. num_intervals
-    boundaries = (midnight + np.arange(num_intervals + 1, dtype=np.int64) * x_seconds)
+    boundaries = midnight + np.arange(num_intervals + 1, dtype=np.int64) * x_seconds
     window_secs = int(kernel_half_width)  # backward window width in seconds
 
     # Vectorised BMA computation via cumsum + searchsorted.
@@ -134,11 +140,11 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_w
     cum_sum[0] = 0.0
     np.cumsum(px_arr, out=cum_sum[1:])
 
-    idx_lo = np.searchsorted(ts_arr, boundaries - window_secs, side='left')
-    idx_hi = np.searchsorted(ts_arr, boundaries,               side='right')
-    count  = idx_hi - idx_lo
-    valid  = count > 0
-    bma    = np.full(len(boundaries), np.nan)
+    idx_lo = np.searchsorted(ts_arr, boundaries - window_secs, side="left")
+    idx_hi = np.searchsorted(ts_arr, boundaries, side="right")
+    count = idx_hi - idx_lo
+    valid = count > 0
+    bma = np.full(len(boundaries), np.nan)
     bma[valid] = (cum_sum[idx_hi[valid]] - cum_sum[idx_lo[valid]]) / count[valid]
 
     # Seed the midnight boundary with the previous day's BMA when no trades fall
@@ -152,26 +158,37 @@ def aggregate_log_returns(csv_path, x_seconds, prev_log_last=None, kernel_half_w
 
     if np.any(~np.isfinite(bma)) or np.all(bma <= 0):
         bar_starts = boundaries[:-1]
-        return pd.DataFrame({
-            'datetime':        pd.to_datetime(bar_starts, unit='s'),
-            'log_return':      np.nan,
-            'log_first_price': np.nan,
-            'log_last_price':  np.nan,
-        }), prev_log_last
+        return pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(bar_starts, unit="s"),
+                "log_return": np.nan,
+                "log_first_price": np.nan,
+                "log_last_price": np.nan,
+            }
+        ), prev_log_last
 
     log_bma = np.log(bma)
     log_first = log_bma[:-1]
-    log_last  = log_bma[1:]
+    log_last = log_bma[1:]
 
-    return pd.DataFrame({
-        'datetime':        pd.to_datetime(boundaries[:-1], unit='s'),
-        'log_return':      log_last - log_first,
-        'log_first_price': log_first,
-        'log_last_price':  log_last,
-    }), float(log_bma[-1])
+    return pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(boundaries[:-1], unit="s"),
+            "log_return": log_last - log_first,
+            "log_first_price": log_first,
+            "log_last_price": log_last,
+        }
+    ), float(log_bma[-1])
 
 
-def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='data', kernel_half_width=0, trim_quantile=0.0, detrend=1):
+def aggregate_log_returns_range(
+    start_date,
+    end_date,
+    x_seconds,
+    output_dir="data",
+    kernel_half_width=0,
+    trim_quantile=0.0,
+):
     """
     Aggregate log returns for each CSV in a date range and export the combined results.
 
@@ -182,54 +199,52 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
         output_dir: Directory to write the combined CSV file
         kernel_half_width: Kernel width parameter
         trim_quantile: Fraction of data to trim from extremes (e.g., 0.01 for 1%)
-        detrend: 1 to remove a linear trend from log-prices before returning, 0 to leave raw
 
     Returns:
         The combined DataFrame of aggregated log returns for the range.
     """
+
     def _to_datetime(dt_obj):
         if isinstance(dt_obj, str):
-            return datetime.strptime(dt_obj, '%Y-%m-%d')
+            return datetime.strptime(dt_obj, "%Y-%m-%d")
         if isinstance(dt_obj, datetime):
             return dt_obj
-        raise TypeError('start_date and end_date must be datetime or YYYY-MM-DD string')
+        raise TypeError("start_date and end_date must be datetime or YYYY-MM-DD string")
 
     start_dt = _to_datetime(start_date)
     end_dt = _to_datetime(end_date)
 
     if start_dt > end_dt:
-        raise ValueError('start_date must be less than or equal to end_date')
+        raise ValueError("start_date must be less than or equal to end_date")
 
     os.makedirs(output_dir, exist_ok=True)
 
-    trim_tag = f'_trim{trim_quantile}' if trim_quantile > 0 else ''
-    kernel_tag = f'_k{kernel_half_width}' if kernel_half_width > 0 else ''
-    detrend_tag = '_detrended' if detrend else ''
+    trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
+    kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
     output_file = os.path.join(
         output_dir,
-        f'ETHUSDT-aggReturns-{start_dt.strftime("%Y-%m-%d")}_to_{end_dt.strftime("%Y-%m-%d")}'
-        f'-{x_seconds}sec{kernel_tag}{trim_tag}{detrend_tag}.csv',
+        f"ETHUSDT-aggReturns-{start_dt.strftime('%Y-%m-%d')}_to_{end_dt.strftime('%Y-%m-%d')}"
+        f"-{x_seconds}sec{kernel_tag}{trim_tag}.csv",
     )
     if os.path.exists(output_file):
-        cached = pd.read_csv(output_file, parse_dates=['datetime'])
+        cached = pd.read_csv(output_file, parse_dates=["datetime"])
         return cached
     else:
-
         current = start_dt
         combined_frames = []
 
         prev_log_last = None
         while current <= end_dt:
-            date_str = current.strftime('%Y-%m-%d')
-            csv_path = os.path.join(output_dir, f'ETHUSDT-aggTrades-{date_str}.csv')
+            date_str = current.strftime("%Y-%m-%d")
+            csv_path = os.path.join(output_dir, f"ETHUSDT-aggTrades-{date_str}.csv")
             if not os.path.exists(csv_path):
-                raise FileNotFoundError(f'Missing required CSV file: {csv_path}')
+                raise FileNotFoundError(f"Missing required CSV file: {csv_path}")
 
             daily_df, prev_log_last = aggregate_log_returns(
-                csv_path, 
-                x_seconds, 
-                prev_log_last=prev_log_last, 
-                kernel_half_width=kernel_half_width
+                csv_path,
+                x_seconds,
+                prev_log_last=prev_log_last,
+                kernel_half_width=kernel_half_width,
             )
             combined_frames.append(daily_df)
             current += timedelta(days=1)
@@ -237,83 +252,71 @@ def aggregate_log_returns_range(start_date, end_date, x_seconds, output_dir='dat
         if combined_frames:
             combined_df = pd.concat(combined_frames, ignore_index=True)
         else:
-            combined_df = pd.DataFrame(columns=['datetime', 'log_return'])
+            combined_df = pd.DataFrame(columns=["datetime", "log_return"])
 
         # Validate evenly spaced intervals across the full stacked range
         if not combined_df.empty:
-            if not combined_df['datetime'].is_monotonic_increasing:
-                raise ValueError('Combined datetime values are not strictly increasing.')
-
-            interval_seconds = combined_df['datetime'].diff().dt.total_seconds().iloc[1:]
-            if not np.allclose(interval_seconds, x_seconds, atol=1e-6):
-                bad_index = interval_seconds[~np.isclose(interval_seconds, x_seconds, atol=1e-6)].index[0]
-                bad_start = combined_df.loc[bad_index - 1, 'datetime']
-                bad_end = combined_df.loc[bad_index, 'datetime']
+            if not combined_df["datetime"].is_monotonic_increasing:
                 raise ValueError(
-                    f'Uneven interval spacing detected between {bad_start} and {bad_end}: '
-                    f'{interval_seconds.iloc[bad_index-1]} seconds (expected {x_seconds})'
+                    "Combined datetime values are not strictly increasing."
                 )
-            
+
+            interval_seconds = (
+                combined_df["datetime"].diff().dt.total_seconds().iloc[1:]
+            )
+            if not np.allclose(interval_seconds, x_seconds, atol=1e-6):
+                bad_index = interval_seconds[
+                    ~np.isclose(interval_seconds, x_seconds, atol=1e-6)
+                ].index[0]
+                bad_start = combined_df.loc[bad_index - 1, "datetime"]
+                bad_end = combined_df.loc[bad_index, "datetime"]
+                raise ValueError(
+                    f"Uneven interval spacing detected between {bad_start} and {bad_end}: "
+                    f"{interval_seconds.iloc[bad_index - 1]} seconds (expected {x_seconds})"
+                )
+
         # Trim extreme log prices if requested
         if trim_quantile > 0 and not combined_df.empty:
-            lower_q = combined_df['log_first_price'].quantile(trim_quantile / 2)
-            upper_q = combined_df['log_first_price'].quantile(1 - trim_quantile / 2)
-            combined_df = combined_df[(combined_df['log_first_price'] >= lower_q) & 
-                                    (combined_df['log_first_price'] <= upper_q)].copy()    
-                
-        # Detrend the *drift*, not the price level. We compute the per-bar
-        # drift mu_w = mean(diff(log_first_price)) within the window and
-        # subtract mu_w * (k - k_mean) from both log-price columns. That
-        # operation:
-        #   - leaves the within-window mean log-price intact (well positions
-        #     in absolute log-price space are preserved),
-        #   - zeroes the mean of dx = diff(log_first_price) within the
-        #     window (the drift is demeaned),
-        #   - keeps log_return = log_last_price - log_first_price unchanged
-        #     (the same shift is applied to both columns).
-        if detrend and not combined_df.empty:
-            valid_first = combined_df['log_first_price'].notna()
-            if int(valid_first.sum()) >= 2:
-                x_first = combined_df.loc[valid_first, 'log_first_price'].to_numpy()
-                mean_dx = float(np.mean(np.diff(x_first)))   # per-bar drift
-                t = np.arange(len(combined_df), dtype=np.float64)
-                k_mean = float(t[valid_first].mean())
-                adjustment = mean_dx * (t - k_mean)
-                for col in ('log_first_price', 'log_last_price'):
-                    combined_df[col] = combined_df[col] - adjustment
-                combined_df['log_return'] = (
-                    combined_df['log_last_price'] - combined_df['log_first_price']
-                )
-
+            lower_q = combined_df["log_first_price"].quantile(trim_quantile / 2)
+            upper_q = combined_df["log_first_price"].quantile(1 - trim_quantile / 2)
+            combined_df = combined_df[
+                (combined_df["log_first_price"] >= lower_q)
+                & (combined_df["log_first_price"] <= upper_q)
+            ].copy()
 
         combined_df.to_csv(output_file, index=False)
         return combined_df
+
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
+
 def _aggregated_returns_path(
-    start_date, end_date, seconds_interval,
-    kernel_half_width, trim_quantile, detrend,
-    data_dir='data',
+    start_date,
+    end_date,
+    seconds_interval,
+    kernel_half_width,
+    trim_quantile,
+    data_dir="data",
 ):
     """Path of the cached aggregated-returns CSV per data_collection naming."""
+
     def _to_dt(d):
         if isinstance(d, str):
-            return datetime.strptime(d, '%Y-%m-%d')
+            return datetime.strptime(d, "%Y-%m-%d")
         return d
 
     start_dt = _to_dt(start_date)
     end_dt = _to_dt(end_date)
-    kernel_tag = f'_k{kernel_half_width}' if kernel_half_width > 0 else ''
-    trim_tag = f'_trim{trim_quantile}' if trim_quantile > 0 else ''
-    detrend_tag = '_detrended' if detrend else ''
+    kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
+    trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
     return os.path.join(
         data_dir,
-        f'ETHUSDT-aggReturns-{start_dt.strftime("%Y-%m-%d")}_to_'
-        f'{end_dt.strftime("%Y-%m-%d")}-{seconds_interval}sec'
-        f'{kernel_tag}{trim_tag}{detrend_tag}.csv',
+        f"ETHUSDT-aggReturns-{start_dt.strftime('%Y-%m-%d')}_to_"
+        f"{end_dt.strftime('%Y-%m-%d')}-{seconds_interval}sec"
+        f"{kernel_tag}{trim_tag}.csv",
     )
 
 
@@ -323,7 +326,6 @@ def load_series(
     seconds_interval,
     kernel_half_width=5,
     trim_quantile=0.01,
-    detrend=0,
     window_type=None,
 ):
     """
@@ -333,17 +335,13 @@ def load_series(
 
     Two operating modes:
 
-    - ``window_type is None`` (legacy): a single whole-range aggregated CSV
+    - ``window_type is None``: a single whole-range aggregated CSV
       produced by ``dc.aggregate_log_returns_range(start, end, ...)`` is read.
-      Detrending (when enabled at aggregation time) is applied globally.
 
     - ``window_type='weekly'|'biweekly'|'monthly'``: the per-window CSVs
       produced by Phase A's per-window aggregation are read and concatenated
-      in time order. With ``detrend=1`` each window's linear trend has been
-      removed *within* that window only, so the concatenated log-price series
-      is locally detrended. Cross-window dx are dropped via a window_idx tag
-      so a jump between two independently-detrended windows cannot leak into
-      the SDE M-step.
+      in time order. Cross-window dx are dropped via a window_idx tag so a
+      jump between two windows cannot leak into the SDE M-step.
 
     Returns
     -------
@@ -354,76 +352,87 @@ def load_series(
     """
     if window_type is None:
         cached_path = _aggregated_returns_path(
-            start_date, end_date, seconds_interval,
-            kernel_half_width, trim_quantile, detrend,
+            start_date,
+            end_date,
+            seconds_interval,
+            kernel_half_width,
+            trim_quantile,
         )
         if os.path.exists(cached_path):
-            df = pd.read_csv(cached_path, parse_dates=['datetime'])
+            df = pd.read_csv(cached_path, parse_dates=["datetime"])
             if df.empty:
                 df = aggregate_log_returns_range(
-                    start_date, end_date, seconds_interval,
+                    start_date,
+                    end_date,
+                    seconds_interval,
                     kernel_half_width=kernel_half_width,
                     trim_quantile=trim_quantile,
-                    detrend=detrend,
                 )
         else:
             df = aggregate_log_returns_range(
-                start_date, end_date, seconds_interval,
+                start_date,
+                end_date,
+                seconds_interval,
                 kernel_half_width=kernel_half_width,
                 trim_quantile=trim_quantile,
-                detrend=detrend,
             )
         if df.empty:
-            raise ValueError('Empty aggregated returns dataframe.')
-        df = df.sort_values('datetime').reset_index(drop=True)
-        df['__window_idx'] = 0
+            raise ValueError("Empty aggregated returns dataframe.")
+        df = df.sort_values("datetime").reset_index(drop=True)
+        df["__window_idx"] = 0
     else:
         from regime_estimation import iter_windows
+
         frames = []
         for w_idx, (window_start, window_end) in enumerate(
             iter_windows(start_date, end_date, window_type)
         ):
             cached_path = _aggregated_returns_path(
-                window_start, window_end, seconds_interval,
-                kernel_half_width, trim_quantile, detrend,
+                window_start,
+                window_end,
+                seconds_interval,
+                kernel_half_width,
+                trim_quantile,
             )
             if os.path.exists(cached_path):
-                df_w = pd.read_csv(cached_path, parse_dates=['datetime'])
+                df_w = pd.read_csv(cached_path, parse_dates=["datetime"])
                 if df_w.empty:
                     df_w = aggregate_log_returns_range(
-                        window_start, window_end, seconds_interval,
+                        window_start,
+                        window_end,
+                        seconds_interval,
                         kernel_half_width=kernel_half_width,
                         trim_quantile=trim_quantile,
-                        detrend=detrend,
                     )
             else:
                 df_w = aggregate_log_returns_range(
-                    window_start, window_end, seconds_interval,
+                    window_start,
+                    window_end,
+                    seconds_interval,
                     kernel_half_width=kernel_half_width,
                     trim_quantile=trim_quantile,
-                    detrend=detrend,
                 )
             if df_w is None or df_w.empty:
                 continue
             df_w = df_w.copy()
-            df_w['__window_idx'] = w_idx
+            df_w["__window_idx"] = w_idx
             frames.append(df_w)
         if not frames:
             raise ValueError(
-                f'No per-window aggregated CSVs available for '
-                f'{start_date}..{end_date} at {seconds_interval}s '
-                f'({window_type}).'
+                f"No per-window aggregated CSVs available for "
+                f"{start_date}..{end_date} at {seconds_interval}s "
+                f"({window_type})."
             )
-        df = pd.concat(frames, ignore_index=True).sort_values('datetime')
+        df = pd.concat(frames, ignore_index=True).sort_values("datetime")
         df = df.reset_index(drop=True)
 
-    x = df['log_first_price'].values.astype(float)
-    ts = pd.to_datetime(df['datetime']).values
-    win_idx = df['__window_idx'].values.astype(int)
+    x = df["log_first_price"].values.astype(float)
+    ts = pd.to_datetime(df["datetime"]).values
+    win_idx = df["__window_idx"].values.astype(int)
 
-    dt_arr = (np.diff(ts) / np.timedelta64(1, 's')).astype(float)
+    dt_arr = (np.diff(ts) / np.timedelta64(1, "s")).astype(float)
     finite = np.isfinite(np.diff(x)) & np.isfinite(x[:-1])
-    same_window = (win_idx[:-1] == win_idx[1:])
+    same_window = win_idx[:-1] == win_idx[1:]
     valid = (dt_arr > 0) & (dt_arr <= 1.5 * seconds_interval) & finite & same_window
 
     x_prev = x[:-1][valid]
@@ -434,6 +443,7 @@ def load_series(
 
 
 ## Change 4 — EMA drift demeaning
+
 
 def ema_demean_drift(r, dt_t, halflife_days=14.0):
     """
@@ -475,28 +485,32 @@ def ema_demean_drift(r, dt_t, halflife_days=14.0):
     r = np.asarray(r, dtype=float)
     if halflife_days is None or not np.isfinite(halflife_days) or halflife_days <= 0:
         return r.copy(), np.zeros_like(r)
-    halflife_str = f'{halflife_days * 24 * 3600:.0f}s'
+    halflife_str = f"{halflife_days * 24 * 3600:.0f}s"
     r_series = pd.Series(r, index=pd.to_datetime(dt_t))
     r_bar_series = r_series.ewm(
         halflife=halflife_str,
         times=r_series.index,
-        adjust=False,   # causal: no future data used
+        adjust=False,  # causal: no future data used
     ).mean()
 
     r_bar = r_bar_series.values
     r_hat = r - r_bar
     return r_hat, r_bar
 
+
 # ---------------------------------------------------------------------------
 # Useful tool
 # ---------------------------------------------------------------------------
 
+
 def window_seconds(window_type):
-    if window_type == 'weekly':
+    if window_type == "weekly":
         return 7 * 24 * 3600
-    elif window_type == 'biweekly':
+    elif window_type == "biweekly":
         return 14 * 24 * 3600
-    elif window_type == 'monthly':
+    elif window_type == "monthly":
         return 30 * 24 * 3600
     else:
-        raise ValueError(f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'.")
+        raise ValueError(
+            f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'."
+        )
