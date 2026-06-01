@@ -1,33 +1,38 @@
 """
-backtest_jumps.py — self-contained backtest: train GP, replay eval period,
-detect well-jumps on price, test whether topology signals predicted them.
+backtest_jumps.py — self-contained backtest of Kalman-GP topology signals as
+predictors of ETH price well-jumps.
 
-MODEL FIDELITY
---------------
-The training phase (Phase 3) replicates RunGP.py exactly:
-  • Phase A: 30 s KM estimation per monthly window → KM CSVs cached to
-    REGIME_OUTPUT_DIR (shared with RunGP.py; fast path used if already on disk)
-  • spatial_var derived from KM drift-bin variance via compute_km_spatial_var
-    (same function as RunGP.py; SPATIAL_VAR_FIXED used as fallback)
-  • sigma2 from var(r_hat * dt) / dt on 900 s training data
-  • sl_init = (x_hi - x_lo) / (3 * N_INDUCING)
-  • Sequential Kalman updates: monthly-window loop, weekly sub-batch reproject
-    (30-day rolling x-range) — identical to RunGP.py Step 8
+STRUCTURE
+---------
+There is a single continuous GP run from BURN_IN_START to BACKTEST_END:
 
-The eval phase uses daily_replay (same method as find_well_jumps.py), which
-continues the trained model state day by day from EVAL_START and records
-topology at each day.
+  [BURN_IN_START, BACKTEST_START)  — burn-in: model warms up, no topology
+                                     recorded, no events classified.
+  [BACKTEST_START, BACKTEST_END]   — backtest: topology recorded every day,
+                                     well-jumps detected, signals evaluated.
+
+The same daily_replay loop runs over the entire period; BACKTEST_START is
+passed as record_from so burn-in days advance model state but produce no
+output.  There is no separate train/eval split and no model state reset at
+BACKTEST_START.
+
+GP INITIALISATION
+-----------------
+  • KM (Phase A) runs on KM_INIT_MONTHS of data ending the day before
+    BURN_IN_START.  This period is used ONLY to compute spatial_var for the
+    GP prior; the GP itself does not see this data.
+  • spatial_var = Var[KM annualised drift bins] (SPATIAL_VAR_FIXED if unusable)
+  • sigma2 from var(r_hat * dt) / dt estimated from the first few days of burn-in
+  • sl_init = (x_hi - x_lo) / (3 * N_INDUCING) over the KM init x-range
+  • KM CSVs are written to a backtest-local subdirectory (REGIME_OUTPUT_DIR)
+    and are not shared with RunGP.py.
 
 DATA-LEAKAGE GUARANTEE
 -----------------------
-1. The GP model is initialised and warmed only on [TRAIN_START, TRAIN_END].
-2. The eval replay processes days strictly in chronological order.  Topology
-   at day d uses data up to and including d, nothing later.
-3. Jump labels use a price-only geometric criterion (rolling range + displacement
+1. The GP runs strictly forward in time; topology at day d uses data ≤ d only.
+2. Jump labels use a price-only geometric criterion (rolling range + displacement
    thresholds) with no reference to any topology signal.
-4. After writing the topology CSV and events CSV, ALL model / array state is
-   explicitly deleted before the backtest analysis begins.  The analysis reads
-   only from the two CSV files.
+3. The backtest analysis reads only from the two CSV files written by the GP run.
 
 SIGNALS TESTED
 --------------
@@ -37,11 +42,9 @@ SIGNALS TESTED
   slope_z_barrier_mean  — trend: OLS z-stat of barrier_mean (negative = declining)
   slope_z_barrier_snr   — trend: OLS z-stat of barrier_snr  (negative = declining)
 
-barrier_mean as a raw level is NOT a signal — only its rate of decline is.
-
-OUTPUTS  (all under BACKTEST_DIR / {eval_tag}/)
+OUTPUTS  (all under BACKTEST_DIR / {backtest_tag}/)
 -------
-  daily_topology.csv    — day-by-day topology across the eval period
+  daily_topology.csv    — day-by-day topology across [BACKTEST_START, BACKTEST_END]
   events.csv            — detected well-jump events
   per_event.csv         — signal values at each (event, offset) pair
   null_samples.csv      — same schema for null (calm) dates
@@ -68,9 +71,7 @@ from data_collection import load_series
 from phase_GP import KalmanGPDriftModel, daily_replay, _SEC_PER_YEAR
 from regime_estimation import (
     iter_windows,
-    normalize_window_boundaries,
     run_phase_a,
-    print_regime_table,
 )
 from RunGP import compute_km_spatial_var
 
@@ -79,36 +80,38 @@ from RunGP import compute_km_spatial_var
 # CONFIGURATION
 # =============================================================================
 
-# --- Date ranges -------------------------------------------------------------
-# Training / burn-in: GP is fitted here; NO topology recorded; NO events here.
-TRAIN_START = datetime(2024, 1, 1)
-TRAIN_END = datetime(2024, 6, 30)
+# --- Backtest period ---------------------------------------------------------
+# Burn-in: GP runs but topology is NOT recorded and events are NOT classified.
+BURN_IN_START = datetime(2025, 1, 1)  # first day the GP runs
+BACKTEST_START = datetime(2025, 7, 1)  # first day topology is recorded
+BACKTEST_END = datetime(2026, 3, 31)  # last day
 
-# Evaluation: GP continues from TRAIN_END state; topology recorded every day;
-# well-jumps detected; backtest signals evaluated.
-EVAL_START = datetime(2024, 7, 1)
-EVAL_END = datetime(2026, 3, 31)
+# --- KM initialisation data --------------------------------------------------
+# Phase A (KM) runs on this period to estimate spatial_var for the GP prior.
+# It ends the day before BURN_IN_START; the GP itself never sees this data.
+KM_INIT_MONTHS = 12  # months of history to use for KM
+# KM_INIT_END and KM_INIT_START are derived in code from BURN_IN_START.
 
-# --- Phase A (KM) — must match RunGP.py exactly ------------------------------
-PHASE_A_SI = 30  # seconds interval for KM estimation
+# --- Phase A (KM) ------------------------------------------------------------
+PHASE_A_SI = 30  # aggregation interval for KM estimation (seconds)
 KERNEL_HW_PHASE_A = 3  # kernel half-width for Phase A
 N_BINS = 200  # KM histogram bins
 WEIGHT_THRESHOLD = 5  # min weight for KM bin to be included
 MIN_BARRIER_FRACTION = 0.1  # min barrier / well-depth fraction
 MIN_WELL_SEPARATION = 0.0  # min log-price gap between KM wells
-REGIME_OUTPUT_DIR = "regime_results"  # shared with RunGP.py (cached)
+REGIME_OUTPUT_DIR = "regime_results"  # KM CSVs written here (backtest-local)
 
-# --- GP config — must match RunGP.py exactly ---------------------------------
-PHASE_GP_SI = 1200  # aggregation interval in seconds
-KERNEL_HW = 50  # kernel half-width for KM
+# --- GP config ---------------------------------------------------------------
+PHASE_GP_SI = 900  # aggregation interval for the GP (seconds)
+KERNEL_HW = 1  # kernel half-width for 900 s aggregation
 TRIM_QUANTILE = 0.01  # trim extreme micro-returns
-N_INDUCING = 10  # inducing points
+N_INDUCING = 20  # inducing points
 TEMPORAL_LS_DAYS = 5.0  # Matern temporal lengthscale (days)
 SPATIAL_LENGTHSCALE_INIT = None  # None → (x_hi-x_lo)/(3*N_INDUCING)
-SPATIAL_VAR_FIXED = 300.0  # fallback if KM variance unusable
-SIGMA2 = None  # None → var(r_hat*dt)/dt from training data
+SPATIAL_VAR_FIXED = 300.0  # fallback spatial_var if KM result unusable
+SIGMA2 = None  # None → var(r_hat*dt)/dt from burn-in data
 USE_REPROJECT = True
-REPROJECT_WINDOW_DAYS = 30  # trailing days for rolling x-range
+REPROJECT_WINDOW_DAYS = 30  # trailing days for rolling x-range reproject
 
 # --- Topology ----------------------------------------------------------------
 N_GRID = 200
@@ -123,8 +126,8 @@ JUMP_THR = 0.12  # displacement from anchor > this → "jumping"
 SETTLE_DAYS = 5  # consecutive stable days needed to declare new well
 
 # --- Backtest analysis -------------------------------------------------------
-OFFSETS = [-1]  # days before jump_start to sample
-TREND_WINDOW = 7  # look-back for slope-z statistics
+OFFSETS = [-1]  # days before jump_start to sample signals
+TREND_WINDOW = 10  # look-back for slope-z statistics (must be ≥ 4 for _slope_z)
 NULL_BUFFER_DAYS = 14  # calm date must be ≥ this far from any jump
 NULL_SAMPLE_SIZE = 200  # null draws per offset
 
@@ -154,60 +157,63 @@ ALT_HYPOTHESIS = {
 
 
 # =============================================================================
-# PHASE 1 — build GP model and replay
+# GP RUN + BACKTEST REPLAY
 # =============================================================================
 
 
-def _train_and_replay(console: Console, rng, out_dir: str) -> tuple[str, str]:
-    """Train GP on [TRAIN_START, TRAIN_END] (mirrors RunGP.py exactly), then
-    replay [EVAL_START, EVAL_END] day-by-day to record topology.
+def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
+    """Run the Kalman-GP over [BURN_IN_START, BACKTEST_END] as a single loop.
+
+    Burn-in [BURN_IN_START, BACKTEST_START) advances the model state but does
+    not record topology and is not used for jump classification.
+
+    KM (Phase A) is run on [KM_INIT_START, KM_INIT_END] — one year of data
+    ending the day before BURN_IN_START — solely to compute spatial_var for
+    the GP prior.  The GP itself never receives those observations.
 
     Writes:
-      {out_dir}/daily_topology.csv
+      {out_dir}/daily_topology.csv   (BACKTEST_START → BACKTEST_END only)
       {out_dir}/events.csv
-
-    Explicitly deletes all GP / array state before returning so the analysis
-    phase cannot accidentally access in-memory model output.
 
     Returns (daily_path, events_path).
     """
+    from dateutil.relativedelta import relativedelta
+
+    km_init_end = BURN_IN_START - pd.Timedelta(days=1)
+    km_init_start = BURN_IN_START - relativedelta(months=KM_INIT_MONTHS)
+    console.print(
+        f"[bold]Backtest run[/bold]  "
+        f"KM init=[{km_init_start.date()}, {km_init_end.date()}]  "
+        f"burn-in=[{BURN_IN_START.date()}, {BACKTEST_START.date()})  "
+        f"backtest=[{BACKTEST_START.date()}, {BACKTEST_END.date()}]  "
+        f"→ {out_dir}/"
+    )
+
     # ---- Step 1: download ---------------------------------------------------
     console.rule("[bold cyan]Step 1 — Download raw data")
-    dc.ensure_data(TRAIN_START, EVAL_END)
+    dc.ensure_data(km_init_start, BACKTEST_END)
 
-    # ---- Step 2: aggregate at both intervals for TRAIN period ---------------
-    console.rule("[bold cyan]Step 2 — Aggregate log-returns")
-    train_snapped, _ = normalize_window_boundaries(
-        TRAIN_START, TRAIN_END, "monthly", console=console
-    )
-    _, train_end_snapped = normalize_window_boundaries(
-        TRAIN_START, TRAIN_END, "monthly", console=console
-    )
-
-    for si in sorted({PHASE_A_SI, PHASE_GP_SI}):
+    # ---- Step 2: aggregate 900s GP returns (per monthly window) -------------
+    # The filename encodes KERNEL_HW so changing it invalidates the cache and
+    # forces re-aggregation.  load_series in Step 5 reads these files directly.
+    console.rule("[bold cyan]Step 2 — Aggregate 900 s log-returns")
+    for _w_start, _w_end in iter_windows(BURN_IN_START, BACKTEST_END, "monthly"):
         dc.aggregate_log_returns_range(
-            train_snapped,
-            train_end_snapped,
-            si,
-            kernel_half_width=KERNEL_HW if si == PHASE_GP_SI else KERNEL_HW_PHASE_A,
+            _w_start,
+            _w_end,
+            PHASE_GP_SI,
+            kernel_half_width=KERNEL_HW,
             trim_quantile=TRIM_QUANTILE,
         )
-    # Aggregate 900 s for eval period too
-    dc.aggregate_log_returns_range(
-        EVAL_START,
-        EVAL_END,
-        PHASE_GP_SI,
-        kernel_half_width=KERNEL_HW,
-        trim_quantile=TRIM_QUANTILE,
-    )
 
-    # ---- Step 3: Phase A (KM bins) on TRAINING data -------------------------
+    # ---- Step 3: Phase A (KM) on initialisation period ---------------------
     console.rule(
-        "[bold cyan]Step 3 — Phase A (KM bins + regime labels) on training data"
+        f"[bold cyan]Step 3 — Phase A (KM) on init period "
+        f"[{km_init_start.date()} → {km_init_end.date()}]"
     )
-    labels_df = run_phase_a(
-        TRAIN_START,
-        TRAIN_END,
+    run_phase_a(
+        km_init_start,
+        km_init_end,
         PHASE_A_SI,
         kernel_half_width=KERNEL_HW_PHASE_A,
         trim_quantile=TRIM_QUANTILE,
@@ -219,40 +225,63 @@ def _train_and_replay(console: Console, rng, out_dir: str) -> tuple[str, str]:
         output_dir=REGIME_OUTPUT_DIR,
         console=console,
     )
-    print_regime_table(labels_df, console=console)
 
-    # ---- Step 4: load 900 s training series ---------------------------------
-    console.rule("[bold cyan]Step 4 — Load 900 s training series")
-    x_train, dx_train, dt_step, dt_t_train = load_series(
-        train_snapped,
-        train_end_snapped,
+    # ---- Step 4: prepare KM window list ------------------------------------
+    console.rule("[bold cyan]Step 4 — Prepare KM window list and x_range")
+    km_windows = list(iter_windows(km_init_start, km_init_end, "monthly"))
+    km_dir = os.path.join(REGIME_OUTPUT_DIR, "km")
+    console.print(f"  {len(km_windows)} monthly windows over KM init period")
+    # Load 30s log-prices from the KM init period (aggregated per window by
+    # run_phase_a above) purely to derive the x_range used to filter KM drift bins.
+    x_km, _, _, _ = load_series(
+        km_init_start,
+        km_init_end,
+        PHASE_A_SI,
+        kernel_half_width=KERNEL_HW_PHASE_A,
+        trim_quantile=TRIM_QUANTILE,
+        window_type="monthly",
+    )
+    x_lo_km = float(np.percentile(x_km, 1))
+    x_hi_km = float(np.percentile(x_km, 99))
+    x_range_km = (x_lo_km, x_hi_km)
+    del x_km
+    console.print(f"  x_range(KM init)={x_range_km}")
+
+    # ---- Step 5: load 900 s series for the full GP run ----------------------
+    console.rule(
+        f"[bold cyan]Step 5 — Load 900 s series "
+        f"[{BURN_IN_START.date()} → {BACKTEST_END.date()}]"
+    )
+    x_all, dx_all, dt_step, dt_t_all = load_series(
+        BURN_IN_START,
+        BACKTEST_END,
         PHASE_GP_SI,
         kernel_half_width=KERNEL_HW,
         trim_quantile=TRIM_QUANTILE,
         window_type="monthly",
     )
-    N_train = len(x_train)
-    dt_t_pd = pd.to_datetime(dt_t_train)  # full training timestamp array
-    t_seconds = (dt_t_pd.astype(np.int64) / 1e9).values.astype(float)
-    r_hat = (dx_train / dt_step) * _SEC_PER_YEAR
+    dt_t_pd = pd.to_datetime(dt_t_all)
+    r_hat_all = (dx_all / dt_step) * _SEC_PER_YEAR
+    # x_range for initial inducing grid — derived from burn-in only.
+    # reproject_to_range keeps the grid current throughout the replay.
+    burnin_mask = dt_t_pd < pd.Timestamp(BACKTEST_START)
+    x_burnin = x_all[burnin_mask]
+    x_lo_g = float(np.percentile(x_burnin, 1))
+    x_hi_g = float(np.percentile(x_burnin, 99))
+    x_range_global = (x_lo_g, x_hi_g)
     console.print(
-        f"  N={N_train}  dt={dt_step:.0f}s  "
-        f"r_hat mean={r_hat.mean():+.3e}/yr  std={r_hat.std():.3e}/yr"
+        f"  N={len(x_all)}  dt={dt_step:.0f}s  x_range(inducing init)={x_range_global}  "
+        f"r_hat mean={r_hat_all.mean():+.3e}/yr  std={r_hat_all.std():.3e}/yr"
     )
 
-    # ---- Step 5: determine spatial_var from KM ------------------------------
-    console.rule("[bold cyan]Step 5 — Determine spatial_var from KM")
-    x_lo_g = float(np.percentile(x_train, 1))
-    x_hi_g = float(np.percentile(x_train, 99))
-    x_range_global = (x_lo_g, x_hi_g)
-
-    train_windows = list(iter_windows(train_snapped, train_end_snapped, "monthly"))
-    km_dir = os.path.join(REGIME_OUTPUT_DIR, "km")
+    # spatial_var from KM bins filtered to the KM init period x_range
     sp_var = compute_km_spatial_var(
         km_dir,
-        train_windows,
+        km_windows,
         PHASE_A_SI,
-        x_range=x_range_global,
+        x_range=x_range_km,
+        kernel_half_width=KERNEL_HW_PHASE_A,
+        trim_quantile=TRIM_QUANTILE,
         console=console,
     )
     if sp_var is None or sp_var < 1.0:
@@ -260,13 +289,7 @@ def _train_and_replay(console: Console, rng, out_dir: str) -> tuple[str, str]:
         console.print(
             f"[yellow]  KM var unusable; using fallback spatial_var={sp_var}[/yellow]"
         )
-
-    sigma2 = SIGMA2 if SIGMA2 is not None else float(np.var(r_hat * dt_step) / dt_step)
-    obs_noise = sigma2 / dt_step
-    console.print(
-        f"  spatial_var={sp_var:.4g}  sigma2={sigma2:.4g}  "
-        f"obs_noise={obs_noise:.4g}  GP_SNR={sp_var / obs_noise:.4g}"
-    )
+    console.print(f"  spatial_var={sp_var:.4g}")
 
     # ---- Step 6: initialise model -------------------------------------------
     console.rule("[bold cyan]Step 6 — Initialise Kalman-GP model")
@@ -275,6 +298,17 @@ def _train_and_replay(console: Console, rng, out_dir: str) -> tuple[str, str]:
         if SPATIAL_LENGTHSCALE_INIT is not None
         else (x_hi_g - x_lo_g) / (3 * max(N_INDUCING, 1))
     )
+    r_hat_burnin = r_hat_all[burnin_mask]  # burnin_mask computed in Step 5
+    sigma2 = (
+        SIGMA2
+        if SIGMA2 is not None
+        else float(np.var(r_hat_burnin * dt_step) / dt_step)
+    )
+    obs_noise = sigma2 / dt_step
+    console.print(
+        f"  spatial_var={sp_var:.4g}  sigma2={sigma2:.4g}  "
+        f"obs_noise={obs_noise:.4g}  GP_SNR={sp_var / obs_noise:.4g}"
+    )
     model = KalmanGPDriftModel(
         spatial_lengthscale=sl_init,
         temporal_lengthscale_days=TEMPORAL_LS_DAYS,
@@ -282,97 +316,31 @@ def _train_and_replay(console: Console, rng, out_dir: str) -> tuple[str, str]:
         sigma2=sigma2,
         dt=float(dt_step),
     )
-    model.initialise(x_range=x_range_global, n_inducing=N_INDUCING, data_x=x_train)
+    model.initialise(x_range=x_range_global, n_inducing=N_INDUCING, data_x=x_burnin)
     console.print(
         f"  M={model.M}  sl={model.spatial_ls:.4f}  "
         f"tls={model.temporal_ls:.2f}d  sp_var={model.spatial_var:.4g}"
     )
+    del r_hat_all
 
-    # ---- Step 7: HP optimisation — SKIPPED (HP_OPT_MODE='none') -------------
-    console.rule("[bold cyan]Step 7 — HP optimisation SKIPPED (mode=none)")
-
-    # ---- Step 8: sequential Kalman updates — monthly windows, weekly reproject
-    # Identical to RunGP.py Step 8.
+    # ---- Step 7: single daily_replay loop over burn-in + backtest -----------
     console.rule(
-        "[bold cyan]Step 8 — Sequential Kalman updates (monthly windows, weekly reproject)"
+        f"[bold cyan]Step 7 — GP replay  "
+        f"burn-in [{BURN_IN_START.date()}, {BACKTEST_START.date()})  "
+        f"+ backtest [{BACKTEST_START.date()}, {BACKTEST_END.date()}]"
     )
-
-    # Map each 900 s observation to its monthly window index
-    dt_series = pd.Series(dt_t_pd)
-    window_idx = np.full(N_train, -1, dtype=int)
-    for idx, (w_start, w_end) in enumerate(train_windows):
-        mask = (dt_series >= pd.Timestamp(w_start)) & (
-            dt_series < pd.Timestamp(w_end) + pd.Timedelta(days=1)
-        )
-        window_idx[mask.values] = idx
-
-    topo_range = x_range_global  # fallback
-    for idx, (w_start, w_end) in enumerate(train_windows):
-        obs_mask = window_idx == idx
-        if not obs_mask.any():
-            continue
-
-        x_w = x_train[obs_mask]
-        r_hat_w = r_hat[obs_mask]
-        t_w = t_seconds[obs_mask]
-        dt_w_pd = dt_t_pd[obs_mask]
-
-        dt_w_series = pd.Series(dt_w_pd)
-        week_periods = dt_w_series.dt.to_period("W").values
-
-        if USE_REPROJECT:
-            for wk in sorted(set(week_periods)):
-                wk_mask = week_periods == wk
-                x_wk = x_w[wk_mask]
-                r_hat_wk = r_hat_w[wk_mask]
-                t_wk = t_w[wk_mask]
-                dt_wk_last = dt_w_pd[wk_mask].max()
-
-                roll_lo = dt_wk_last - pd.Timedelta(days=REPROJECT_WINDOW_DAYS - 1)
-                roll_mask = (dt_t_pd >= roll_lo) & (dt_t_pd <= dt_wk_last)
-                x_roll = x_train[roll_mask]
-                if len(x_roll) < 2:
-                    x_roll = x_wk
-
-                topo_range = model.reproject_to_range(
-                    float(x_roll.min()), float(x_roll.max()), n_inducing=N_INDUCING
-                )
-                model.update(x_wk, r_hat_wk, t_wk)
-        else:
-            model.update(x_w, r_hat_w, t_w)
-
-        console.print(f"  window {idx}  [{w_start.date()} → {w_end.date()}]  trained")
-
     console.print(
-        f"  Training complete.  Model state at {pd.Timestamp(dt_t_train[-1]).date()}"
+        "  [dim]Burn-in days advance model state; topology recording starts "
+        f"at {BACKTEST_START.date()}[/dim]"
     )
-
-    # ---- Free training arrays (keep model) ----------------------------------
-    del x_train, dx_train, dt_t_train, dt_t_pd, dt_series, r_hat, t_seconds
-    del window_idx, labels_df, train_windows
-    gc.collect()
-
-    # ---- Eval replay: load 900 s eval series and record topology per day ----
-    console.rule(f"[bold cyan]Eval replay  ({EVAL_START.date()} → {EVAL_END.date()})")
-    x_eval, dx_eval, _, dt_t_eval = load_series(
-        EVAL_START,
-        EVAL_END,
-        PHASE_GP_SI,
-        kernel_half_width=KERNEL_HW,
-        trim_quantile=TRIM_QUANTILE,
-        window_type="monthly",
-    )
-    dt_t_eval_pd = pd.to_datetime(dt_t_eval)
-
     rows = []
     for d, topo_d, x_d in daily_replay(
         model,
-        x_eval,
-        dx_eval,
-        dt_t_eval_pd,
+        x_all,
+        dx_all,
+        dt_t_pd,
         dt_step,
-        record_from=EVAL_START,
-        reproject_cadence_days=REPROJECT_WINDOW_DAYS,
+        record_from=BACKTEST_START,
         reproject_window_days=REPROJECT_WINDOW_DAYS,
         n_inducing=N_INDUCING,
         n_grid=N_GRID,
@@ -397,13 +365,15 @@ def _train_and_replay(console: Console, rng, out_dir: str) -> tuple[str, str]:
             f"  barrier={topo_d['barrier_mean']:.3f}±{topo_d['barrier_std']:.3f}"
         )
 
-    # ---- Detect well-jumps on price-only data --------------------------------
-    console.rule("[bold cyan]Phase 5 — Well-jump detection (price-geometric)")
+    # ---- Detect well-jumps on backtest period only --------------------------
+    console.rule(
+        "[bold cyan]Phase — Well-jump detection (price-geometric, backtest period)"
+    )
     daily_df = pd.DataFrame(rows).set_index("date")
     daily_df.index = pd.to_datetime(daily_df.index)
     events_df = _detect_jumps(daily_df, console)
 
-    # ---- Write CSV files -----------------------------------------------------
+    # ---- Write CSV files ----------------------------------------------------
     daily_path = os.path.join(out_dir, "daily_topology.csv")
     events_path = os.path.join(out_dir, "events.csv")
     daily_df.reset_index().to_csv(daily_path, index=False)
@@ -414,12 +384,8 @@ def _train_and_replay(console: Console, rng, out_dir: str) -> tuple[str, str]:
     else:
         console.print("[yellow]  No events detected; wrote empty events.csv[/yellow]")
 
-    # ==========================================================================
-    # EXPLICIT TEARDOWN — nothing model-related survives into the analysis phase
-    # ==========================================================================
-    del model, x_eval, dx_eval, dt_t_eval, dt_t_eval_pd, rows, daily_df, events_df
+    del model, x_all, dx_all, dt_t_all, dt_t_pd, rows, daily_df, events_df
     gc.collect()
-    console.print("[dim]  GP model and all array state cleared from memory.[/dim]")
 
     return daily_path, events_path
 
@@ -521,7 +487,7 @@ def _slope_z(y: np.ndarray) -> tuple[float, float]:
     y = np.asarray(y, dtype=float)
     y = y[np.isfinite(y)]
     n = len(y)
-    if n < 4:
+    if n < 3:
         return float("nan"), float("nan")
     x = np.arange(n, dtype=float)
     x_c = x - x.mean()
@@ -564,6 +530,30 @@ def _sample_signals(daily: pd.DataFrame, date: pd.Timestamp) -> dict | None:
         "slope_z_barrier_mean": z_bm,
         "slope_z_barrier_snr": z_snr,
     }
+
+
+def _bh_correct(pvals: np.ndarray) -> np.ndarray:
+    """Benjamini-Hochberg FDR correction over a 1-D array of p-values.
+
+    NaN entries are passed through unchanged.  The correction uses
+    m = number of finite p-values actually present (not a fixed constant),
+    so it adapts automatically when some tests cannot be run.
+    """
+    out = np.full_like(pvals, np.nan, dtype=float)
+    finite = np.isfinite(pvals)
+    idx = np.where(finite)[0]
+    if len(idx) == 0:
+        return out
+    m = len(idx)
+    # Sort finite p-values ascending; track original positions.
+    order = idx[np.argsort(pvals[idx])]
+    ranks = np.arange(1, m + 1)
+    p_adj = np.minimum(1.0, pvals[order] * m / ranks)
+    # Enforce monotone decrease from largest rank downward.
+    for i in range(m - 2, -1, -1):
+        p_adj[i] = min(p_adj[i], p_adj[i + 1])
+    out[order] = p_adj
+    return out
 
 
 def _run_backtest(
@@ -676,30 +666,49 @@ def _run_backtest(
                     if len(null_vals)
                     else np.nan,
                     "mw_u": float(u_stat) if np.isfinite(u_stat) else np.nan,
-                    "mw_p_one_sided": float(p_val) if np.isfinite(p_val) else np.nan,
+                    "mw_p_raw": float(p_val) if np.isfinite(p_val) else np.nan,
                 }
             )
     summary = pd.DataFrame(summary_rows)
+
+    # BH correction over the actual number of finite tests.
+    p_raw = summary["mw_p_raw"].to_numpy(dtype=float)
+    summary["mw_p_bh"] = _bh_correct(p_raw)
+    console.print(
+        f"  BH correction over {int(np.isfinite(p_raw).sum())} finite tests "
+        f"(out of {len(p_raw)} total = {len(SIGNALS)} signals × {len(OFFSETS)} offsets)"
+    )
     summary.to_csv(os.path.join(out_dir, "summary.csv"), index=False)
 
     # ---- Console table -------------------------------------------------------
-    table = Table(title="Pre-jump vs null  (one-sided Mann-Whitney p)")
+    table = Table(title="Pre-jump vs null  (one-sided Mann-Whitney)")
     table.add_column("signal", style="bold")
     table.add_column("alt")
     for off in OFFSETS:
-        table.add_column(f"d={off}", justify="right")
+        table.add_column(f"d={off}  p_raw / p_bh", justify="right")
     for sig in SIGNALS:
         row = [sig, ALT_HYPOTHESIS[sig]]
         for off in OFFSETS:
             s = summary[(summary["signal"] == sig) & (summary["offset_days"] == off)]
-            p = s["mw_p_one_sided"].values[0] if not s.empty else np.nan
-            if np.isfinite(p):
-                mark = " **" if p < 0.01 else (" *" if p < 0.05 else "")
-                row.append(f"{p:.3f}{mark}")
-            else:
+            if s.empty:
                 row.append("-")
+                continue
+            p_r = float(s["mw_p_raw"].values[0])
+            p_b = float(s["mw_p_bh"].values[0])
+            if not np.isfinite(p_r):
+                row.append("-")
+                continue
+            raw_mark = "**" if p_r < 0.01 else ("*" if p_r < 0.05 else "")
+            bh_mark = (
+                "‡"
+                if np.isfinite(p_b) and p_b < 0.05
+                else ("†" if np.isfinite(p_b) and p_b < 0.10 else "")
+            )
+            p_b_str = f"{p_b:.3f}{bh_mark}" if np.isfinite(p_b) else "nan"
+            row.append(f"{p_r:.3f}{raw_mark} / {p_b_str}")
         table.add_row(*row)
     console.print(table)
+    console.print("  * p_raw<0.05  ** p_raw<0.01  † p_bh<0.10  ‡ p_bh<0.05")
 
     # ---- Plots ---------------------------------------------------------------
     console.rule("[bold cyan]Phase 10 — Plots")
@@ -714,6 +723,8 @@ def _run_backtest(
 
 
 def _plot_boxes(pre: pd.DataFrame, null: pd.DataFrame, out_path: str) -> None:
+    n_events = pre["event_id"].nunique() if "event_id" in pre.columns else len(pre)
+    offsets_str = ", ".join(f"{o:+d}d" for o in OFFSETS)
     fig, axes = plt.subplots(len(SIGNALS), 1, figsize=(10, 2.4 * len(SIGNALS)))
     if len(SIGNALS) == 1:
         axes = [axes]
@@ -723,7 +734,9 @@ def _plot_boxes(pre: pd.DataFrame, null: pd.DataFrame, out_path: str) -> None:
             pv = pre.loc[pre["offset_days"] == off, sig].dropna().values
             nv = null.loc[null["offset_days"] == off, sig].dropna().values
             data.extend([pv, nv])
-            labels.extend([f"pre {off:+d}", f"null {off:+d}"])
+            labels.extend(
+                [f"pre {off:+d}d  (n={len(pv)})", f"null {off:+d}d  (n={len(nv)})"]
+            )
             colors.extend(["#d6604d", "#4393c3"])
         positions = np.arange(len(data))
         bp = ax.boxplot(
@@ -737,10 +750,13 @@ def _plot_boxes(pre: pd.DataFrame, null: pd.DataFrame, out_path: str) -> None:
         ax.set_ylabel(sig, fontsize=9)
         ax.grid(alpha=0.3, axis="y")
     fig.suptitle(
-        f"Pre-jump (red) vs null calm (blue)  —  offsets {OFFSETS}  "
-        f"[train {TRAIN_START.date()}→{TRAIN_END.date()}  "
-        f"eval {EVAL_START.date()}→{EVAL_END.date()}]",
-        fontsize=9,
+        f"Pre-jump (red) vs null calm (blue)\n"
+        f"offsets: {offsets_str}   events: {n_events}   null buffer: {NULL_BUFFER_DAYS}d   "
+        f"null draws/offset: {NULL_SAMPLE_SIZE}   trend window: {TREND_WINDOW}d\n"
+        f"burn-in: {BURN_IN_START.date()} → {BACKTEST_START.date()}   "
+        f"backtest: {BACKTEST_START.date()} → {BACKTEST_END.date()}   "
+        f"GP si: {PHASE_GP_SI}s k={KERNEL_HW}   KM si: {PHASE_A_SI}s k={KERNEL_HW_PHASE_A}",
+        fontsize=8,
     )
     fig.tight_layout()
     fig.savefig(out_path, dpi=130)
@@ -773,10 +789,15 @@ def _plot_overview(daily: pd.DataFrame, events: pd.DataFrame, out_path: str) -> 
                 pd.Timestamp(ev["jump_start"]), color="crimson", lw=0.6, alpha=0.7
             )
     axes[-1].set_xlabel("date")
+    n_events = len(events)
+    offsets_str = ", ".join(f"{o:+d}d" for o in OFFSETS)
     fig.suptitle(
-        f"Kalman-GP topology (eval {EVAL_START.date()} → {EVAL_END.date()})  "
-        f"— red lines = jump_start",
-        fontsize=10,
+        f"Kalman-GP topology   backtest: {BACKTEST_START.date()} → {BACKTEST_END.date()}   "
+        f"({n_events} jumps, red lines = jump_start)\n"
+        f"burn-in: {BURN_IN_START.date()} → {BACKTEST_START.date()}   "
+        f"GP si: {PHASE_GP_SI}s k={KERNEL_HW}   KM si: {PHASE_A_SI}s k={KERNEL_HW_PHASE_A}   "
+        f"offsets: {offsets_str}   trend window: {TREND_WINDOW}d",
+        fontsize=9,
     )
     fig.tight_layout()
     fig.savefig(out_path, dpi=130)
@@ -792,21 +813,16 @@ def main() -> None:
     console = Console()
     rng = np.random.default_rng(SEED)
 
-    eval_tag = f"{EVAL_START.strftime('%Y-%m-%d')}_{EVAL_END.strftime('%Y-%m-%d')}"
-    out_dir = os.path.join(BACKTEST_DIR, eval_tag)
+    backtest_tag = (
+        f"{BACKTEST_START.strftime('%Y-%m-%d')}_{BACKTEST_END.strftime('%Y-%m-%d')}"
+    )
+    out_dir = os.path.join(BACKTEST_DIR, backtest_tag)
     os.makedirs(out_dir, exist_ok=True)
 
-    console.print(
-        f"[bold]Backtest[/bold]  "
-        f"train=[{TRAIN_START.date()}, {TRAIN_END.date()}]  "
-        f"eval=[{EVAL_START.date()}, {EVAL_END.date()}]  "
-        f"→ {out_dir}/"
-    )
+    # Phase 1: run the GP (burn-in + backtest) and detect jumps.
+    daily_path, events_path = _run_gp_and_record(console, rng, out_dir)
 
-    # Phase 1: run the GP and detect jumps; clears all model state on exit.
-    daily_path, events_path = _train_and_replay(console, rng, out_dir)
-
-    # Phase 2: pure CSV-based backtest analysis.
+    # Phase 2: pure CSV-based signal analysis.
     _run_backtest(console, rng, out_dir, daily_path, events_path)
 
 

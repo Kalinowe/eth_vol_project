@@ -129,7 +129,14 @@ GP_OUTPUT_DIR_ROOT = "gp_results"
 
 
 def compute_km_spatial_var(
-    km_dir, window_list, phase_a_si, x_range=None, drift_trim_pct=0.02, console=None
+    km_dir,
+    window_list,
+    phase_a_si,
+    x_range=None,
+    drift_trim_pct=0.02,
+    kernel_half_width=0,
+    trim_quantile=0.0,
+    console=None,
 ):
     """Spatial variance Var[mu(x)] in /year^2, estimated from KM drift bins.
 
@@ -139,11 +146,13 @@ def compute_km_spatial_var(
     is calibrated to the observed drift variability in x.
     """
     console = console or Console()
+    kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
+    trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
     frames = []
     for w_start, w_end in window_list:
         fname = (
             f"km_{w_start.strftime('%Y-%m-%d')}_to_"
-            f"{w_end.strftime('%Y-%m-%d')}_{phase_a_si}s.csv"
+            f"{w_end.strftime('%Y-%m-%d')}_{phase_a_si}s{kernel_tag}{trim_tag}.csv"
         )
         path = os.path.join(km_dir, fname)
         if os.path.exists(path):

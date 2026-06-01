@@ -517,9 +517,12 @@ def run_phase_a(
         start_date, end_date, window_type, console=console
     )
 
+    kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
+    trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
     fname = (
         f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_"
-        f"{end_date.strftime('%Y-%m-%d')}_{seconds_interval}s_{window_type}.csv"
+        f"{end_date.strftime('%Y-%m-%d')}_{seconds_interval}s"
+        f"{kernel_tag}{trim_tag}_{window_type}.csv"
     )
     out_path = os.path.join(output_dir, fname)
 
@@ -598,7 +601,8 @@ def run_phase_a(
         km_path = os.path.join(
             km_dir,
             f"km_{result['window_start'].strftime('%Y-%m-%d')}_to_"
-            f"{result['window_end'].strftime('%Y-%m-%d')}_{seconds_interval}s.csv",
+            f"{result['window_end'].strftime('%Y-%m-%d')}_{seconds_interval}s"
+            f"{kernel_tag}{trim_tag}.csv",
         )
         result["km_df"].to_csv(km_path, index=False)
         rows.append(

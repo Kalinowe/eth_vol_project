@@ -858,7 +858,6 @@ def daily_replay(
     dt_step,
     *,
     record_from,
-    reproject_cadence_days=7,
     reproject_window_days=30,
     n_inducing,
     n_grid=200,
@@ -873,55 +872,73 @@ def daily_replay(
     ``record_from``.  Days before ``record_from`` advance the model state but
     are not yielded (warm-up).
 
-    The inducing grid is reprojected every ``reproject_cadence_days`` days to
-    the rolling ``reproject_window_days`` trailing x-range, matching the same
-    logic used in RunGP_update and find_well_jumps.
+    The inducing grid is reprojected once per ISO week using the trailing
+    ``reproject_window_days`` x-range — identical to the training loop in
+    RunGP.py Step 8.  The reproject fires at the start of each ISO week,
+    before any of that week's daily updates, matching training exactly.
     """
     import pandas as _pd  # already imported at module level; re-alias for clarity
 
     record_ts = _pd.Timestamp(record_from).normalize()
+    dt_norm = dt_t_pd.normalize()
+    all_days = sorted(dt_norm.unique())
+    if not all_days:
+        return
 
-    # Initial reproject on the full observed range.
-    topo_range = model.reproject_to_range(
-        float(x_all.min()), float(x_all.max()), n_inducing=n_inducing
-    )
-    last_reproject_d = None
+    # Group days by ISO week, preserving chronological order.
+    day_series = _pd.Series(all_days)
+    week_labels = day_series.dt.to_period("W").values
 
-    for d in sorted(dt_t_pd.normalize().unique()):
-        # Cadenced rolling-window reproject.
-        if (
-            last_reproject_d is None
-            or (d - last_reproject_d).days >= reproject_cadence_days
-        ):
-            roll_lo = d - _pd.Timedelta(days=reproject_window_days - 1)
-            roll_mask = (dt_t_pd.normalize() >= roll_lo) & (dt_t_pd.normalize() <= d)
-            x_roll = x_all[roll_mask]
-            if len(x_roll) < 2:
-                x_roll = x_all[dt_t_pd.normalize() <= d]
-            if len(x_roll) >= 2:
-                topo_range = model.reproject_to_range(
-                    float(x_roll.min()), float(x_roll.max()), n_inducing=n_inducing
-                )
-                last_reproject_d = d
-
-        mask = dt_t_pd.normalize() == d
-        x_d = x_all[mask]
-        dx_d = dx_all[mask]
-        t_d = (np.asarray(dt_t_pd[mask].astype(np.int64)) / 1e9).astype(float)
-        r_hat_d = (dx_d / dt_step) * _SEC_PER_YEAR
-
-        model.update(x_d, r_hat_d, t_d)
-
-        if d < record_ts:
-            continue  # warm-up: advance state only
-
-        topo_d = topology_from_gp(
-            model,
-            topo_range,
-            n_grid=n_grid,
-            n_samples=n_samples,
-            min_crossing_sep=min_crossing_sep,
-            min_barrier_fraction=min_barrier_fraction,
-            rng=rng,
+    # Initial reproject: use only data strictly before the first day to be
+    # processed — no future information enters the inducing grid placement.
+    first_day = all_days[0]
+    x_pre = x_all[dt_norm < first_day]
+    if len(x_pre) >= 2:
+        topo_range = model.reproject_to_range(
+            float(x_pre.min()), float(x_pre.max()), n_inducing=n_inducing
         )
-        yield d, topo_d, x_d
+    else:
+        # No prior data available (GP starts cold); use only the very first
+        # bar's price as a single-point fallback — model.reproject_to_range
+        # will add a small margin automatically.
+        x_first = x_all[dt_norm == first_day]
+        x0 = float(x_first.mean()) if len(x_first) else 0.0
+        topo_range = model.reproject_to_range(x0, x0, n_inducing=n_inducing)
+
+    for wk in sorted(set(week_labels)):
+        wk_days = sorted(d for d, w in zip(all_days, week_labels) if w == wk)
+        # Reproject fires *before* this week's updates, so only data up to
+        # (but not including) the first day of this week is permissible.
+        wk_cutoff = wk_days[0] - _pd.Timedelta(days=1)
+        roll_lo = wk_cutoff - _pd.Timedelta(days=reproject_window_days - 1)
+        roll_mask = (dt_norm >= roll_lo) & (dt_norm <= wk_cutoff)
+        x_roll = x_all[roll_mask]
+        if len(x_roll) < 2:
+            x_roll = x_all[dt_norm <= wk_cutoff]
+        if len(x_roll) >= 2:
+            topo_range = model.reproject_to_range(
+                float(x_roll.min()), float(x_roll.max()), n_inducing=n_inducing
+            )
+
+        for d in wk_days:
+            mask = dt_norm == d
+            x_d = x_all[mask]
+            dx_d = dx_all[mask]
+            t_d = (np.asarray(dt_t_pd[mask].astype(np.int64)) / 1e9).astype(float)
+            r_hat_d = (dx_d / dt_step) * _SEC_PER_YEAR
+
+            model.update(x_d, r_hat_d, t_d)
+
+            if d < record_ts:
+                continue  # warm-up: advance state only
+
+            topo_d = topology_from_gp(
+                model,
+                topo_range,
+                n_grid=n_grid,
+                n_samples=n_samples,
+                min_crossing_sep=min_crossing_sep,
+                min_barrier_fraction=min_barrier_fraction,
+                rng=rng,
+            )
+            yield d, topo_d, x_d
