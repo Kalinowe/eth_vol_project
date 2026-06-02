@@ -8,22 +8,18 @@ All configuration is in the CONFIGURATION block below.  Run with:
 
 Pipeline steps
 --------------
-Stage 1  upfront 3-param HP-opt (spatial_ls, temporal_ls, spatial_var)
-         optional 2-param HP-opt for spatial_ls and temporal_ls only;
-         spatial_var is held fixed at the KM-derived value (HP_OPT_MODE='ls_only').
-
     1  Download raw data
     2  Aggregate log-returns
-    3  Phase A (KM bins + regime labels)
+    3  Phase A (KM estimation)
     4  Load Phase GP series
     5  Determine spatial_var from KM or fixed value
     6  Initialise Kalman-GP model
-    7  HP optimisation (if HP_OPT_MODE != 'none')
-    8  Sequential Kalman updates + topology per window
-         For each window: optional reproject_to_range → Kalman update → topology_from_gp
-    9  GP potential U(x) topology snapshots
-   10  Log-price vs topology plot
-   11  GP drift + KM overlay plot
+    7  Sequential Kalman updates + topology per window
+         For each window: optional reproject_to_range \u2192 Kalman update \u2192 topology_from_gp
+    8  GP potential U(x) topology snapshots
+    9  Log-price vs topology plot
+   10  GP drift + KM overlay plot
+   11  Persist model state
 """
 
 import os
@@ -40,7 +36,6 @@ from regime_estimation import (
     iter_windows,
     normalize_window_boundaries,
     run_phase_a,
-    print_regime_table,
 )
 from phase_GP import KalmanGPDriftModel, topology_from_gp, _SEC_PER_YEAR
 from paths import gp_output_dir, gp_state_stem
@@ -67,7 +62,6 @@ window_type = "monthly"
 n_bins = 200
 weight_threshold = 5
 min_barrier_fraction = 0.1
-min_well_separation = 0.0
 
 
 # =============================================================================
@@ -80,15 +74,6 @@ min_well_separation = 0.0
 SPATIAL_VAR_SOURCE = "km"
 SPATIAL_VAR_FIXED = 300.0  # used when SPATIAL_VAR_SOURCE='fixed' or as fallback
 
-# --- HP optimisation ----------------------------------------------------------
-# 'none'    — use initial-guess lengthscales throughout (fastest)
-# 'ls_only' — optimise spatial_ls and temporal_ls; hold spatial_var fixed
-#              spatial_var is set from KM data; MLL is nearly flat in it
-# 'all'     — jointly optimise spatial_ls, temporal_ls, spatial_var (not recommended)
-HP_OPT_MODE = "none"
-HP_OPT_N_RESTARTS = 3
-HP_OPT_MAX_SAMPLES = 5000  # subsample observations fed to MLL optimiser
-
 # --- Reprojection (move inducing points into each window's observed x-range) --
 USE_REPROJECT = True
 REPROJECT_MARGIN = 0.1  # fraction of window x-width added on each side
@@ -96,8 +81,7 @@ REPROJECT_MARGIN = 0.1  # fraction of window x-width added on each side
 # Wider than a single window to keep the state warm when price drifts.
 REPROJECT_WINDOW_DAYS = 30
 
-# --- Lengthscales (initial values; starting points for HP-opt or final values
-#     when HP_OPT_MODE='none') -------------------------------------------------
+# --- Lengthscales (initial values) -------------------------------------------
 # spatial_ls: None -> (x_hi - x_lo) / (3 * N_INDUCING)  — smaller than the
 #   inducing spacing so the posterior can capture sharper well/barrier
 #   features in drift.
@@ -117,6 +101,12 @@ MIN_CROSSING_SEP = 10
 
 # --- Reproducibility ---------------------------------------------------------
 SEED = 42
+
+# --- Daily topology look-back for RunGP_update bootstrap ---------------------
+# Number of trailing calendar days for which daily topology is pre-computed
+# and stored in the pickle so RunGP_update can immediately produce slope
+# signals on its first run without a full 90-day state replay.
+RECENT_DAILY_DAYS = 14
 
 # --- Output ------------------------------------------------------------------
 OUTPUT_DIR = "regime_results"
@@ -203,15 +193,10 @@ def compute_km_spatial_var(
 
 
 def prepare_phase_a(snapped_start, snapped_end, window_list, console):
-    """Steps 1–3: download, aggregate, and run Phase A.
+    """Steps 1–3: download, aggregate, and run Phase A KM estimation.
 
     Uses the module-level config variables so callers don't need to thread
     every parameter through.
-
-    Returns
-    -------
-    labels_df : pd.DataFrame
-        Per-window regime labels from Phase A.
     """
     console.rule("[bold cyan]Step 1 — Download raw data")
     dc.ensure_data(snapped_start, snapped_end)
@@ -227,8 +212,8 @@ def prepare_phase_a(snapped_start, snapped_end, window_list, console):
                 trim_quantile=trim_quantile,
             )
 
-    console.rule("[bold cyan]Step 3 — Phase A (KM bins + regime labels)")
-    labels_df = run_phase_a(
+    console.rule("[bold cyan]Step 3 — Phase A (KM estimation)")
+    run_phase_a(
         snapped_start,
         snapped_end,
         phase_a_seconds_interval,
@@ -236,14 +221,10 @@ def prepare_phase_a(snapped_start, snapped_end, window_list, console):
         trim_quantile=trim_quantile,
         n_bins=n_bins,
         weight_threshold=weight_threshold,
-        min_barrier_fraction=min_barrier_fraction,
-        min_well_separation=min_well_separation,
         window_type="monthly",
         output_dir=OUTPUT_DIR,
         console=console,
     )
-    print_regime_table(labels_df, console=console)
-    return labels_df
 
 
 # =============================================================================
@@ -268,17 +249,14 @@ def main() -> None:
         console=console,
     )
     stage_tag = (
-        f"{SPATIAL_VAR_SOURCE}var_{HP_OPT_MODE}hp_"
-        f"{'reproject' if USE_REPROJECT else 'noreproject'}"
+        f"{SPATIAL_VAR_SOURCE}var_{'reproject' if USE_REPROJECT else 'noreproject'}"
     )
-    gp_dir = gp_output_dir(
-        phase_gp_seconds_interval, HP_OPT_MODE, root=GP_OUTPUT_DIR_ROOT
-    )
+    gp_dir = gp_output_dir(phase_gp_seconds_interval, root=GP_OUTPUT_DIR_ROOT)
     os.makedirs(gp_dir, exist_ok=True)
 
     window_list = list(iter_windows(snapped_start, snapped_end, "monthly"))
 
-    labels_df = prepare_phase_a(snapped_start, snapped_end, window_list, console)
+    prepare_phase_a(snapped_start, snapped_end, window_list, console)
 
     # -------------------------------------------------------------------------
     console.rule("[bold cyan]Step 4 — Load Phase GP series")
@@ -306,25 +284,24 @@ def main() -> None:
     x_hi = float(np.percentile(x_prev, 99))
     x_range_global = (x_lo, x_hi)
 
-    sigma2 = SIGMA2 if SIGMA2 is not None else float(np.var(r_hat * dt) / dt)
-    obs_noise = sigma2 / dt
+    # Raw estimate — will be corrected for spatial drift variance after sp_var
+    # is resolved in Step 5.  Keep raw_sigma2 separate so the correction can
+    # be applied regardless of SPATIAL_VAR_SOURCE.
+    raw_sigma2 = SIGMA2 if SIGMA2 is not None else float(np.var(r_hat * dt) / dt)
+    sigma2 = raw_sigma2  # placeholder; updated below after sp_var is known
 
-    # Pre-compute window→observation index map (reused in HP opt + Kalman loop)
-    labels_ts = labels_df.copy()
-    labels_ts["window_start"] = pd.to_datetime(labels_ts["window_start"])
-    labels_ts["window_end"] = pd.to_datetime(labels_ts["window_end"])
+    # Pre-compute window→observation index map (reused in Kalman loop)
     dt_series = pd.Series(pd.to_datetime(dt_t))
 
     window_idx_arr = np.full(N, -1, dtype=int)
-    for i, row in labels_ts.iterrows():
-        mask = (dt_series >= row["window_start"]) & (
-            dt_series < row["window_end"] + pd.Timedelta(days=1)
+    for w_idx, (w_start, w_end) in enumerate(window_list):
+        mask = (dt_series >= pd.Timestamp(w_start)) & (
+            dt_series < pd.Timestamp(w_end) + pd.Timedelta(days=1)
         )
-        window_idx_arr[mask.values] = i
+        window_idx_arr[mask.values] = w_idx
 
     _n_inducing_eff = N_INDUCING
     _temporal_ls_eff = TEMPORAL_LENGTHSCALE_DAYS_INIT
-    _hp_opt_mode_eff = HP_OPT_MODE
 
     # Spatial lengthscale initial guess: smaller than the inducing spacing
     # so the posterior can resolve well/barrier features.
@@ -355,10 +332,35 @@ def main() -> None:
         sp_var = SPATIAL_VAR_FIXED
         console.print(f"  spatial_var={sp_var:.4g} [fixed]")
 
-    console.print(
+    # Correct sigma2: Var[r_hat*dt]/dt = sigma2 + Var[mu(x,t)] ≈ sigma2 + sp_var.
+    # Subtracting sp_var removes the drift-variation component so sigma2 reflects
+    # pure observation noise.  Clamp to 1% of raw to avoid sigma2 ≤ 0.
+    if SIGMA2 is None:
+        sigma2 = max(raw_sigma2 - sp_var, 0.01 * raw_sigma2)
+        console.print(
+            f"  sigma2 estimation: raw={raw_sigma2:.4g}  "
+            f"sp_var={sp_var:.4g}  corrected={sigma2:.4g}"
+        )
+    obs_noise = sigma2 / dt
+    gp_snr = sp_var / obs_noise
+    snr_msg = (
         f"  spatial_var={sp_var:.4g}  obs_noise={obs_noise:.4g}  "
-        f"GP SNR/obs={sp_var / obs_noise:.4g}"
+        f"GP SNR/obs={gp_snr:.4g}"
     )
+    if gp_snr < 0.05:
+        console.print(
+            f"[bold red]{snr_msg}[/bold red]\n"
+            "  [red]WARNING: GP_SNR < 0.05 — posterior nearly identical to prior; "
+            "topology signals will have very low dynamic range.[/red]"
+        )
+    elif gp_snr < 0.2:
+        console.print(
+            f"[yellow]{snr_msg}[/yellow]\n"
+            "  [yellow]NOTE: GP_SNR < 0.2 — observation noise dominates; "
+            "topology signals may have limited dynamic range.[/yellow]"
+        )
+    else:
+        console.print(snr_msg)
 
     # -------------------------------------------------------------------------
     console.rule("[bold cyan]Step 6 — Initialise Kalman-GP model")
@@ -379,54 +381,8 @@ def main() -> None:
     )
 
     # -------------------------------------------------------------------------
-    if _hp_opt_mode_eff != "none":
-        console.rule(f"[bold cyan]Step 7 — HP optimisation ({_hp_opt_mode_eff})")
-
-        # Subsample observations for MLL
-        x_hp = x_prev.copy()
-        r_hp = r_hat.copy()
-        t_hp = t_seconds.copy()
-        if len(x_hp) > HP_OPT_MAX_SAMPLES:
-            idx_sub = np.linspace(0, len(x_hp) - 1, HP_OPT_MAX_SAMPLES, dtype=int)
-            x_hp, r_hp, t_hp = x_hp[idx_sub], r_hp[idx_sub], t_hp[idx_sub]
-
-        # bounds_range = median per-window x-width so ls bounds are calibrated
-        # to the window scale (where topology is evaluated), not the full history.
-        win_widths = []
-        for w_idx in labels_ts.index:
-            xw = x_prev[window_idx_arr == w_idx]
-            if len(xw) > 1:
-                win_widths.append(float(xw.max() - xw.min()))
-        if win_widths:
-            med_width = float(np.median(win_widths))
-            bounds_range = (x_lo, x_lo + med_width)
-        else:
-            bounds_range = x_range_global
-
-        model.optimise_hp(
-            x_hp,
-            r_hp,
-            t_hp,
-            n_restarts=HP_OPT_N_RESTARTS,
-            x_range=x_range_global,
-            bounds_range=bounds_range,
-            fix_spatial_var=(_hp_opt_mode_eff == "ls_only"),
-            console=console,
-        )
-        # Re-initialise state with optimised HPs (don't carry stale prior cov).
-        model.initialise(
-            x_range=x_range_global, n_inducing=_n_inducing_eff, data_x=x_prev
-        )
-        console.print(
-            f"  Post-opt:  spatial_ls={model.spatial_ls:.4f}  "
-            f"temporal_ls={model.temporal_ls:.2f}d  "
-            f"spatial_var={model.spatial_var:.4g}"
-        )
-    else:
-        console.rule("[bold cyan]Step 7 — HP optimisation SKIPPED (HP_OPT_MODE=none)")
-
     # -------------------------------------------------------------------------
-    console.rule("[bold cyan]Step 8 — Sequential Kalman updates + topology")
+    console.rule("[bold cyan]Step 7 — Sequential Kalman updates + topology")
 
     topology_rows = []
     snapshots = []  # (datetime, state_mean, state_cov, x_range_for_topo, inducing_x)
@@ -434,7 +390,7 @@ def main() -> None:
     snapshot_counter = 0
     dt_t_pd = pd.to_datetime(dt_t)  # full datetime array, used for rolling x-range
 
-    for w_idx in labels_ts.index:
+    for w_idx, (w_start, w_end) in enumerate(window_list):
         obs_mask = window_idx_arr == w_idx
         if not obs_mask.any():
             continue
@@ -443,7 +399,6 @@ def main() -> None:
         r_hat_w = r_hat[obs_mask]
         t_w = t_seconds[obs_mask]
         dt_w = dt_t[obs_mask]
-        row = labels_ts.loc[w_idx]
 
         # --- Weekly rolling-window reproject ------------------------------------
         # Split this window's observations into ISO-weekly sub-batches.
@@ -461,12 +416,16 @@ def main() -> None:
                 x_wk = x_w[wk_mask]
                 r_hat_wk = r_hat_w[wk_mask]
                 t_wk = t_w[wk_mask]
-                dt_wk_last = dt_w_pd[wk_mask].max()
+                dt_wk_first = dt_w_pd[wk_mask].min()
 
-                # 30-day rolling x-range up to this week's last observation.
-                roll_lo = dt_wk_last - pd.Timedelta(days=REPROJECT_WINDOW_DAYS - 1)
-                roll_mask_all = (dt_t_pd >= roll_lo) & (dt_t_pd <= dt_wk_last)
+                # 30-day rolling x-range strictly before this week's first obs
+                # — causal: no current-week data enters the inducing grid placement.
+                roll_cutoff = dt_wk_first - pd.Timedelta(days=1)
+                roll_lo = roll_cutoff - pd.Timedelta(days=REPROJECT_WINDOW_DAYS - 1)
+                roll_mask_all = (dt_t_pd >= roll_lo) & (dt_t_pd <= roll_cutoff)
                 x_roll = x_prev[roll_mask_all]
+                if len(x_roll) < 2:
+                    x_roll = x_prev[dt_t_pd < dt_wk_first]
                 if len(x_roll) < 2:
                     x_roll = x_wk
 
@@ -492,12 +451,11 @@ def main() -> None:
         topology_rows.append(
             {
                 "datetime": dt_query,
-                "window_start": str(pd.Timestamp(row["window_start"]).date()),
+                "window_start": str(pd.Timestamp(w_start).date()),
                 "p_multiwell_gp": topo["p_multiwell"],
                 "mean_n_wells": topo["mean_n_wells"],
                 "barrier_mean": topo["barrier_mean"],
                 "barrier_std": topo["barrier_std"],
-                "kramers": topo["kramers_mean"],
                 "u_range": topo["u_range"],
                 "mu_std_to_mean": topo["mu_std_to_mean"],
             }
@@ -512,9 +470,7 @@ def main() -> None:
                     model.state_cov.copy(),
                     topo_range,
                     model.inducing_x.copy(),  # needed for correct predict() when reprojecting
-                    pd.Timestamp(
-                        row["window_start"]
-                    ),  # for log-price slice in topology plot
+                    pd.Timestamp(w_start),  # for log-price slice in topology plot
                 )
             )
 
@@ -528,6 +484,118 @@ def main() -> None:
     df_topology = pd.DataFrame(topology_rows)
     df_params = pd.DataFrame([model.get_params()])
 
+    # -------------------------------------------------------------------------
+    console.rule(
+        f"[bold cyan]Step 7b — Daily topology (last {RECENT_DAILY_DAYS} days "
+        "for RunGP_update bootstrap)"
+    )
+    # Replay the last RECENT_DAILY_DAYS calendar days day-by-day using a
+    # separate model restored from the nearest preceding monthly snapshot.
+    # This gives RunGP_update daily p_multiwell/barrier rows immediately so
+    # slope signals (slope_p_multiwell, slope_z_p_multiwell) are available
+    # without an expensive 90-day state rebuild on the first update run.
+    recent_start_dt = (
+        pd.Timestamp(snapped_end) - pd.Timedelta(days=RECENT_DAILY_DAYS - 1)
+    ).normalize()
+    best_snap_rd, best_snap_rd_dt = None, None
+    for snap in snapshots:
+        snap_dt = pd.Timestamp(snap[0])
+        if snap_dt < recent_start_dt:
+            if best_snap_rd_dt is None or snap_dt > best_snap_rd_dt:
+                best_snap_rd, best_snap_rd_dt = snap, snap_dt
+
+    recent_daily_topo: list[dict] = []
+    if best_snap_rd is not None:
+        p_rd = model.get_params()
+        rdm = KalmanGPDriftModel(
+            spatial_lengthscale=p_rd["spatial_lengthscale"],
+            temporal_lengthscale_days=p_rd["temporal_lengthscale_days"],
+            spatial_variance=p_rd["spatial_variance"],
+            sigma2=float(model.sigma2),
+            dt=float(model.dt),
+        )
+        rdm.inducing_x = np.asarray(best_snap_rd[4]).copy()
+        rdm.M = len(rdm.inducing_x)
+        rdm._recompute_hp_dependent()
+        rdm._I_2M = np.eye(2 * rdm.M)
+        rdm.state_mean = np.asarray(best_snap_rd[1]).copy()
+        rdm.state_cov = np.asarray(best_snap_rd[2]).copy()
+
+        rd_replay_start = (
+            (best_snap_rd_dt + pd.Timedelta(days=1)).normalize().to_pydatetime()
+        )
+        x_rd, dx_rd, dt_rd, dt_t_rd = load_series(
+            rd_replay_start,
+            pd.Timestamp(snapped_end).to_pydatetime(),
+            phase_gp_seconds_interval,
+            kernel_half_width=kernel_half_width,
+            trim_quantile=trim_quantile,
+            window_type="monthly",
+        )
+        dt_t_rd_pd = pd.to_datetime(dt_t_rd)
+        r_hat_rd = (dx_rd / dt_rd) * _SEC_PER_YEAR
+        topo_range_rd = tuple(best_snap_rd[3])
+        last_repr_rd: pd.Timestamp | None = None
+
+        for d in sorted(dt_t_rd_pd.normalize().unique()):
+            if last_repr_rd is None or (d - last_repr_rd).days >= 7:
+                roll_lo_rd = d - pd.Timedelta(days=REPROJECT_WINDOW_DAYS - 1)
+                rmask = (dt_t_rd_pd.normalize() >= roll_lo_rd) & (
+                    dt_t_rd_pd.normalize() <= d
+                )
+                xr = x_rd[rmask]
+                if len(xr) >= 2:
+                    topo_range_rd = rdm.reproject_to_range(
+                        float(xr.min()),
+                        float(xr.max()),
+                        n_inducing=_n_inducing_eff,
+                    )
+                    last_repr_rd = d
+
+            dmask = dt_t_rd_pd.normalize() == d
+            t_d_rd = (dt_t_rd_pd[dmask].astype(np.int64) / 1e9).values.astype(float)
+            rdm.update(x_rd[dmask], r_hat_rd[dmask], t_d_rd)
+
+            if d < recent_start_dt:
+                continue
+
+            topo_d = topology_from_gp(
+                rdm,
+                topo_range_rd,
+                n_grid=N_GRID,
+                n_samples=N_SAMPLES,
+                min_crossing_sep=MIN_CROSSING_SEP,
+                min_barrier_fraction=min_barrier_fraction,
+                rng=rng,
+            )
+            recent_daily_topo.append(
+                {
+                    "date": d.strftime("%Y-%m-%d"),
+                    "p_multiwell": topo_d["p_multiwell"],
+                    "barrier_mean": topo_d["barrier_mean"],
+                    "barrier_std": topo_d["barrier_std"],
+                    "barrier_snr": (
+                        topo_d["barrier_mean"] / topo_d["barrier_std"]
+                        if topo_d["barrier_std"] > 0
+                        else 0.0
+                    ),
+                    "mean_n_wells": topo_d["mean_n_wells"],
+                }
+            )
+            console.print(
+                f"  {d.date()}  p_multi={topo_d['p_multiwell']:.3f}"
+                f"  barrier={topo_d['barrier_mean']:.4f}±{topo_d['barrier_std']:.4f}"
+            )
+        del rdm
+        console.print(
+            f"  [green]{len(recent_daily_topo)} daily rows will be saved to pickle[/green]"
+        )
+    else:
+        console.print(
+            f"  [yellow]No monthly snapshot before {recent_start_dt.date()}; "
+            "recent_daily_topo omitted (RunGP_update will rebuild from scratch).[/yellow]"
+        )
+
     stem = (
         f"gp_{pd.Timestamp(snapped_start).strftime('%Y-%m-%d')}_to_"
         f"{pd.Timestamp(snapped_end).strftime('%Y-%m-%d')}"
@@ -538,7 +606,7 @@ def main() -> None:
     console.print(f"[green]Wrote[/green] {gp_dir}/{stem}_topology.csv")
 
     # -------------------------------------------------------------------------
-    console.rule("[bold cyan]Step 9 — GP potential U(x) topology snapshots")
+    console.rule("[bold cyan]Step 8 — GP potential U(x) topology snapshots")
     plot_topology_snapshots(
         model,
         x_range_global,
@@ -552,7 +620,7 @@ def main() -> None:
         rng=rng,
     )
 
-    console.rule("[bold cyan]Step 10 — log-price vs topology plot")
+    console.rule("[bold cyan]Step 9 \u2014 log-price vs topology plot")
     plot_logprice_topology(
         model,
         snapshots,
@@ -563,12 +631,11 @@ def main() -> None:
         phase_gp_seconds_interval,
         os.path.join(gp_dir, f"{stem}_logprice_topology.png"),
         spatial_var_source=SPATIAL_VAR_SOURCE,
-        hp_opt_mode=HP_OPT_MODE,
         use_reproject=USE_REPROJECT,
         n_grid=N_GRID,
     )
 
-    console.rule("[bold cyan]Step 11 — GP drift + KM overlay plot")
+    console.rule("[bold cyan]Step 10 \u2014 GP drift + KM overlay plot")
     plot_drift_with_km(
         model,
         snapshots,
@@ -579,13 +646,12 @@ def main() -> None:
         OUTPUT_DIR,
         os.path.join(gp_dir, f"{stem}_drift_km.png"),
         spatial_var_source=SPATIAL_VAR_SOURCE,
-        hp_opt_mode=HP_OPT_MODE,
         use_reproject=USE_REPROJECT,
         n_grid=N_GRID,
         rng=rng,
     )
 
-    console.rule("[bold cyan]Step 12 — Persist model state")
+    console.rule("[bold cyan]Step 11 — Persist model state")
     state_path = os.path.join(gp_dir, f"{stem}_state.pkl")
     state_blob = {
         "schema_version": 1,
@@ -603,9 +669,7 @@ def main() -> None:
             "n_bins": n_bins,
             "weight_threshold": weight_threshold,
             "min_barrier_fraction": min_barrier_fraction,
-            "min_well_separation": min_well_separation,
             "spatial_var_source": SPATIAL_VAR_SOURCE,
-            "hp_opt_mode": HP_OPT_MODE,
             "use_reproject": USE_REPROJECT,
             "reproject_margin": REPROJECT_MARGIN,
             "n_inducing": _n_inducing_eff,
@@ -629,6 +693,7 @@ def main() -> None:
         "last_dt": pd.Timestamp(dt_t[-1]),
         "snapshots": snapshots,
         "topology_history": df_topology.copy(),
+        "recent_daily_topo": recent_daily_topo,
     }
     with open(state_path, "wb") as fh:
         pickle.dump(state_blob, fh, protocol=pickle.HIGHEST_PROTOCOL)

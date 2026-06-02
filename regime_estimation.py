@@ -5,30 +5,60 @@ Pipeline per calendar-month window:
   1. Make sure the daily Binance dumps are downloaded and unzipped.
   2. Aggregate into log-return bars at one or more sampling intervals.
   3. Run Kramers-Moyal on the log-prices to recover non-parametric drift mu(x).
-  4. Classify the topology of mu(x) -- count stable equilibria, infer regime.
 
-Each (window, sampling-interval) row produces a regime label that can be
-sanity-checked by re-running RunEM.py on that exact window and visually
-inspecting the static potential plot.
+Per-window KM drift and diffusion bins are written as CSV files under
+{output_dir}/km/ and consumed downstream by the Kalman-GP pipeline.
 """
 
-import glob
 import os
-import warnings
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+from kramersmoyal import km as kmc_lib
 from rich.console import Console
-from rich.table import Table
-from scipy.integrate import cumulative_trapezoid
-from scipy.signal import argrelmin
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, WhiteKernel
 
 import data_collection as dc
-from force_field_estimation import estimate_km
+
+
+# ---------------------------------------------------------------------------
+# KM drift estimator
+# ---------------------------------------------------------------------------
+
+
+def estimate_km(log_prices, seconds_interval, n_bins=200, weight_threshold=5):
+    """
+    Run Kramers-Moyal estimation on a 1D log-price series.
+
+    Args:
+        log_prices: 1D array-like of log-prices, NaNs already dropped.
+        seconds_interval: dt between consecutive observations, in seconds.
+        n_bins: number of bins used by the KM histogram.
+        weight_threshold: minimum bin weight (count) to keep; below this drift
+            and diffusion are set to NaN to avoid divergent estimates in the tails.
+
+    Returns:
+        DataFrame with columns ['bin_center', 'drift', 'diffusion', 'weight'].
+        Drift is annualizable as drift * sec_per_year. Diffusion is sigma^2 / 2.
+    """
+    x_series = np.asarray(log_prices, dtype=np.float64).reshape(-1, 1)
+    kmc, edges = kmc_lib(x_series, bins=n_bins, full=False)
+
+    weights = kmc[0, :]
+    drift = np.where(weights > weight_threshold, kmc[1, :] / seconds_interval, np.nan)
+    diffusion = np.where(
+        weights > weight_threshold, kmc[2, :] / (2 * seconds_interval), np.nan
+    )
+    centers = edges[0]
+
+    return pd.DataFrame(
+        {
+            "bin_center": centers,
+            "drift": drift,
+            "diffusion": diffusion,
+            "weight": weights,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,182 +181,6 @@ def normalize_window_boundaries(
 
 
 # ---------------------------------------------------------------------------
-# Topological classifier
-# ---------------------------------------------------------------------------
-
-
-def _greedy_well_filter(x, U, threshold, min_well_separation):
-    """
-    Apply the legacy argrelmin + barrier-height greedy filter to a single
-    potential curve. Returns (kept_idx, barriers) — barriers measured between
-    consecutive kept minima.
-    """
-    min_idx = argrelmin(U, order=5)[0]
-    if len(min_idx) == 0:
-        return [], []
-
-    def barrier_between_indices(ia, ib):
-        lo, hi = min(ia, ib), max(ia, ib)
-        U_peak = U[lo : hi + 1].max()
-        return float(U_peak - max(U[ia], U[ib]))
-
-    kept_idx = [min_idx[0]]
-    for idx in min_idx[1:]:
-        bh = barrier_between_indices(kept_idx[-1], idx)
-        sep = abs(x[idx] - x[kept_idx[-1]])
-        if bh >= threshold and sep >= min_well_separation:
-            kept_idx.append(idx)
-
-    barriers = [
-        barrier_between_indices(kept_idx[i], kept_idx[i + 1])
-        for i in range(len(kept_idx) - 1)
-    ]
-    return kept_idx, barriers
-
-
-def classify_potential_topology(
-    km_result_df,
-    min_barrier_fraction=0.1,
-    min_well_separation=0.0,
-    annualize_drift=True,
-    n_restarts=3,
-    weight_threshold=5,
-    n_samples=200,
-    n_grid=300,
-    random_state=0,
-):
-    """
-    Classify the topology of U(x) by fitting a Gaussian process to the
-    Kramers–Moyal drift estimate and integrating posterior drift samples
-    into potential samples. Counting wells per posterior sample yields
-    P(n_wells >= 2 | data), so windows near the topological transition
-    receive a continuous probability rather than a hard label.
-
-    Returns the same keys as the previous version plus:
-        p_multiwell  -- P(n_wells >= 2 | data), used downstream as eta weight.
-    well_locations and barriers are computed from the *posterior mean*
-    potential rather than a single noisy estimate. n_wells is the posterior
-    mean well count (a float).
-
-    Args:
-        km_result_df: output of estimate_km — columns
-            ['bin_center', 'drift', 'diffusion', 'weight'].
-        weight_threshold: bin count threshold matching estimate_km; used to
-            scale per-bin GP noise as alpha = weight_threshold / weights
-            (capped at 10.0 for numerical stability in tail bins).
-    """
-    df = km_result_df.dropna(subset=["drift"]).reset_index(drop=True)
-    if len(df) < 5:
-        return {
-            "n_wells": 0.0,
-            "p_multiwell": 0.0,
-            "well_locations": [],
-            "barriers": [],
-            "u_range": 0.0,
-            "regime": "no-equilibrium",
-        }
-
-    sec_per_year = 365.25 * 24 * 3600
-    x = df["bin_center"].values.astype(float)
-    f = df["drift"].values.astype(float)
-    if annualize_drift:
-        f = f * sec_per_year
-
-    # Per-bin noise variance: bins with low counts get larger alpha. The
-    # weight column survives the dropna above because we only filtered on
-    # 'drift' (NaN where weight <= weight_threshold in estimate_km).
-    weights = df["weight"].values.astype(float)
-    weights = np.maximum(weights, 1.0)
-    alpha = np.minimum(weight_threshold / weights, 10.0)
-
-    x_std = float(np.std(x)) if np.std(x) > 0 else 1.0
-    kernel = RBF(
-        length_scale=x_std * 0.3, length_scale_bounds=(1e-3, 10.0)
-    ) + WhiteKernel(noise_level=1.0, noise_level_bounds=(1e-10, 1e3))
-    gp = GaussianProcessRegressor(
-        kernel=kernel,
-        alpha=alpha,
-        n_restarts_optimizer=n_restarts,
-        normalize_y=True,
-    )
-    # Widening the WhiteKernel bound above lets the optimiser drive
-    # noise_level very low when the per-bin alpha already absorbs the noise;
-    # any residual convergence warning is benign and suppressed here so the
-    # per-window console output stays clean.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        gp.fit(x.reshape(-1, 1), f)
-
-    x_grid = np.linspace(x.min(), x.max(), n_grid)
-    f_samples = gp.sample_y(
-        x_grid.reshape(-1, 1),
-        n_samples=n_samples,
-        random_state=random_state,
-    )  # shape (n_grid, n_samples)
-
-    # Integrate each drift sample into a potential and count wells.
-    # cumulative_trapezoid returns (n_grid - 1,); prepend 0 to align with x_grid.
-    U_samples = -cumulative_trapezoid(f_samples, x_grid, axis=0, initial=0.0)
-    U_samples = U_samples - U_samples.min(axis=0, keepdims=True)
-
-    # Posterior mean potential, used for representative well_locations / barriers.
-    U_mean = U_samples.mean(axis=1)
-    U_mean = U_mean - U_mean.min()
-    u_range_mean = float(U_mean.max())
-
-    # Per-sample well counts using the legacy filter.
-    n_wells_samples = np.empty(n_samples, dtype=int)
-    for j in range(n_samples):
-        U_j = U_samples[:, j]
-        u_range_j = float(U_j.max())
-        if u_range_j == 0.0:
-            n_wells_samples[j] = 0
-            continue
-        thr_j = min_barrier_fraction * u_range_j
-        kept_idx, _ = _greedy_well_filter(x_grid, U_j, thr_j, min_well_separation)
-        n_wells_samples[j] = len(kept_idx)
-
-    p_multiwell = float(np.mean(n_wells_samples >= 2))
-    mean_n_wells = float(np.mean(n_wells_samples))
-
-    if mean_n_wells < 1.3:
-        regime = "single-well"
-    elif mean_n_wells < 1.7:
-        regime = "uncertain"
-    else:
-        regime = "multi-well"
-
-    if u_range_mean == 0.0:
-        return {
-            "n_wells": round(mean_n_wells, 2),
-            "p_multiwell": round(p_multiwell, 4),
-            "well_locations": [],
-            "barriers": [],
-            "u_range": 0.0,
-            "regime": regime,
-        }
-
-    threshold_mean = min_barrier_fraction * u_range_mean
-    kept_idx_mean, barriers_mean = _greedy_well_filter(
-        x_grid,
-        U_mean,
-        threshold_mean,
-        min_well_separation,
-    )
-    well_locations = [float(x_grid[i]) for i in kept_idx_mean]
-    barriers = [round(b, 6) for b in barriers_mean]
-
-    return {
-        "n_wells": round(mean_n_wells, 2),
-        "p_multiwell": round(p_multiwell, 4),
-        "well_locations": well_locations,
-        "barriers": barriers,
-        "u_range": round(u_range_mean, 4),
-        "regime": regime,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Per-window driver
 # ---------------------------------------------------------------------------
 
@@ -339,15 +193,14 @@ def analyze_window(
     trim_quantile=0.01,
     n_bins=200,
     weight_threshold=5,
-    min_barrier_fraction=0.1,
-    min_well_separation=0.0,
     min_observations=100,
 ):
     """
-    Run the KM + topology pipeline on one (window, interval) pair.
+    Ensure data exists, aggregate log-returns, and run KM estimation for
+    one (window, interval) pair.
 
-    Returns a dict on success, or None if the window is unusable (data missing,
-    too few observations, etc.).
+    Returns a dict with keys [window_start, window_end, seconds_interval,
+    n_observations, km_df], or None if the window is unusable.
     """
     # If the aggregated CSV for this (window, interval) already exists we can
     # skip the download and unzip entirely — aggregate_log_returns_range will
@@ -391,88 +244,13 @@ def analyze_window(
     km_df = estimate_km(
         log_prices, seconds_interval, n_bins=n_bins, weight_threshold=weight_threshold
     )
-    topo = classify_potential_topology(
-        km_df,
-        min_barrier_fraction=min_barrier_fraction,
-        min_well_separation=min_well_separation,
-        weight_threshold=weight_threshold,
-    )
-
     return {
         "window_start": window_start,
         "window_end": window_end,
         "seconds_interval": seconds_interval,
         "n_observations": int(len(log_prices)),
         "km_df": km_df,
-        **topo,
     }
-
-
-# ---------------------------------------------------------------------------
-# Partial-cache helper
-# ---------------------------------------------------------------------------
-
-
-def _load_cached_windows(
-    output_dir: str,
-    window_type: str,
-    seconds_interval: int,
-    start_date: datetime,
-    end_date: datetime,
-) -> tuple[pd.DataFrame, set]:
-    """
-    Scan output_dir for ``regime_labels_*_{interval}s_{window_type}.csv`` files
-    and collect rows whose window falls inside [start_date, end_date]. One
-    interval per CSV — different intervals live in separate files.
-
-    Returns
-    -------
-    cached_df  : DataFrame of valid (non-NaN p_multiwell) rows. Dates as strings.
-    covered    : set of (window_start_str, window_end_str) already present.
-    """
-    pattern = os.path.join(
-        output_dir,
-        f"regime_labels_*_{int(seconds_interval)}s_{window_type}.csv",
-    )
-    csv_files = glob.glob(pattern)
-    if not csv_files:
-        return pd.DataFrame(), set()
-
-    start_str = start_date.strftime("%Y-%m-%d")
-    end_str = end_date.strftime("%Y-%m-%d")
-
-    frames = []
-    for path in csv_files:
-        try:
-            df = pd.read_csv(path, dtype={"window_start": str, "window_end": str})
-            mask = (df["window_start"] >= start_str) & (df["window_end"] <= end_str)
-            sub = df[mask]
-            if not sub.empty:
-                frames.append(sub)
-        except Exception:
-            continue
-
-    if not frames:
-        return pd.DataFrame(), set()
-
-    cached_df = pd.concat(frames, ignore_index=True)
-    cached_df = cached_df.drop_duplicates(
-        subset=["window_start", "window_end"], keep="first"
-    )
-
-    # Rows from before p_multiwell was added are missing or NaN there —
-    # drop them so freshly computed rows can take their place.
-    if "p_multiwell" not in cached_df.columns:
-        cached_df["p_multiwell"] = np.nan
-    valid_rows = cached_df[
-        cached_df["p_multiwell"].notna() | (cached_df["regime"] == "unavailable")
-    ].copy()
-
-    covered = set()
-    for (ws, we), _ in valid_rows.groupby(["window_start", "window_end"]):
-        covered.add((ws, we))
-
-    return valid_rows, covered
 
 
 # ---------------------------------------------------------------------------
@@ -488,26 +266,16 @@ def run_phase_a(
     trim_quantile=0.01,
     n_bins=200,
     weight_threshold=5,
-    min_barrier_fraction=0.1,
-    min_well_separation=0.0,
     output_dir="regime_results",
     window_type="monthly",
     console=None,
 ):
     """
-    Single-interval driver. Iterate over windows and assemble a label table at
-    one sampling resolution.
+    Iterate over windows, run KM estimation on each, and write per-window KM
+    CSV files to {output_dir}/km/. Windows whose KM CSV already exists on disk
+    are skipped (cache hit).
 
-    start_date and end_date are snapped to exact window boundaries before
-    execution (see normalize_window_boundaries). A notice is printed when
-    either date is adjusted.
-
-    Different ``seconds_interval`` values live in **separate** CSVs — the
-    interval is encoded in the filename:
-        regime_labels_<start>_to_<end>_<int>s_<window_type>.csv
-    so a multi-interval run is now several independent ``run_phase_a`` calls.
-
-    Returns the assembled DataFrame and writes it to the path above.
+    Returns a DataFrame with columns [window_start, window_end, n_observations].
     """
     os.makedirs(output_dir, exist_ok=True)
     console = console or Console()
@@ -519,59 +287,30 @@ def run_phase_a(
 
     kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
     trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
-    fname = (
-        f"regime_labels_{start_date.strftime('%Y-%m-%d')}_to_"
-        f"{end_date.strftime('%Y-%m-%d')}_{seconds_interval}s"
-        f"{kernel_tag}{trim_tag}_{window_type}.csv"
-    )
-    out_path = os.path.join(output_dir, fname)
-
-    # Fast path: exact output file already on disk — but only if it carries
-    # p_multiwell (older CSVs written before that column existed force a rerun).
-    if os.path.exists(out_path):
-        cached = pd.read_csv(out_path)
-        good_regimes = ["single-well", "multi-well", "uncertain"]
-        has_pmulti = (
-            "p_multiwell" in cached.columns
-            and cached[cached["regime"].isin(good_regimes)]["p_multiwell"].notna().all()
-        )
-        if has_pmulti:
-            console.print(
-                f"[green]Labels CSV already exists:[/green] {fname} — loading from disk."
-            )
-            return cached
-        console.print(
-            f"[yellow]Cached labels CSV {fname} predates p_multiwell — "
-            "recomputing missing windows.[/yellow]"
-        )
-
-    # Partial cache: collect rows already computed in other files at this interval.
-    cached_df, covered_windows = _load_cached_windows(
-        output_dir,
-        window_type,
-        seconds_interval,
-        start_date,
-        end_date,
-    )
-
-    all_windows = list(iter_windows(start_date, end_date, window_type))
-    missing_windows = [
-        (ws, we)
-        for ws, we in all_windows
-        if (ws.strftime("%Y-%m-%d"), we.strftime("%Y-%m-%d")) not in covered_windows
-    ]
-
-    if covered_windows:
-        console.print(
-            f"[green]Partial cache:[/green] {len(covered_windows)} window(s) reused from existing files, "
-            f"[yellow]{len(missing_windows)}[/yellow] window(s) to compute."
-        )
-
     km_dir = os.path.join(output_dir, "km")
     os.makedirs(km_dir, exist_ok=True)
 
+    all_windows = list(iter_windows(start_date, end_date, window_type))
     rows = []
-    for window_start, window_end in missing_windows:
+    n_cached = 0
+    for window_start, window_end in all_windows:
+        km_path = os.path.join(
+            km_dir,
+            f"km_{window_start.strftime('%Y-%m-%d')}_to_"
+            f"{window_end.strftime('%Y-%m-%d')}_{seconds_interval}s"
+            f"{kernel_tag}{trim_tag}.csv",
+        )
+        if os.path.exists(km_path):
+            n_cached += 1
+            rows.append(
+                {
+                    "window_start": window_start.strftime("%Y-%m-%d"),
+                    "window_end": window_end.strftime("%Y-%m-%d"),
+                    "n_observations": None,
+                }
+            )
+            continue
+
         result = analyze_window(
             window_start,
             window_end,
@@ -580,107 +319,32 @@ def run_phase_a(
             trim_quantile=trim_quantile,
             n_bins=n_bins,
             weight_threshold=weight_threshold,
-            min_barrier_fraction=min_barrier_fraction,
-            min_well_separation=min_well_separation,
         )
         if result is None:
             rows.append(
                 {
                     "window_start": window_start.strftime("%Y-%m-%d"),
                     "window_end": window_end.strftime("%Y-%m-%d"),
-                    "seconds_interval": seconds_interval,
-                    "regime": "unavailable",
-                    "n_wells": None,
-                    "p_multiwell": None,
-                    "well_locations": None,
-                    "barriers": None,
                     "n_observations": 0,
                 }
             )
             continue
-        km_path = os.path.join(
-            km_dir,
-            f"km_{result['window_start'].strftime('%Y-%m-%d')}_to_"
-            f"{result['window_end'].strftime('%Y-%m-%d')}_{seconds_interval}s"
-            f"{kernel_tag}{trim_tag}.csv",
-        )
+
         result["km_df"].to_csv(km_path, index=False)
         rows.append(
             {
                 "window_start": result["window_start"].strftime("%Y-%m-%d"),
                 "window_end": result["window_end"].strftime("%Y-%m-%d"),
-                "seconds_interval": seconds_interval,
-                "regime": result["regime"],
-                "n_wells": result["n_wells"],
-                "p_multiwell": result.get("p_multiwell", np.nan),
-                "well_locations": [round(x, 6) for x in result["well_locations"]],
-                "barriers": [round(b, 6) for b in result["barriers"]],
-                "u_range": result["u_range"],
                 "n_observations": result["n_observations"],
             }
         )
 
-    # Merge cached and newly computed rows.
-    parts = []
-    if not cached_df.empty:
-        parts.append(cached_df)
-    if rows:
-        parts.append(pd.DataFrame(rows))
-
-    out_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-
-    # Deduplicate; prefer freshly computed rows (keep='last') so a stale cache
-    # entry cannot shadow an updated p_multiwell or regime label.
-    out_df = out_df.drop_duplicates(subset=["window_start", "window_end"], keep="last")
-    out_df = out_df.sort_values("window_start").reset_index(drop=True)
-    out_df.to_csv(out_path, index=False)
-    return out_df
-
-
-def print_regime_table(labels_df, console=None):
-    console = console or Console()
-    intervals = sorted(
-        set(
-            pd.to_numeric(labels_df.get("seconds_interval", []), errors="coerce")
-            .dropna()
-            .astype(int)
+    if n_cached:
+        console.print(
+            f"[green]KM cache:[/green] {n_cached} window(s) reused, "
+            f"{len(all_windows) - n_cached} computed."
         )
-    )
-    interval_label = f"{intervals[0]}s" if len(intervals) == 1 else "mixed"
-    table = Table(title=f"Phase A regime labels — Δt = {interval_label}")
-    table.add_column("Start", style="cyan")
-    table.add_column("End", style="cyan")
-    table.add_column("Regime", style="green")
-    table.add_column("Wells", justify="right", style="magenta")
-    table.add_column("p_multiwell", justify="right", style="magenta")
-    table.add_column("U range (ann.)", justify="right", style="yellow")
-    table.add_column("Barriers", style="yellow")
-    table.add_column("# obs", justify="right")
-
-    has_pmulti = "p_multiwell" in labels_df.columns
-
-    for _, r in labels_df.iterrows():
-        u_range_str = f"{r['u_range']:.2f}" if pd.notna(r.get("u_range")) else ""
-        n_wells_val = r["n_wells"]
-        if pd.isna(n_wells_val):
-            n_wells_str = ""
-        else:
-            n_wells_str = f"{float(n_wells_val):.1f}"
-        if has_pmulti and pd.notna(r.get("p_multiwell")):
-            pmulti_str = f"{float(r['p_multiwell']):.2f}"
-        else:
-            pmulti_str = ""
-        table.add_row(
-            str(r["window_start"]),
-            str(r["window_end"]),
-            str(r["regime"]),
-            n_wells_str,
-            pmulti_str,
-            u_range_str,
-            str(r["barriers"]) if r["barriers"] is not None else "",
-            str(r["n_observations"]),
-        )
-    console.print(table)
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
