@@ -1,8 +1,6 @@
 import os
 
 import matplotlib.dates as mdates
-import matplotlib.ticker as mticker
-import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -143,6 +141,8 @@ def plot_drift_with_km(
     use_reproject,
     n_grid=200,
     rng=None,
+    kernel_hw_phase_a=0,
+    trim_quantile=0.0,
 ):
     """
     Grid of panels (one per snapshot) showing GP posterior drift overlaid with
@@ -157,11 +157,14 @@ def plot_drift_with_km(
         return
 
     km_dir = os.path.join(output_dir, "km")
+    _kernel_tag = f"_k{kernel_hw_phase_a}" if kernel_hw_phase_a > 0 else ""
+    _trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
+    _km_suffix = f"_{phase_a_si}s{_kernel_tag}{_trim_tag}.csv"
 
     # ---- Y-axis bounds: weighted percentile of KM drift across the full period ----
     all_drifts, all_weights = [], []
     for fname in sorted(os.listdir(km_dir)):
-        if not fname.endswith(f"_{phase_a_si}s.csv"):
+        if not fname.endswith(_km_suffix):
             continue
         parts = fname.replace(".csv", "").split("_")
         try:
@@ -251,7 +254,7 @@ def plot_drift_with_km(
         # Find the KM CSV whose window contains dt_query.
         km_df = None
         for fname in sorted(os.listdir(km_dir)):
-            if not fname.endswith(f"_{phase_a_si}s.csv"):
+            if not fname.endswith(_km_suffix):
                 continue
             parts = fname.replace(".csv", "").split("_")
             try:
@@ -449,6 +452,132 @@ def plot_logprice_topology(
     fig.savefig(out_path, dpi=130)
     plt.close(fig)
     print(f"Saved: {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Backtest analysis plots
+# ---------------------------------------------------------------------------
+
+
+def plot_backtest_boxes(
+    pre: pd.DataFrame,
+    null: pd.DataFrame,
+    out_path: str,
+    *,
+    signals: list,
+    offsets: list,
+    null_buffer_days: int,
+    null_sample_size: int,
+    trend_window: int,
+    burn_in_start,
+    backtest_start,
+    backtest_end,
+    phase_gp_si: int,
+    kernel_hw: int,
+    phase_a_si: int,
+    kernel_hw_phase_a: int,
+) -> None:
+    n_events = pre["event_id"].nunique() if "event_id" in pre.columns else len(pre)
+    offsets_str = ", ".join(f"{o:+d}d" for o in offsets)
+    fig, axes = plt.subplots(len(signals), 1, figsize=(10, 2.4 * len(signals)))
+    if len(signals) == 1:
+        axes = [axes]
+    for ax, sig in zip(axes, signals):
+        data, labels, colors = [], [], []
+        for off in offsets:
+            pv = pre.loc[pre["offset_days"] == off, sig].dropna().values
+            nv = null.loc[null["offset_days"] == off, sig].dropna().values
+            data.extend([pv, nv])
+            labels.extend(
+                [f"pre {off:+d}d  (n={len(pv)})", f"null {off:+d}d  (n={len(nv)})"]
+            )
+            colors.extend(["#d6604d", "#4393c3"])
+        positions = np.arange(len(data))
+        bp = ax.boxplot(
+            data, positions=positions, widths=0.7, patch_artist=True, showfliers=False
+        )
+        for patch, c in zip(bp["boxes"], colors):
+            patch.set_facecolor(c)
+            patch.set_alpha(0.6)
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+        ax.set_ylabel(sig, fontsize=9)
+        ax.grid(alpha=0.3, axis="y")
+    fig.suptitle(
+        f"Pre-jump (red) vs null calm (blue)\n"
+        f"offsets: {offsets_str}   events: {n_events}   null buffer: {null_buffer_days}d   "
+        f"null draws/offset: {null_sample_size}   trend window: {trend_window}d\n"
+        f"burn-in: {burn_in_start.date()} -> {backtest_start.date()}   "
+        f"backtest: {backtest_start.date()} -> {backtest_end.date()}   "
+        f"GP si: {phase_gp_si}s k={kernel_hw}   KM si: {phase_a_si}s k={kernel_hw_phase_a}",
+        fontsize=8,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+
+
+def plot_backtest_overview(
+    daily: pd.DataFrame,
+    events: pd.DataFrame,
+    out_path: str,
+    *,
+    slope_z_fn,
+    trend_window: int,
+    offsets: list,
+    backtest_start,
+    backtest_end,
+    burn_in_start,
+    phase_gp_si: int,
+    kernel_hw: int,
+    phase_a_si: int,
+    kernel_hw_phase_a: int,
+) -> None:
+    """Price + signal panels with jump markers."""
+    daily = daily.copy()
+    slope_z_vals = np.full(len(daily), np.nan)
+    for i in range(len(daily)):
+        lo = daily.index[i] - pd.Timedelta(days=trend_window - 1)
+        tail_pm = np.asarray(
+            daily.loc[
+                (daily.index >= lo) & (daily.index <= daily.index[i]), "p_multiwell"
+            ],
+            dtype=float,
+        )
+        _, z = slope_z_fn(tail_pm)
+        slope_z_vals[i] = z
+    daily["slope_z_p_multiwell"] = slope_z_vals
+    panels = [
+        ("price_usd", "ETH/USDT [$]", "log"),
+        ("p_multiwell", "p_multiwell", None),
+        ("slope_z_p_multiwell", "slope_z_p_multiwell", None),
+    ]
+    fig, axes = plt.subplots(len(panels), 1, figsize=(13, 8), sharex=True)
+    for ax, (col, ylab, yscale) in zip(axes, panels):
+        if col in daily.columns:
+            ax.plot(daily.index, daily[col], color="#1f4e79", lw=0.9)
+        if yscale:
+            ax.set_yscale(yscale)
+        ax.set_ylabel(ylab, fontsize=9)
+        ax.grid(alpha=0.3)
+        for _, ev in events.iterrows():
+            ax.axvline(
+                pd.Timestamp(ev["jump_start"]), color="crimson", lw=0.6, alpha=0.7
+            )
+    axes[-1].set_xlabel("date")
+    n_events = len(events)
+    offsets_str = ", ".join(f"{o:+d}d" for o in offsets)
+    fig.suptitle(
+        f"Kalman-GP topology   backtest: {backtest_start.date()} -> {backtest_end.date()}   "
+        f"({n_events} jumps, red lines = jump_start)\n"
+        f"burn-in: {burn_in_start.date()} -> {backtest_start.date()}   "
+        f"GP si: {phase_gp_si}s k={kernel_hw}   KM si: {phase_a_si}s k={kernel_hw_phase_a}   "
+        f"offsets: {offsets_str}   trend window: {trend_window}d",
+        fontsize=9,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
 
 
 if __name__ == "__main__":

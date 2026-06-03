@@ -31,7 +31,7 @@ import pandas as pd
 from rich.console import Console
 
 import data_collection as dc
-from data_collection import load_series
+from data_collection import load_series, ema_demean_drift
 from regime_estimation import (
     iter_windows,
     normalize_window_boundaries,
@@ -69,10 +69,10 @@ min_barrier_fraction = 0.1
 # =============================================================================
 
 # --- Spatial variance source --------------------------------------------------
-# 'km'    — compute var(KM annualised drift bins) from Phase A output
+# 'km'    — compute var(Kramers-Moyal annualised drift bins) from Phase A output
 # 'fixed' — use SPATIAL_VAR_FIXED directly
 SPATIAL_VAR_SOURCE = "km"
-SPATIAL_VAR_FIXED = 300.0  # used when SPATIAL_VAR_SOURCE='fixed' or as fallback
+SPATIAL_VAR_FIXED = 2000.0  # used when SPATIAL_VAR_SOURCE='fixed' or as fallback
 
 # --- Reprojection (move inducing points into each window's observed x-range) --
 USE_REPROJECT = True
@@ -87,6 +87,12 @@ REPROJECT_WINDOW_DAYS = 30
 #   features in drift.
 SPATIAL_LENGTHSCALE_INIT = None  # None -> (x_hi - x_lo) / (N_INDUCING)
 TEMPORAL_LENGTHSCALE_DAYS_INIT = 5.0  # days
+
+# --- EMA demeaning -----------------------------------------------------------
+# Remove a slow-moving mean from the observed drift before GP inference.
+# None  -> no demeaning (raw r_hat passed to the model)
+# float -> half-life in calendar days of the exponential moving average
+EMA_HALFLIFE_DAYS = 30  # e.g. 30.0 to enable
 
 # --- Observation noise -------------------------------------------------------
 SIGMA2 = None  # None -> var(r_hat * dt) / dt  [/year]^2 * sec
@@ -188,6 +194,246 @@ def compute_km_spatial_var(
 
 
 # =============================================================================
+# SHARED PIPELINE INIT  (Steps 1–6, importable by backtest_jumps etc.)
+# =============================================================================
+
+
+def init_gp_pipeline(
+    start_date,
+    end_date,
+    km_init_months=0,
+    phase_a_si=30,
+    kernel_hw_phase_a=3,
+    phase_gp_si=900,
+    kernel_hw=50,
+    trim_quantile=0.01,
+    n_bins=200,
+    weight_threshold=5,
+    n_inducing=10,
+    temporal_ls_days=5.0,
+    spatial_lengthscale_init=None,
+    spatial_var_mode="km",
+    spatial_var_fixed=300.0,
+    sigma2_override=None,
+    ema_halflife_days=None,
+    regime_output_dir="regime_results",
+    console=None,
+) -> dict:
+    """Steps 1–6: download, aggregate, KM estimation, GP series load,
+    spatial-var determination, and Kalman-GP model initialisation.
+
+    Parameters
+    ----------
+    km_init_months : int
+        Months of history before ``start_date`` to use for KM estimation.
+        0 (default) uses the same ``[start_date, end_date]`` period as the GP
+        run — identical to the old ``prepare_phase_a`` behaviour.
+        When > 0, raw data for the pre-period is downloaded and aggregated,
+        KM estimation covers the pre-period only, and the GP series is loaded
+        strictly from ``[start_date, end_date]``.
+
+    Returns
+    -------
+    dict with keys: model, x_all, dx_all, r_hat_all, dt_step, dt_t, dt_t_pd,
+        x_range_global, sp_var, sigma2, raw_sigma2, snapped_start, snapped_end,
+        gp_windows, km_windows, regime_output_dir, n_inducing, sl_init.
+    """
+    console = console or Console()
+
+    # --- Snap GP window boundaries ---
+    snapped_start, snapped_end = normalize_window_boundaries(
+        start_date, end_date, "monthly", console=console
+    )
+    gp_windows = list(iter_windows(snapped_start, snapped_end, "monthly"))
+
+    # --- KM pre-period (causal: only history before snapped_start) ---
+    if km_init_months > 0:
+        km_start_ts = pd.Timestamp(snapped_start) - pd.DateOffset(months=km_init_months)
+        km_end_ts = pd.Timestamp(snapped_start) - pd.Timedelta(days=1)
+        km_start, km_end = normalize_window_boundaries(
+            km_start_ts.to_pydatetime(),
+            km_end_ts.to_pydatetime(),
+            "monthly",
+            console=console,
+        )
+        km_windows = list(iter_windows(km_start, km_end, "monthly"))
+        data_start = km_start
+    else:
+        km_windows = gp_windows
+        km_start = snapped_start
+        km_end = snapped_end
+        data_start = snapped_start
+
+    # --- Step 1: Download raw data ---
+    console.rule("[bold cyan]Step 1 — Download raw data")
+    dc.ensure_data(data_start, snapped_end)
+
+    # --- Step 2: Aggregate log-returns ---
+    console.rule("[bold cyan]Step 2 — Aggregate log-returns")
+    for w_start, w_end in km_windows:
+        dc.aggregate_log_returns_range(
+            w_start,
+            w_end,
+            phase_a_si,
+            kernel_half_width=kernel_hw_phase_a,
+            trim_quantile=trim_quantile,
+        )
+    for w_start, w_end in gp_windows:
+        dc.aggregate_log_returns_range(
+            w_start,
+            w_end,
+            phase_gp_si,
+            kernel_half_width=kernel_hw,
+            trim_quantile=trim_quantile,
+        )
+
+    # --- Step 3: Phase A KM estimation ---
+    console.rule("[bold cyan]Step 3 — Phase A (KM estimation)")
+    run_phase_a(
+        km_start,
+        km_end,
+        phase_a_si,
+        kernel_half_width=kernel_hw_phase_a,
+        trim_quantile=trim_quantile,
+        n_bins=n_bins,
+        weight_threshold=weight_threshold,
+        window_type="monthly",
+        output_dir=regime_output_dir,
+        console=console,
+    )
+
+    # --- Step 4: Load Phase GP series ---
+    console.rule("[bold cyan]Step 4 — Load Phase GP series")
+    x_all, dx_all, dt_step, dt_t = load_series(
+        snapped_start,
+        snapped_end,
+        phase_gp_si,
+        kernel_half_width=kernel_hw,
+        trim_quantile=trim_quantile,
+        window_type="monthly",
+    )
+    dt_t_pd = pd.to_datetime(dt_t)
+    N = len(dx_all)
+    console.print(f"  N = {N} increments,  dt = {dt_step:.0f}s")
+
+    r_hat_all = (dx_all / dt_step) * _SEC_PER_YEAR
+    if ema_halflife_days is not None:
+        r_hat_all, _ = ema_demean_drift(
+            r_hat_all, dt_t_pd, halflife_days=ema_halflife_days
+        )
+    console.print(
+        f"  r_hat: mean={r_hat_all.mean():+.3e}/yr  std={r_hat_all.std():.3e}/yr  "
+        f"var={r_hat_all.var():.3e} /yr^2"
+    )
+
+    x_lo = float(np.percentile(x_all, 1))
+    x_hi = float(np.percentile(x_all, 99))
+    x_range_global = (x_lo, x_hi)
+
+    raw_sigma2 = (
+        sigma2_override
+        if sigma2_override is not None
+        else float(np.var(r_hat_all * dt_step) / dt_step)
+    )
+
+    # --- Step 5: Determine spatial_var ---
+    console.rule("[bold cyan]Step 5 — Determine spatial_var")
+    if spatial_var_mode == "km":
+        km_dir = os.path.join(regime_output_dir, "km")
+        sp_var = compute_km_spatial_var(
+            km_dir,
+            km_windows,
+            phase_a_si,
+            x_range=x_range_global,
+            kernel_half_width=kernel_hw_phase_a,
+            trim_quantile=trim_quantile,
+            console=console,
+        )
+        if sp_var is None or sp_var < 1.0:
+            sp_var = spatial_var_fixed
+            console.print(
+                f"[yellow]KM var unusable; using fallback spatial_var={sp_var}[/yellow]"
+            )
+    else:
+        sp_var = spatial_var_fixed
+        console.print(f"  spatial_var={sp_var:.4g} [fixed]")
+
+    if sigma2_override is None:
+        sigma2 = max(raw_sigma2 - sp_var, 0.01 * raw_sigma2)
+        console.print(
+            f"  sigma2 estimation: raw={raw_sigma2:.4g}  "
+            f"sp_var={sp_var:.4g}  corrected={sigma2:.4g}"
+        )
+    else:
+        sigma2 = raw_sigma2
+
+    obs_noise = sigma2 / dt_step
+    gp_snr = sp_var / obs_noise
+    snr_msg = (
+        f"  spatial_var={sp_var:.4g}  obs_noise={obs_noise:.4g}  "
+        f"GP SNR/obs={gp_snr:.4g}"
+    )
+    if gp_snr < 0.05:
+        console.print(
+            f"[bold red]{snr_msg}[/bold red]\n"
+            "  [red]WARNING: GP_SNR < 0.05 — posterior nearly identical to prior; "
+            "topology signals will have very low dynamic range.[/red]"
+        )
+    elif gp_snr < 0.2:
+        console.print(
+            f"[yellow]{snr_msg}[/yellow]\n"
+            "  [yellow]NOTE: GP_SNR < 0.2 — observation noise dominates; "
+            "topology signals may have limited dynamic range.[/yellow]"
+        )
+    else:
+        console.print(snr_msg)
+
+    # --- Step 6: Initialise Kalman-GP model ---
+    console.rule("[bold cyan]Step 6 — Initialise Kalman-GP model")
+    sl_init = (
+        spatial_lengthscale_init
+        if spatial_lengthscale_init is not None
+        else (x_hi - x_lo) / (3 * max(n_inducing, 1))
+    )
+    model = KalmanGPDriftModel(
+        spatial_lengthscale=sl_init,
+        temporal_lengthscale_days=temporal_ls_days,
+        spatial_variance=sp_var,
+        sigma2=sigma2,
+        dt=float(dt_step),
+    )
+    model.initialise(x_range=x_range_global, n_inducing=n_inducing, data_x=x_all)
+    console.print(
+        f"  inducing M={model.M}  state_dim={2 * model.M}  "
+        f"x_range=[{x_lo:.4f},{x_hi:.4f}]  "
+        f"spatial_ls={model.spatial_ls:.4f}  "
+        f"temporal_ls={model.temporal_ls:.2f}d  "
+        f"spatial_var={model.spatial_var:.4g}"
+    )
+
+    return {
+        "model": model,
+        "x_all": x_all,
+        "dx_all": dx_all,
+        "r_hat_all": r_hat_all,
+        "dt_step": float(dt_step),
+        "dt_t": dt_t,
+        "dt_t_pd": dt_t_pd,
+        "x_range_global": x_range_global,
+        "sp_var": sp_var,
+        "sigma2": sigma2,
+        "raw_sigma2": raw_sigma2,
+        "snapped_start": snapped_start,
+        "snapped_end": snapped_end,
+        "gp_windows": gp_windows,
+        "km_windows": km_windows,
+        "regime_output_dir": regime_output_dir,
+        "n_inducing": n_inducing,
+        "sl_init": sl_init,
+    }
+
+
+# =============================================================================
 # PIPELINE HELPERS
 # =============================================================================
 
@@ -242,143 +488,63 @@ def main() -> None:
     )
     rng = np.random.default_rng(SEED)
 
-    snapped_start, snapped_end = normalize_window_boundaries(
+    # ---- Steps 1–6: data collection + model initialisation ------------------
+    _init = init_gp_pipeline(
         start_date,
         end_date,
-        "monthly",
+        km_init_months=0,
+        phase_a_si=phase_a_seconds_interval,
+        kernel_hw_phase_a=kernel_half_width_phase_a,
+        phase_gp_si=phase_gp_seconds_interval,
+        kernel_hw=kernel_half_width,
+        trim_quantile=trim_quantile,
+        n_bins=n_bins,
+        weight_threshold=weight_threshold,
+        n_inducing=N_INDUCING,
+        temporal_ls_days=TEMPORAL_LENGTHSCALE_DAYS_INIT,
+        spatial_lengthscale_init=SPATIAL_LENGTHSCALE_INIT,
+        spatial_var_mode=SPATIAL_VAR_SOURCE,
+        spatial_var_fixed=SPATIAL_VAR_FIXED,
+        sigma2_override=SIGMA2,
+        ema_halflife_days=EMA_HALFLIFE_DAYS,
+        regime_output_dir=OUTPUT_DIR,
         console=console,
     )
+    model = _init["model"]
+    x_prev = _init["x_all"]
+    dx = _init["dx_all"]
+    r_hat = _init["r_hat_all"]
+    dt = _init["dt_step"]
+    dt_t = _init["dt_t"]
+    dt_t_pd = _init["dt_t_pd"]
+    x_range_global = _init["x_range_global"]
+    x_lo, x_hi = x_range_global
+    sp_var = _init["sp_var"]
+    sigma2 = _init["sigma2"]
+    raw_sigma2 = _init["raw_sigma2"]
+    snapped_start = _init["snapped_start"]
+    snapped_end = _init["snapped_end"]
+    window_list = _init["gp_windows"]
+    _n_inducing_eff = _init["n_inducing"]
+    _temporal_ls_eff = TEMPORAL_LENGTHSCALE_DAYS_INIT
+
     stage_tag = (
         f"{SPATIAL_VAR_SOURCE}var_{'reproject' if USE_REPROJECT else 'noreproject'}"
     )
     gp_dir = gp_output_dir(phase_gp_seconds_interval, root=GP_OUTPUT_DIR_ROOT)
     os.makedirs(gp_dir, exist_ok=True)
 
-    window_list = list(iter_windows(snapped_start, snapped_end, "monthly"))
-
-    prepare_phase_a(snapped_start, snapped_end, window_list, console)
-
-    # -------------------------------------------------------------------------
-    console.rule("[bold cyan]Step 4 — Load Phase GP series")
-    x_prev, dx, dt, dt_t = load_series(
-        snapped_start,
-        snapped_end,
-        phase_gp_seconds_interval,
-        kernel_half_width=kernel_half_width,
-        trim_quantile=trim_quantile,
-        window_type="monthly",
-    )
     N = len(dx)
-    console.print(f"  N = {N} increments,  dt = {dt:.0f}s")
-
-    r = (dx / dt) * _SEC_PER_YEAR
-    r_hat = r.copy()
-    console.print(
-        f"  r_hat: mean={r_hat.mean():+.3e}/yr  std={r_hat.std():.3e}/yr  "
-        f"var={r_hat.var():.3e} /yr^2"
-    )
-
-    t_seconds = (pd.to_datetime(dt_t).astype(np.int64) / 1e9).values.astype(float)
-
-    x_lo = float(np.percentile(x_prev, 1))
-    x_hi = float(np.percentile(x_prev, 99))
-    x_range_global = (x_lo, x_hi)
-
-    # Raw estimate — will be corrected for spatial drift variance after sp_var
-    # is resolved in Step 5.  Keep raw_sigma2 separate so the correction can
-    # be applied regardless of SPATIAL_VAR_SOURCE.
-    raw_sigma2 = SIGMA2 if SIGMA2 is not None else float(np.var(r_hat * dt) / dt)
-    sigma2 = raw_sigma2  # placeholder; updated below after sp_var is known
+    t_seconds = (dt_t_pd.astype(np.int64) / 1e9).values.astype(float)
+    dt_series = pd.Series(dt_t_pd)
 
     # Pre-compute window→observation index map (reused in Kalman loop)
-    dt_series = pd.Series(pd.to_datetime(dt_t))
-
     window_idx_arr = np.full(N, -1, dtype=int)
     for w_idx, (w_start, w_end) in enumerate(window_list):
         mask = (dt_series >= pd.Timestamp(w_start)) & (
             dt_series < pd.Timestamp(w_end) + pd.Timedelta(days=1)
         )
         window_idx_arr[mask.values] = w_idx
-
-    _n_inducing_eff = N_INDUCING
-    _temporal_ls_eff = TEMPORAL_LENGTHSCALE_DAYS_INIT
-
-    # Spatial lengthscale initial guess: smaller than the inducing spacing
-    # so the posterior can resolve well/barrier features.
-    sl_init = (
-        SPATIAL_LENGTHSCALE_INIT
-        if SPATIAL_LENGTHSCALE_INIT is not None
-        else (x_hi - x_lo) / (3 * max(_n_inducing_eff, 1))
-    )
-
-    # -------------------------------------------------------------------------
-    console.rule("[bold cyan]Step 5 — Determine spatial_var")
-
-    if SPATIAL_VAR_SOURCE == "km":
-        km_dir = os.path.join(OUTPUT_DIR, "km")
-        sp_var = compute_km_spatial_var(
-            km_dir,
-            window_list,
-            phase_a_seconds_interval,
-            x_range=x_range_global,
-            console=console,
-        )
-        if sp_var is None or sp_var < 1.0:
-            sp_var = SPATIAL_VAR_FIXED
-            console.print(
-                f"[yellow]KM var unusable; using fallback spatial_var={sp_var}[/yellow]"
-            )
-    else:
-        sp_var = SPATIAL_VAR_FIXED
-        console.print(f"  spatial_var={sp_var:.4g} [fixed]")
-
-    # Correct sigma2: Var[r_hat*dt]/dt = sigma2 + Var[mu(x,t)] ≈ sigma2 + sp_var.
-    # Subtracting sp_var removes the drift-variation component so sigma2 reflects
-    # pure observation noise.  Clamp to 1% of raw to avoid sigma2 ≤ 0.
-    if SIGMA2 is None:
-        sigma2 = max(raw_sigma2 - sp_var, 0.01 * raw_sigma2)
-        console.print(
-            f"  sigma2 estimation: raw={raw_sigma2:.4g}  "
-            f"sp_var={sp_var:.4g}  corrected={sigma2:.4g}"
-        )
-    obs_noise = sigma2 / dt
-    gp_snr = sp_var / obs_noise
-    snr_msg = (
-        f"  spatial_var={sp_var:.4g}  obs_noise={obs_noise:.4g}  "
-        f"GP SNR/obs={gp_snr:.4g}"
-    )
-    if gp_snr < 0.05:
-        console.print(
-            f"[bold red]{snr_msg}[/bold red]\n"
-            "  [red]WARNING: GP_SNR < 0.05 — posterior nearly identical to prior; "
-            "topology signals will have very low dynamic range.[/red]"
-        )
-    elif gp_snr < 0.2:
-        console.print(
-            f"[yellow]{snr_msg}[/yellow]\n"
-            "  [yellow]NOTE: GP_SNR < 0.2 — observation noise dominates; "
-            "topology signals may have limited dynamic range.[/yellow]"
-        )
-    else:
-        console.print(snr_msg)
-
-    # -------------------------------------------------------------------------
-    console.rule("[bold cyan]Step 6 — Initialise Kalman-GP model")
-    model = KalmanGPDriftModel(
-        spatial_lengthscale=sl_init,
-        temporal_lengthscale_days=_temporal_ls_eff,
-        spatial_variance=sp_var,
-        sigma2=sigma2,
-        dt=float(dt),
-    )
-    model.initialise(x_range=x_range_global, n_inducing=_n_inducing_eff, data_x=x_prev)
-    console.print(
-        f"  inducing M={model.M}  state_dim={2 * model.M}  "
-        f"x_range=[{x_lo:.4f},{x_hi:.4f}]  "
-        f"spatial_ls={model.spatial_ls:.4f}  "
-        f"temporal_ls={model.temporal_ls:.2f}d  "
-        f"spatial_var={model.spatial_var:.4g}"
-    )
 
     # -------------------------------------------------------------------------
     # -------------------------------------------------------------------------
@@ -388,7 +554,6 @@ def main() -> None:
     snapshots = []  # (datetime, state_mean, state_cov, x_range_for_topo, inducing_x)
     snapshot_every = 1
     snapshot_counter = 0
-    dt_t_pd = pd.to_datetime(dt_t)  # full datetime array, used for rolling x-range
 
     for w_idx, (w_start, w_end) in enumerate(window_list):
         obs_mask = window_idx_arr == w_idx
@@ -649,6 +814,8 @@ def main() -> None:
         use_reproject=USE_REPROJECT,
         n_grid=N_GRID,
         rng=rng,
+        kernel_hw_phase_a=kernel_half_width_phase_a,
+        trim_quantile=trim_quantile,
     )
 
     console.rule("[bold cyan]Step 11 — Persist model state")

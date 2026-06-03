@@ -48,7 +48,6 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.integrate import cumulative_trapezoid
 from rich.console import Console
 from rich.table import Table
 
@@ -57,7 +56,6 @@ from data_collection import load_series
 from phase_GP import (
     KalmanGPDriftModel,
     topology_from_gp,
-    forecast_topology,
     _SEC_PER_YEAR,
 )
 from regime_estimation import estimate_km
@@ -774,13 +772,13 @@ def main() -> None:
         halfway = (null_m + pre_m) / 2.0
         if direction == "higher":
             if value >= pre_m:
-                return "[bold red]jump very likely, passed pre-jump mean[/bold red]"
+                return "[bold red]jump is likely, passed pre-jump mean[/bold red]"
             if value >= halfway:
                 return "[yellow]passed halfway to pre-jump mean[/yellow]"
             return "typical of calm periods"
         else:  # lower
             if value <= pre_m:
-                return "[bold red]jump very likely, passed pre-jump mean[/bold red]"
+                return "[bold red]jump is likely, passed pre-jump mean[/bold red]"
             if value <= halfway:
                 return "[yellow]passed halfway to pre-jump mean[/yellow]"
             return "typical of calm periods"
