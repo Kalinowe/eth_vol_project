@@ -6,7 +6,7 @@ A sequential Bayesian pipeline for detecting and forecasting **multi-well struct
 
 ## Theoretical Background
 
-This project extends the framework introduced by **Igor Halperin** in *"Non-linear meta-stable dynamics of a particle with a position-dependent mass"* (and related work on *"QLBS: Q-Learner in the Black-Scholes(-Merton) Worlds"*), which treats a financial asset's price as a **particle moving through a potential field**. In that formulation:
+This project extends the framework introduced by **Igor Halperin** in *"Non-Linear and Meta-Stable Dynamics in Financial Markets: Evidence from High Frequency Crypto Currency Market Makers"*, which treats a financial asset's price as a **particle moving through a potential field**. In that formulation:
 
 - The log-price $x_t$ evolves under an SDE whose drift $\mu(x)$ is the negative gradient of a potential: $\mu(x) = -\nabla U(x)$.
 - **Wells** (local minima of $U$) correspond to stable price attractors — the price tends to revert towards them.
@@ -31,35 +31,35 @@ The system is organised into three sequential phases:
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                     PHASE A — KRAMERS-MOYAL                                  │
-│  regime_estimation.py: per-window KM estimation of drift μ(x) and           │
+│                     KRAMERS-MOYAL ESTIMATION                                 │
+│  kramers_moyal.py: per-window KM estimation of drift μ(x) and               │
 │  diffusion D(x) from 30-second log-return bars                              │
 └─────────────────────────────┬───────────────────────────────────────────────┘
                               │  spatial_var, prior calibration
                               ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                     PHASE GP — SEQUENTIAL KALMAN-GP                           │
-│  phase_GP.py: KalmanGPDriftModel — spatio-temporal GP over μ(x,t)           │
+│                     SEQUENTIAL KALMAN-GP                                     │
+│  gaussian_process.py: KalmanGPDriftModel — spatio-temporal GP over μ(x,t)  │
 │  with O(N) Matern 3/2 state-space inference in time × RBF in space          │
 └─────────────────────────────┬───────────────────────────────────────────────┘
                               │
               ┌───────────────┼───────────────┐
               ▼               ▼               ▼
-     ┌────────────┐  ┌──────────────┐  ┌──────────────────┐
-     │  RunGP.py  │  │RunGP_update  │  │ backtest_jumps.py│
-     │ full-hist  │  │  daily incr  │  │  signal backtest │
-     └────────────┘  └──────────────┘  └──────────────────┘
+     ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐
+     │ Initialise_GP.py │  │GP_Daily_Update.py│  │ Backtest.py  │
+     │  full-hist init  │  │  daily incr      │  │  signal bt   │
+     └──────────────────┘  └──────────────────┘  └──────────────┘
 ```
 
 ### Production vs. Research Scripts
 
 | Script | Role |
 |--------|------|
-| **`RunGP.py`** | **Production** — full-history Kalman-GP run. Initialises the model over a date range, processes all windows sequentially, persists state. |
-| **`RunGP_update.py`** | **Production** — incremental daily update. Loads the chained state, ingests one day of new data, produces topology diagnostics + forecasts, saves the updated state for the next day. This is what runs daily in production. |
-| `backtest_jumps.py` | **Research** — mirrors the production pipeline but runs autonomously over a configurable historical window. Detects well-jump events from price geometry alone, then evaluates topology signals as leading indicators. |
+| **`Initialise_GP.py`** | **Production** — full-history Kalman-GP run. Initialises the model over a date range, processes all windows sequentially, persists state. |
+| **`GP_Daily_Update.py`** | **Production** — incremental daily update. Loads the chained state, ingests one day of new data, produces topology diagnostics + forecasts, saves the updated state for the next day. This is what runs daily in production. |
+| `Backtest.py` | **Research** — mirrors the production pipeline but runs autonomously over a configurable historical window. Detects well-jump events from price geometry alone, then evaluates topology signals as leading indicators. |
 
-The backtest uses `init_gp_pipeline()` from `RunGP.py` directly, guaranteeing identical model initialisation between production and evaluation.
+The backtest uses `init_gp_pipeline()` from `Initialise_GP.py` directly, guaranteeing identical model initialisation between production and evaluation.
 
 ---
 
@@ -72,12 +72,12 @@ Raw tick-level data (`aggTrades`) is downloaded from [Binance Vision](https://da
 $$r_k = \log\!\left(\text{BMA}(t_{k+1})\right) - \log\!\left(\text{BMA}(t_k)\right)$$
 
 Two timescales are used:
-- **30-second bars** (Phase A): high-frequency resolution for KM drift/diffusion estimation.
-- **900-second (15-min) bars** (Phase GP): coarser observations for the sequential GP, balancing information density with computational tractability.
+- **30-second bars** (KM estimation): high-frequency resolution for KM drift/diffusion estimation.
+- **900-second (15-min) bars** (GP): coarser observations for the sequential GP, balancing information density with computational tractability.
 
 An optional **EMA demeaning** step removes slow-moving trend components so the GP focuses on the *shape* of the drift field rather than its level.
 
-### 2. Phase A — Kramers-Moyal Estimation
+### 2. Kramers-Moyal Estimation
 
 For each calendar-month window, the **Kramers-Moyal expansion** is applied to the 30-second log-price series to estimate the first two coefficients:
 
@@ -87,11 +87,11 @@ $$D^{(2)}(x) = \lim_{\Delta t \to 0} \frac{1}{2\Delta t} \langle (x_{t+\Delta t}
 
 The implementation uses the `kramersmoyal` library with histogram binning (200 bins by default) and a minimum weight threshold to suppress noisy tail estimates.
 
-Phase A outputs serve two purposes:
+KM outputs serve two purposes:
 1. **Calibration** — the variance of KM drift bins sets `spatial_var`, the prior amplitude of the GP.
 2. **Validation overlay** — KM "red dots" are plotted alongside the GP posterior as a non-parametric sanity check.
 
-### 3. Phase GP — Sequential Kalman-GP
+### 3. Sequential Kalman-GP
 
 The core model places a **separable spatio-temporal GP prior** over the drift field:
 
@@ -141,12 +141,12 @@ Topology signals (level and trend) at configurable look-back offsets before each
 ### Full History Initialisation
 
 ```powershell
-$env:PYTHONIOENCODING='utf-8'; & ".venv/Scripts/python.exe" RunGP.py
+$env:PYTHONIOENCODING='utf-8'; & ".venv/Scripts/python.exe" Initialise_GP.py
 ```
 
 Steps performed:
 1. Download & aggregate raw data for the configured date range.
-2. Run Phase A (KM) on monthly windows to calibrate spatial variance.
+2. Run KM on monthly windows to calibrate spatial variance.
 3. Initialise the Kalman-GP model with the estimated hyperparameters.
 4. Process all windows sequentially: reproject → Kalman update → topology extraction.
 5. Save the full model state to `gp_results/900s/`.
@@ -154,7 +154,7 @@ Steps performed:
 ### Daily Incremental Update
 
 ```powershell
-$env:PYTHONIOENCODING='utf-8'; & ".venv/Scripts/python.exe" RunGP_update.py
+$env:PYTHONIOENCODING='utf-8'; & ".venv/Scripts/python.exe" GP_Daily_Update.py
 ```
 
 Steps performed:
@@ -169,10 +169,22 @@ Steps performed:
 ### Backtest
 
 ```powershell
-$env:PYTHONIOENCODING='utf-8'; & ".venv/Scripts/python.exe" backtest_jumps.py
+$env:PYTHONIOENCODING='utf-8'; & ".venv/Scripts/python.exe" Backtest.py
 ```
 
 Mirrors the production pipeline with a burn-in phase followed by a backtest window. No data leakage: labels are purely price-geometric, and topology at day $d$ uses only data $\le d$.
+
+Outputs are written to `backtests/{start}_{end}/`:
+- `daily_topology.csv` — day-by-day topology across the full period
+- `events.csv` — detected well-jump events
+- `per_event.csv` — signal values at each (event, offset) pair
+- `null_samples.csv` — same schema for null (calm) dates
+- `summary.csv` — per-signal Mann-Whitney stats + rank-biserial IC vs null
+- `plots/all_months_drift.png` — GP drift ±2σ with KM overlay, one panel per backtest month
+- `plots/all_months_potential.png` — integrated potential U(x) ±2σ, one panel per backtest month
+- `plots/YYYY-MM_overview.png` — per-month: ETH/USD price + p_multiwell + barrier_snr, with red jump lines and green calm-day shading
+- `plots/per_signal_boxes.png` — pre-jump vs null signal distributions
+- `plots/events_overview.png` — full-period price + signal panels with jump markers
 
 ---
 
@@ -186,34 +198,40 @@ Mirrors the production pipeline with a burn-in phase followed by a backtest wind
 | `TEMPORAL_LENGTHSCALE_DAYS_INIT` | `5.0` | Matérn temporal memory (days) |
 | `SPATIAL_LENGTHSCALE_INIT` | `None` | `None` → `(x_hi − x_lo) / N_INDUCING` |
 | `EMA_HALFLIFE_DAYS` | `30` | Half-life for drift demeaning |
-| `PHASE_GP_SI` | `900` | GP observation interval (seconds) |
-| `PHASE_A_SI` | `30` | KM estimation interval (seconds) |
+| `GP_SI` | `900` | GP observation interval (seconds) |
+| `KM_SI` | `30` | KM estimation interval (seconds) |
 
 ---
 
 ## Output Gallery
 
-### Log-Price with Topology Overlay
+### Backtest — All Months Drift
 
-The top panel shows ETH log-price over the full history; the bottom panel shows the evolving $p_\text{multiwell}$ signal. Shaded regions indicate periods where the model confidently identifies multi-well structure.
+Grid of GP posterior drift ±2σ panels with KM estimates (red dots) overlaid — one panel per backtest calendar month. Consistent y-axis limits across all panels.
 
-![Log-price with topology overlay](gp_results/900s/gp_2024-01-01_to_2025-12-31_900s_kmvar_reproject_logprice_topology.png)
+### Backtest — All Months Potential
 
-### Potential Landscape Snapshots
+Grid of integrated potential U(x) ±2σ panels — one per backtest month. Wells appear as valleys; barriers as peaks.
 
-Each panel shows the posterior potential $U(x)$ at a different point in time. Wells (local minima) appear as valleys; barriers as peaks. The ±2σ envelope reflects model uncertainty.
+### Backtest — Monthly Overview
 
-![Topology snapshots](gp_results/900s/gp_2024-01-01_to_2025-12-31_900s_kmvar_reproject_topology_snapshots.png)
+Per-month three-panel figure: ETH/USD price (top), p_multiwell (middle), barrier_snr (bottom). Green shading marks calm (low-volatility) days; red vertical lines mark detected jump_start dates. Data plotted as daily steps to show discrete resolution.
 
-### GP Drift with KM Overlay
+### Backtest — Events Overview
 
-The GP posterior drift $\mu(x)$ (blue ±2σ band) vs. the non-parametric KM estimate (red dots). Agreement validates the GP; disagreement signals model adaptation lag.
+Full backtest period: price with topology signal panels and markers at detected well-jump events.
 
-![Drift with KM overlay](gp_results/900s/gp_2024-01-01_to_2025-12-31_900s_kmvar_reproject_drift_km.png)
+![Backtest events overview](backtests/2024-07-01_2025-12-31/plots/events_overview.png)
+
+### Backtest — Signal Distributions
+
+Box plots comparing signal values at look-back offsets before well-jump events (red) vs. null/calm periods (blue). Significant separation confirms predictive value.
+
+![Per-signal box plots](backtests/2024-07-01_2025-12-31/plots/per_signal_boxes.png)
 
 ### Daily Update — Drift Snapshot
 
-A single day's incremental update showing the GP drift posterior updated with new observations, overlaid with KM estimates from the day's data.
+A single day's incremental update showing the GP drift posterior updated with new observations, overlaid with KM estimates.
 
 ![Daily drift snapshot](GP_updates/2026-01-01/drift_snapshot.png)
 
@@ -235,18 +253,6 @@ Barrier mean ± std over time, with the SNR (barrier_mean / barrier_std). Declin
 
 ![Fragility monitor](GP_updates/2026-01-01/fragility.png)
 
-### Backtest — Events Overview
-
-Price with topology signal panels and markers at detected well-jump events. The topology signals visibly elevate before jumps.
-
-![Backtest events overview](backtest_results/events_overview.png)
-
-### Backtest — Signal Distributions
-
-Box plots comparing signal values at look-back offsets before well-jump events (orange) vs. null/calm periods (blue). Significant separation confirms predictive value.
-
-![Per-signal box plots](backtest_results/per_signal_boxes.png)
-
 ---
 
 ## Topology Output Keys
@@ -267,22 +273,22 @@ Box plots comparing signal values at look-back offsets before well-jump events (
 | File | Role |
 |------|------|
 | `data_collection.py` | Download Binance aggTrades zips, aggregate into log-return bars, EMA-demean drift |
-| `regime_estimation.py` | KM bin estimator (`estimate_km`); per-window Phase A pipeline |
-| `phase_GP.py` | `KalmanGPDriftModel`, `topology_from_gp`, `forecast_topology`, `daily_replay`; Matérn 3/2 state-space kernel × RBF spatial kernel |
-| `RunGP.py` | **Production** — full-history Kalman-GP run; writes state to `gp_results/` |
-| `RunGP_update.py` | **Production** — incremental daily update; writes to `GP_updates/{date}/` |
-| `backtest_jumps.py` | **Research** — self-contained backtest mirroring the production pipeline |
-| `paths.py` | Path helpers: `gp_output_dir`, `gp_state_stem` |
-| `plots.py` | GP visualisations: potential snapshots, drift + KM overlay, log-price topology |
+| `kramers_moyal.py` | KM bin estimator (`estimate_km`); per-window KM pipeline |
+| `gaussian_process.py` | `KalmanGPDriftModel`, `topology_from_gp`, `daily_replay`; Matérn 3/2 state-space kernel × RBF spatial kernel |
+| `Initialise_GP.py` | **Production** — full-history Kalman-GP run; writes state pickle to `gp_results/` |
+| `GP_Daily_Update.py` | **Production** — incremental daily update; writes to `GP_updates/{date}/` |
+| `Backtest.py` | **Research** — self-contained backtest; produces drift/potential grids, monthly overviews, and signal-analysis plots under `backtests/{tag}/plots/` |
+| `paths.py` | Path helpers: `gp_output_dir` |
+| `plots.py` | All visualisations: `plot_all_months_drift`, `plot_all_months_potential`, `plot_monthly_overview`, backtest box plots, backtest overview, `detect_price_jumps` |
 | `update/state_io.py` | Load/restore/recalibrate Kalman-GP model state from pickles |
 | `update/daily_cache.py` | Build and maintain daily topology cache |
-| `update/plots_update.py` | Diagnostic plots for `RunGP_update.py` output |
+| `update/plots_update.py` | Diagnostic plots for `GP_Daily_Update.py` output |
 
 ---
 
 ## Data
 
-Raw tick data is downloaded on demand from [Binance Vision](https://data.binance.vision/) (`ETHUSDT-aggTrades-{date}.zip`) and cached under `data/`. Aggregated log-return CSVs are also cached there; re-aggregation is skipped if the file already exists.
+Raw tick data is downloaded on demand from [Binance Vision](https://data.binance.vision/) (`ETHUSDT-aggTrades-{date}.zip`) and cached under `data/`. Aggregated log-return CSVs are also cached there; re-aggregation is skipped if the file already exists. First execution of the pipeline is slow, because files need to be downloaded and aggregated. Subsequent executions with the same parameters are faster.
 
 ---
 

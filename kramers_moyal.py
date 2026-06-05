@@ -1,13 +1,8 @@
 """
-Phase A of the Halperin-extension regime model.
+Kramers-Moyal estimation of non-parametric drift mu(x) from log-price data.
 
-Pipeline per calendar-month window:
-  1. Make sure the daily Binance dumps are downloaded and unzipped.
-  2. Aggregate into log-return bars at one or more sampling intervals.
-  3. Run Kramers-Moyal on the log-prices to recover non-parametric drift mu(x).
-
-Per-window KM drift and diffusion bins are written as CSV files under
-{output_dir}/km/ and consumed downstream by the Kalman-GP pipeline.
+Per calendar-month window: aggregate log-return bars, run KM, and write
+drift/diffusion bins to {output_dir}/km/.
 """
 
 import os
@@ -256,11 +251,11 @@ def analyze_window(
 
 
 # ---------------------------------------------------------------------------
-# Phase A driver
+# KM estimation driver
 # ---------------------------------------------------------------------------
 
 
-def run_phase_a(
+def run_km_estimation(
     start_date,
     end_date,
     seconds_interval,
@@ -289,7 +284,6 @@ def run_phase_a(
     )
 
     kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
-    trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
     km_dir = os.path.join(output_dir, "km")
     os.makedirs(km_dir, exist_ok=True)
 
@@ -301,7 +295,7 @@ def run_phase_a(
             km_dir,
             f"km_{window_start.strftime('%Y-%m-%d')}_to_"
             f"{window_end.strftime('%Y-%m-%d')}_{seconds_interval}s"
-            f"{kernel_tag}{trim_tag}.csv",
+            f"{kernel_tag}.csv",
         )
         if os.path.exists(km_path):
             n_cached += 1
@@ -356,9 +350,7 @@ def run_phase_a(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Standalone execution is intentionally disabled: this module is part of
-    # the pipeline and its parameters live in RunEM.py. Running it directly
-    # would silently fall back to the old hardcoded config and quietly
-    # diverge from whatever RunEM is currently configured to do.
-    Console().print("[yellow]regime_estimation.py is part of the pipeline; ")
+    Console().print(
+        "[yellow]kramers_moyal.py is a library module; import it from RunGP.py.[/yellow]"
+    )
     raise SystemExit(0)

@@ -357,7 +357,7 @@ def load_series(
       produced by ``dc.aggregate_log_returns_range(start, end, ...)`` is read.
 
     - ``window_type='weekly'|'biweekly'|'monthly'``: the per-window CSVs
-      produced by Phase A's per-window aggregation are read and concatenated
+      produced by per-window aggregation are read and concatenated
       in time order. Cross-window dx are dropped via a window_idx tag so a
       jump between two windows cannot leak into the SDE M-step.
 
@@ -401,7 +401,7 @@ def load_series(
         df = df.sort_values("datetime").reset_index(drop=True)
         df["__window_idx"] = 0
     else:
-        from regime_estimation import iter_windows
+        from kramers_moyal import iter_windows
 
         frames = []
         for w_idx, (window_start, window_end) in enumerate(
@@ -469,9 +469,6 @@ def load_series(
     return x_prev, dx, float(seconds_interval), dt_t
 
 
-## Change 4 — EMA drift demeaning
-
-
 def ema_demean_drift(r, dt_t, halflife_days=14.0):
     """
     Remove the slow-moving drift trend from scaled increments r = dx/dt
@@ -493,9 +490,7 @@ def ema_demean_drift(r, dt_t, halflife_days=14.0):
                     anything pd.to_datetime accepts)
     halflife_days : float, EMA halflife in days. Default 14.
 
-    Pass halflife_days = 0 (or None, or non-finite) to disable demeaning —
-    used by Phase GP when the spatial signal is fragile against an EMA
-    whose halflife is comparable to the regime dwell time.
+    Pass halflife_days = 0 (or None, or non-finite) to disable demeaning.
 
     Returns
     -------
@@ -523,21 +518,3 @@ def ema_demean_drift(r, dt_t, halflife_days=14.0):
     r_bar = r_bar_series.values
     r_hat = r - r_bar
     return r_hat, r_bar
-
-
-# ---------------------------------------------------------------------------
-# Useful tool
-# ---------------------------------------------------------------------------
-
-
-def window_seconds(window_type):
-    if window_type == "weekly":
-        return 7 * 24 * 3600
-    elif window_type == "biweekly":
-        return 14 * 24 * 3600
-    elif window_type == "monthly":
-        return 30 * 24 * 3600
-    else:
-        raise ValueError(
-            f"Unknown window_type '{window_type}'. Use 'weekly', 'biweekly', or 'monthly'."
-        )

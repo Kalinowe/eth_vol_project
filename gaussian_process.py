@@ -1,37 +1,22 @@
 """
-Phase GP — Sequential Gaussian Process over the drift field mu(x, t).
+Sequential Gaussian Process over the drift field mu(x, t).
 
-Phase C of the pipeline: a single sequential Kalman-filter GP whose state
-is continuously updated as new observations arrive. The GP factors as a
-spatial RBF kernel over log-price times an exact Matern 3/2 state-space
-representation in time, giving O(N) inference and a constant-size state.
+Kalman-filter GP with RBF spatial kernel × Matérn 3/2 temporal state-space,
+giving O(N) inference with constant state size.
 
-    r_t      = (dx_t / dt) * sec_per_year                annualised drift [/year]
-    r_hat_t  = r_t - EMA(r_t, halflife=tau_ema)          causal EMA demean
+    r_t      = (dx_t / dt) * sec_per_year        annualised drift [/yr]
     r_hat_t ~ mu(x_{t-1}, t) + eps_t
-    eps_t   ~ N(0, sigma2 / dt)                          Euler-Maruyama noise
-    mu(x,t) ~ GP(0, k_rbf(x, x') * k_matern32(t, t'))
+    eps_t   ~ N(0, sigma2 / dt)                  observation noise
+    mu(x,t) ~ GP(0, k_rbf(x,x') * k_matern32(t,t'))
 
-All Kalman state, sigma2, and topology outputs are in annualised units
-(/year for drift, /year² for variance). spatial_var=1.0 is calibrated to
-this convention.
-
-Outputs (under output_dir):
-    phase_gp_<stem>_topology.csv     p_multiwell(t), barrier(t)
-    phase_gp_<stem>_forecast.csv     topology forecasts at multiple horizons
-    phase_gp_<stem>_params.csv       learned kernel hyperparameters
-    phase_gp_<stem>_topology.png     topology signal time series
-    phase_gp_<stem>_potential.png    U(x) snapshots at selected times
+All state and topology outputs are in annualised units (/yr for drift, /yr² for variance).
 """
 
-import os
 import warnings
 import numpy as np
 import pandas as pd
 from scipy.integrate import cumulative_trapezoid
 from scipy.linalg import expm, solve, cholesky
-from rich.console import Console
-
 from scipy.signal import argrelmin
 
 
@@ -479,8 +464,7 @@ def topology_from_gp(
 ):
     """Topology statistics from the current GP posterior — p_multiwell, barrier.
 
-    Assumes the GP state is already in annualised units (mu in /year, mu_var in
-    /year²); see run_phase_gp where r is multiplied by _SEC_PER_YEAR.
+    Assumes the GP state is in annualised units (mu in /year, mu_var in /year²).
     """
     rng = rng or np.random.default_rng(42)
     x_grid = np.linspace(x_range[0], x_range[1], n_grid)
@@ -559,110 +543,8 @@ def topology_from_gp(
 
 
 # ---------------------------------------------------------------------------
-# Topology forecast
-# ---------------------------------------------------------------------------
-
-
-def forecast_topology(
-    model,
-    forecast_horizons_days,
-    x_range,
-    n_grid=200,
-    n_samples=200,
-    min_crossing_sep=10,
-    min_barrier_fraction=0.1,
-    rng=None,
-):
-    """Forecast topology at each horizon by propagating the Kalman state forward."""
-    rng = rng or np.random.default_rng(42)
-    rows = []
-    dt_days = model.dt / 86400.0
-
-    for h in forecast_horizons_days:
-        n_steps = max(1, int(round(h / dt_days)))
-
-        A_n = np.linalg.matrix_power(model.A_block, n_steps)
-        m_pred = A_n @ model.state_mean
-        P_pred = model.state_cov.copy()
-        for _ in range(n_steps):
-            P_pred = model.A_block @ P_pred @ model.A_block.T + model.Q_block
-
-        fwd_model = KalmanGPDriftModel(
-            spatial_lengthscale=model.spatial_ls,
-            temporal_lengthscale_days=model.temporal_ls,
-            spatial_variance=model.spatial_var,
-            sigma2=model.sigma2,
-            dt=model.dt,
-        )
-        fwd_model.inducing_x = model.inducing_x
-        fwd_model.M = model.M
-        fwd_model._K_zz_inv = model._K_zz_inv
-        fwd_model.A_block = model.A_block
-        fwd_model.Q_block = model.Q_block
-        fwd_model._F = model._F
-        fwd_model._L = model._L
-        fwd_model._Qc = model._Qc
-        fwd_model._P_inf_1d = model._P_inf_1d
-        fwd_model.state_mean = m_pred
-        fwd_model.state_cov = P_pred
-
-        topo = topology_from_gp(
-            fwd_model,
-            x_range,
-            n_grid=n_grid,
-            n_samples=n_samples,
-            min_crossing_sep=min_crossing_sep,
-            min_barrier_fraction=min_barrier_fraction,
-            rng=rng,
-        )
-
-        rows.append(
-            {
-                "horizon_days": h,
-                "p_multiwell": topo["p_multiwell"],
-                "barrier_mean": topo["barrier_mean"],
-                "barrier_std": topo["barrier_std"],
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------------------------
 # Replay helpers
 # ---------------------------------------------------------------------------
-
-
-def step_and_describe(
-    model,
-    x_prev,
-    r_hat,
-    t_seconds,
-    *,
-    x_range,
-    n_inducing,
-    n_grid=200,
-    n_samples=200,
-    min_crossing_sep=10,
-    min_barrier_fraction=0.1,
-    rng=None,
-):
-    """Kalman update then topology extraction.
-
-    Calls ``model.update`` then ``topology_from_gp`` and returns the topology
-    dict.  Use alongside ``model.reproject_to_range`` when a reproject is
-    needed before the update.
-    """
-    model.update(x_prev, r_hat, t_seconds)
-    return topology_from_gp(
-        model,
-        x_range,
-        n_grid=n_grid,
-        n_samples=n_samples,
-        min_crossing_sep=min_crossing_sep,
-        min_barrier_fraction=min_barrier_fraction,
-        rng=rng,
-    )
 
 
 def daily_replay(

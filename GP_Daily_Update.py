@@ -1,36 +1,33 @@
 """
 RunGP_update — incremental Kalman-GP update with new data.
 
-Loads the persisted state pickle from `RunGP.py`, ingests new daily
-data appended after the saved `last_dt`, runs a Kalman update on the new
-window, and produces diagnostics + forecasts in:
+Loads the persisted state pickle from RunGP.py, ingests new daily data
+appended after the saved last_dt, runs a Kalman update on the new window,
+and produces diagnostics in:
 
     GP_updates/{NEW_END_DATE}/
 
 WHAT THIS SCRIPT DOES
 ---------------------
-1.  Loads the most recent `*_state.pkl` from `gp_results/{si}s/`.
-2.  Ensures + aggregates new data from the day after `state['last_dt']` through
+1.  Loads the most recent *_state.pkl from gp_results/{si}s/.
+2.  Ensures + aggregates new data from the day after state['last_dt'] through
     NEW_END_DATE (today by default).
-3.  Reprojects the GP to the new window's x-range (mirrors RunGP.py).
-4.  Runs Kalman updates ONE observation at a time so per-observation
-    innovations (and their z-scores) can be recorded for diagnostics.
+3.  Reprojects the GP to the new window's x-range.
+4.  Runs Kalman updates one observation at a time (records per-observation
+    innovations and z-scores for diagnostics).
 5.  Computes:
       - new-window topology  (p_multiwell, barrier_mean, ...)
-      - trend slope of `p_multiwell` and `barrier_mean` over recent history
-      - "fragility" = barrier_std / barrier_mean   (low barrier + high std
-        ⇒ topology near collapse / regime-change candidate)
-      - mean innovation z-score (a positive surprise rate flags model mis-fit)
-      - forecast topology at horizons {1, 3, 7, 14, 30} days using
-        `forecast_topology()`.
+      - trend slope of p_multiwell and barrier_mean over recent history
+      - fragility = barrier_std / barrier_mean
+      - mean innovation z-score
 6.  Plots:
-      - drift snapshot @ end of new window + KM red dots from new data
-      - potential U(x) snapshot + observed U_KM(x) red dots
-      - p_multiwell history + new point + forecast band
-      - barrier_mean history + ±std band + new point + forecasts
-      - innovation z-score time series for the new window
+      - drift snapshot @ end of new window + KM red dots
+      - potential U(x) snapshot
+      - p_multiwell history + new point
+      - barrier_mean history + ±std band + new point
+      - innovation z-score time series
       - σ/μ + fragility history
-7.  Writes a chained `update_state.pkl` so successive updates compose.
+7.  Writes a chained update_state.pkl for successive updates.
 
 Run:
     $env:PYTHONIOENCODING='utf-8'; & ".venv/Scripts/python.exe" RunGP_update.py
@@ -39,7 +36,6 @@ Run:
 from __future__ import annotations
 
 import os
-import glob
 import json
 import pickle
 import sys
@@ -47,18 +43,15 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from rich.console import Console
 from rich.table import Table
 
 import data_collection as dc
 from data_collection import load_series
-from phase_GP import (
-    KalmanGPDriftModel,
+from gaussian_process import (
     topology_from_gp,
     _SEC_PER_YEAR,
 )
-from regime_estimation import estimate_km
 from paths import gp_output_dir
 
 
@@ -83,15 +76,9 @@ NEW_END_DATE: datetime | None = None
 #   chain_state.pkl, e.g. NEW_START_DATE = datetime(2026, 1, 1).
 NEW_START_DATE: datetime | None = None
 
-# Reprojection margin (same convention as RunGP.py).
-REPROJECT_MARGIN = 0.1
-
 # KM bins for the "observed drift red dots" overlay.
 KM_N_BINS = 80
 KM_WEIGHT_THRESHOLD = 5
-
-# Forecast horizons in days.
-FORECAST_HORIZONS = [1, 2, 3]
 
 # Trend window: number of trailing *daily* topology rows used for slope signals.
 # Must match TREND_WINDOW in backtest_jumps.py so the signals are comparable.
@@ -137,7 +124,6 @@ DAILY_TOPO_CACHE_FNAME = "daily_topology_cache.csv"
 from update.state_io import (
     _autopick_state,
     _restore_model,
-    _restore_model_from_snap,
     _predict_at,
     _km_bins_for_overlay,
     _is_last_day_of_month,
@@ -186,60 +172,27 @@ def gp_update(
 ) -> dict:
     """Run one Kalman-GP incremental update step.
 
-    Performs all mathematical operations (data loading, Kalman update,
-    topology, signal computation) and writes persistent outputs
-    (diagnostics.json, topology_history.csv, update_state.pkl) to *out_dir*.
-
-    Designed to be called from ``main()`` for the production workflow and
-    importable by ``backtest_jumps.py`` when replaying history day-by-day to
-    ensure the backtest exercises the exact same production code path.
+    Loads data, runs Kalman updates, computes topology and signals, and
+    writes outputs (diagnostics.json, topology_history.csv, update_state.pkl)
+    to out_dir.
 
     Parameters
     ----------
     blob : dict
-        State pickle from a previous RunGP or RunGP_update run.  The dict is
-        shallow-copied internally so the caller's reference is never mutated.
+        State pickle from a previous RunGP or RunGP_update run.
     new_start_date, new_end_date : datetime
         Inclusive date range to process.
     out_dir : str
         Directory for output files (created by the caller).
     console : Console | None
-        Rich Console for step-level logging.  Pass ``None`` (default) to run
-        silently — appropriate when replaying many days in a backtest loop.
+        Rich Console for step-level logging.
 
     Returns
     -------
-    dict or ``{}``
-        Returns an empty dict if there are no usable observations for the
-        requested window (caller should treat this as a no-op).  Otherwise:
-
-        ``"diagnostics"``
-            The 4 backtest signals + supporting fields, also written to
-            ``diagnostics.json``.
-        ``"new_blob"``
-            Updated state dict — pass as *blob* on the next call or pickle
-            externally.
-        ``"chained_path"``
-            Path of the written ``update_state.pkl``.
-        ``"topo"``
-            Raw ``topology_from_gp`` result dict.
-        ``"daily_cache_plot"``
-            DataFrame (≤ *daily_topo_lookback_days* rows) for the fragility
-            plot.
-        ``"km_df"``
-            KM drift-bin DataFrame for drift/potential overlay plots.
-        ``"model"``
-            Updated ``KalmanGPDriftModel`` instance.
-        ``"x_prev"``
-            Log-price array for the new window.
-        ``"dt_t"``
-            Timestamp array for the new window.
-        ``"z_innov"``
-            Per-observation innovation z-scores.
-        ``"dt_query"``
-            ``pd.Timestamp`` of the last processed observation.
-        ``"topo_range"``
-            ``(x_lo, x_hi)`` tuple used for topology sampling.
+    dict or {}
+        Empty dict if no usable observations.  Otherwise keys:
+        diagnostics, new_blob, chained_path, topo, daily_cache_plot,
+        km_df, model, x_prev, dt_t, z_innov, dt_query, topo_range.
     """
     # Shallow-copy so internal mutations (sigma2_base, last_reproject_date,
     # etc.) never propagate back to the caller's blob reference.
@@ -247,8 +200,8 @@ def gp_update(
     rng = np.random.default_rng(seed)
 
     cfg = blob["config"]
-    si = int(cfg["phase_gp_seconds_interval"])
-    si_a = int(cfg["phase_a_seconds_interval"])
+    si = int(cfg["gp_seconds_interval"])
+    km_si = int(cfg["km_seconds_interval"])
     khw = int(cfg["kernel_half_width"])
     trim = float(cfg["trim_quantile"])
     ema_halflife = float(cfg.get("ema_halflife_days", 0.0))
@@ -267,7 +220,7 @@ def gp_update(
     if console:
         console.rule("[bold cyan]Step 3 — Ensure raw data + aggregate")
     dc.ensure_data(new_start_date, new_end_date)
-    for s in sorted({si_a, si}):
+    for s in sorted({km_si, si}):
         dc.aggregate_log_returns_range(
             new_start_date,
             new_end_date,
@@ -277,9 +230,8 @@ def gp_update(
             ema_halflife_days=ema_halflife if s == si else 0.0,
         )
 
-    # ---- Step 4: load Phase GP series ---------------------------------------
     if console:
-        console.rule("[bold cyan]Step 4 — Load new-window Phase GP series")
+        console.rule("[bold cyan]Step 4 — Load new-window GP series")
     x_prev, dx, dt_step, dt_t = load_series(
         new_start_date,
         new_end_date,
@@ -380,7 +332,7 @@ def gp_update(
             model,
             new_start_date,
             new_end_date,
-            si_a=si_a,
+            km_si=km_si,
             khw=khw,
             ema_halflife=ema_halflife,
             cfg=cfg,
@@ -525,7 +477,7 @@ def gp_update(
     x_prev_km, _dx_km, _dt_km, _ = load_series(
         new_start_date,
         new_end_date,
-        si_a,
+        km_si,
         kernel_half_width=khw,
         trim_quantile=trim,
         ema_halflife_days=0.0,
@@ -538,7 +490,7 @@ def gp_update(
     )
     km_df = _km_bins_for_overlay(
         log_prices_km,
-        seconds_interval=si_a,
+        seconds_interval=km_si,
         n_bins=km_n_bins,
         weight_threshold=km_weight_threshold,
         x_range=topo_range,
@@ -603,7 +555,6 @@ def gp_update(
         "mu_std_to_mean_obs_range": mu_std_to_mean_obs,
         "signal_trend_days": signal_trend_days,
         "month_end_recalibration": recalib_meta,
-        "forecasts": [],
     }
     with open(os.path.join(out_dir, "diagnostics.json"), "w") as fh:
         json.dump(diagnostics, fh, indent=2, default=str)
@@ -705,7 +656,7 @@ def main() -> None:
     with open(state_path, "rb") as fh:
         blob = pickle.load(fh)
     cfg = blob["config"]
-    si = int(cfg["phase_gp_seconds_interval"])
+    si = int(cfg["gp_seconds_interval"])
     last_dt = pd.Timestamp(blob["last_dt"])
     console.print(
         f"  pipeline={blob['pipeline']}  si={si}s  last_dt={last_dt}  "

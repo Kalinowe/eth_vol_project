@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.integrate import cumulative_trapezoid
-from phase_GP import topology_from_gp, _SEC_PER_YEAR
+from gaussian_process import topology_from_gp, _SEC_PER_YEAR
 
 
 # ---------------------------------------------------------------------------
@@ -22,8 +22,7 @@ def detect_price_jumps(
 ) -> pd.DataFrame:
     """Detect well-jump events from a daily log-price series.
 
-    Identical logic to ``_detect_jumps`` in backtest_jumps.py.  Returns a
-    DataFrame with columns: event_id, pre_stable_start, pre_stable_end,
+    Returns a DataFrame with columns: event_id, pre_stable_start, pre_stable_end,
     jump_start, post_stable_start, pre_log_price, post_log_price,
     log_price_change, direction.  Returns an empty DataFrame if no events.
     """
@@ -102,7 +101,7 @@ def plot_topology_snapshots(
     snapshots,
     snapped_start,
     snapped_end,
-    phase_gp_si,
+    gp_si,
     out_path,
     n_grid=200,
     n_samples=200,
@@ -202,7 +201,7 @@ def plot_topology_snapshots(
 
     fig.suptitle(
         f"GP potential U(x) snapshots  |  "
-        f"{snapped_start.date()} – {snapped_end.date()}, {phase_gp_si}s",
+        f"{snapped_start.date()} – {snapped_end.date()}, {gp_si}s",
         fontsize=9,
     )
     fig.tight_layout()
@@ -216,20 +215,19 @@ def plot_drift_with_km(
     snapshots,
     snapped_start,
     snapped_end,
-    phase_a_si,
-    phase_gp_si,
+    km_si,
+    gp_si,
     output_dir,
     out_path,
     spatial_var_source,
     use_reproject,
     n_grid=200,
     rng=None,
-    kernel_hw_phase_a=0,
-    trim_quantile=0.0,
+    km_kernel_hw=0,
 ):
     """
     Grid of panels (one per snapshot) showing GP posterior drift overlaid with
-    Phase A KM bin estimates.
+    KM bin estimates.
 
     Y-axis uses a weighted percentile of KM drift values so sparse boundary
     bins with extreme drift do not inflate the scale.
@@ -240,9 +238,8 @@ def plot_drift_with_km(
         return
 
     km_dir = os.path.join(output_dir, "km")
-    _kernel_tag = f"_k{kernel_hw_phase_a}" if kernel_hw_phase_a > 0 else ""
-    _trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
-    _km_suffix = f"_{phase_a_si}s{_kernel_tag}{_trim_tag}.csv"
+    _kernel_tag = f"_k{km_kernel_hw}" if km_kernel_hw > 0 else ""
+    _km_suffix = f"_{km_si}s{_kernel_tag}.csv"
 
     # ---- Y-axis bounds: weighted percentile of KM drift across the full period ----
     all_drifts, all_weights = [], []
@@ -396,7 +393,7 @@ def plot_drift_with_km(
 
     fig.suptitle(
         f"GP drift + KM estimates  |  {snapped_start.date()} – {snapped_end.date()}, "
-        f"{phase_gp_si}s  |  sp_var={spatial_var_source}  "
+        f"{gp_si}s  |  sp_var={spatial_var_source}  "
         f"reproject={use_reproject}",
         fontsize=9,
     )
@@ -413,7 +410,7 @@ def plot_logprice_topology(
     dt_t_all,
     snapped_start,
     snapped_end,
-    phase_gp_si,
+    gp_si,
     out_path,
     spatial_var_source,
     use_reproject,
@@ -548,11 +545,407 @@ def plot_logprice_topology(
 
     fig.suptitle(
         f"Log-price & GP topology  |  {pd.Timestamp(snapped_start).date()} – {pd.Timestamp(snapped_end).date()}, "
-        f"{phase_gp_si}s  |  sp_var={spatial_var_source}  "
+        f"{gp_si}s  |  sp_var={spatial_var_source}  "
         f"reproject={use_reproject}",
         fontsize=9,
     )
     fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Per-month backtest plots
+# ---------------------------------------------------------------------------
+
+
+def km_drift_ylim(
+    km_dir: str,
+    km_si: int,
+    km_kernel_hw: int,
+    q_lo: float = 0.02,
+    q_hi: float = 0.98,
+    pad_frac: float = 0.25,
+) -> tuple:
+    """Robust global y-axis limits from all KM drift CSVs in *km_dir*."""
+    kernel_tag = f"_k{km_kernel_hw}" if km_kernel_hw > 0 else ""
+    km_suffix = f"_{km_si}s{kernel_tag}.csv"
+    all_drifts, all_weights = [], []
+    if not os.path.isdir(km_dir):
+        return -200.0, 200.0
+    for fname in sorted(os.listdir(km_dir)):
+        if not fname.endswith(km_suffix):
+            continue
+        df = pd.read_csv(os.path.join(km_dir, fname)).dropna(subset=["drift"])
+        if df.empty:
+            continue
+        all_drifts.extend((df["drift"].values * _SEC_PER_YEAR).tolist())
+        all_weights.extend(df["weight"].values.tolist())
+    if not all_drifts:
+        return -200.0, 200.0
+    arr = np.asarray(all_drifts)
+    wts = np.asarray(all_weights, dtype=float)
+    wts /= wts.sum()
+    order = np.argsort(arr)
+    cdf = np.cumsum(wts[order])
+    q2 = arr[order[np.searchsorted(cdf, q_lo)]]
+    q98 = arr[order[np.searchsorted(cdf, q_hi)]]
+    pad = pad_frac * max(abs(q2), abs(q98), 1.0)
+    return float(q2 - pad), float(q98 + pad)
+
+
+def plot_all_months_drift(
+    model,
+    snapshots: list,
+    out_path: str,
+    km_dir: str = None,
+    km_si: int = 30,
+    km_kernel_hw: int = 3,
+    n_grid: int = 200,
+    y_lo: float = None,
+    y_hi: float = None,
+    backtest_start=None,
+    backtest_end=None,
+) -> None:
+    """Grid of GP drift \u00b12\u03c3 + KM overlay panels \u2014 one panel per backtest month."""
+    if not snapshots:
+        print(f"[plot_all_months_drift] no snapshots; skipping {out_path}")
+        return
+
+    kernel_tag = f"_k{km_kernel_hw}" if km_kernel_hw > 0 else ""
+    km_suffix = f"_{km_si}s{kernel_tag}.csv"
+
+    n = len(snapshots)
+    cols = min(n, 3)
+    rows = int(np.ceil(n / cols))
+    fig, axes = plt.subplots(
+        rows, cols, figsize=(5.5 * cols, 4.0 * rows), squeeze=False
+    )
+    axes_flat = axes.flatten()
+
+    saved_mean = model.state_mean.copy()
+    saved_cov = model.state_cov.copy()
+    saved_inducing = model.inducing_x.copy()
+
+    for k, ax in enumerate(axes_flat):
+        if k >= n:
+            ax.axis("off")
+            continue
+
+        snap = snapshots[k]
+        dt_end = pd.Timestamp(snap[0])
+        sm = np.asarray(snap[1])
+        sc = np.asarray(snap[2])
+        topo_range = snap[3]
+        inducing_arr = np.asarray(snap[4])
+        month_start = pd.Timestamp(snap[5]) if len(snap) > 5 else dt_end.replace(day=1)
+
+        model.state_mean = sm
+        model.state_cov = sc
+        if not np.array_equal(model.inducing_x, inducing_arr):
+            model.inducing_x = inducing_arr
+            model._recompute_hp_dependent()
+
+        x_grid = np.linspace(topo_range[0], topo_range[1], n_grid)
+        _predict_total = getattr(model, "predict_total", model.predict)
+        mu_mean, mu_var = _predict_total(x_grid, full_cov=False)
+        mu_std = np.sqrt(np.maximum(mu_var, 0.0))
+
+        # Load KM data for this month
+        km_df = None
+        if km_dir is not None and os.path.isdir(km_dir):
+            for fname in sorted(os.listdir(km_dir)):
+                if not fname.endswith(km_suffix):
+                    continue
+                parts = fname.replace(".csv", "").split("_")
+                try:
+                    km_s = pd.Timestamp(parts[1])
+                    km_e = pd.Timestamp(parts[3])
+                except Exception:
+                    continue
+                if km_s <= dt_end <= km_e + pd.Timedelta(days=1):
+                    cand = pd.read_csv(os.path.join(km_dir, fname)).dropna(
+                        subset=["drift"]
+                    )
+                    if not cand.empty:
+                        km_df = cand
+                        break
+
+        ax.axhline(0, color="grey", linewidth=0.5)
+        ax.fill_between(
+            x_grid,
+            mu_mean - 2 * mu_std,
+            mu_mean + 2 * mu_std,
+            color="steelblue",
+            alpha=0.2,
+            label="GP \u00b12\u03c3",
+        )
+        ax.plot(x_grid, mu_mean, color="steelblue", linewidth=1.4, label="GP mean")
+        if km_df is not None:
+            km_sorted = km_df.sort_values("bin_center")
+            d_ann = km_sorted["drift"].values * _SEC_PER_YEAR
+            w = km_sorted["weight"].values.astype(float)
+            sz = 5 + 25 * w / max(w.max(), 1.0)
+            ax.scatter(
+                km_sorted["bin_center"].values,
+                d_ann,
+                s=sz,
+                c="crimson",
+                alpha=0.45,
+                edgecolors="none",
+                zorder=4,
+                label="KM bins",
+            )
+        ax.scatter(
+            inducing_arr,
+            np.zeros(len(inducing_arr)),
+            marker="|",
+            color="darkgreen",
+            s=60,
+            zorder=5,
+            label="inducing",
+        )
+        ax.set_xlim(topo_range[0], topo_range[1])
+        if y_lo is not None and y_hi is not None:
+            ax.set_ylim(y_lo, y_hi)
+        ax.set_title(month_start.strftime("%Y-%m"), fontsize=9)
+        ax.set_xlabel("log-price", fontsize=7)
+        ax.set_ylabel("drift [/yr]", fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.grid(alpha=0.25)
+        if k == 0:
+            ax.legend(fontsize=6, loc="best")
+
+    model.state_mean = saved_mean
+    model.state_cov = saved_cov
+    if not np.array_equal(model.inducing_x, saved_inducing):
+        model.inducing_x = saved_inducing
+        model._recompute_hp_dependent()
+
+    title = "GP drift \u00b12\u03c3 with KM overlay \u2014 all backtest months"
+    if backtest_start is not None and backtest_end is not None:
+        title += (
+            f"  |  {pd.Timestamp(backtest_start).date()}"
+            f" \u2013 {pd.Timestamp(backtest_end).date()}"
+        )
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def plot_all_months_potential(
+    model,
+    snapshots: list,
+    out_path: str,
+    n_grid: int = 200,
+    n_samples: int = 120,
+    rng=None,
+    backtest_start=None,
+    backtest_end=None,
+) -> None:
+    """Grid of GP potential U(x) \u00b12\u03c3 panels \u2014 one panel per backtest month."""
+    rng = rng or np.random.default_rng(0)
+    if not snapshots:
+        print(f"[plot_all_months_potential] no snapshots; skipping {out_path}")
+        return
+
+    n = len(snapshots)
+    cols = min(n, 3)
+    rows = int(np.ceil(n / cols))
+    fig, axes = plt.subplots(
+        rows, cols, figsize=(5.5 * cols, 4.0 * rows), squeeze=False
+    )
+    axes_flat = axes.flatten()
+
+    saved_mean = model.state_mean.copy()
+    saved_cov = model.state_cov.copy()
+    saved_inducing = model.inducing_x.copy()
+
+    for k, ax in enumerate(axes_flat):
+        if k >= n:
+            ax.axis("off")
+            continue
+
+        snap = snapshots[k]
+        dt_end = pd.Timestamp(snap[0])
+        sm = np.asarray(snap[1])
+        sc = np.asarray(snap[2])
+        topo_range = snap[3]
+        inducing_arr = np.asarray(snap[4])
+        month_start = pd.Timestamp(snap[5]) if len(snap) > 5 else dt_end.replace(day=1)
+
+        model.state_mean = sm
+        model.state_cov = sc
+        if not np.array_equal(model.inducing_x, inducing_arr):
+            model.inducing_x = inducing_arr
+            model._recompute_hp_dependent()
+
+        x_grid = np.linspace(topo_range[0], topo_range[1], n_grid)
+        _predict_total = getattr(model, "predict_total", model.predict)
+        mu_mean, _ = _predict_total(x_grid, full_cov=False)
+        U_mean = -cumulative_trapezoid(mu_mean, x_grid, initial=0.0)
+        U_mean -= U_mean.min()
+
+        f_samples = model.sample_drift(x_grid, n_samples=n_samples, rng=rng)
+        U_samples = -cumulative_trapezoid(f_samples, x_grid, axis=0, initial=0.0)
+        U_samples -= U_samples.min(axis=0, keepdims=True)
+        U_std = U_samples.std(axis=1)
+
+        ax.fill_between(
+            x_grid,
+            U_mean - 2 * U_std,
+            U_mean + 2 * U_std,
+            color="steelblue",
+            alpha=0.2,
+            label="\u00b12\u03c3",
+        )
+        ax.plot(x_grid, U_mean, color="steelblue", linewidth=1.4, label="U(x) mean")
+        ax.scatter(
+            inducing_arr,
+            np.zeros(len(inducing_arr)),
+            marker="|",
+            color="darkgreen",
+            s=60,
+            zorder=5,
+            label="inducing",
+        )
+        ax.set_xlim(topo_range[0], topo_range[1])
+        ax.set_title(month_start.strftime("%Y-%m"), fontsize=9)
+        ax.set_xlabel("log-price", fontsize=7)
+        ax.set_ylabel("U(x) = \u2212\u222bμ dx", fontsize=7)
+        ax.tick_params(labelsize=6)
+        ax.grid(alpha=0.25)
+        if k == 0:
+            ax.legend(fontsize=6, loc="best")
+
+    model.state_mean = saved_mean
+    model.state_cov = saved_cov
+    if not np.array_equal(model.inducing_x, saved_inducing):
+        model.inducing_x = saved_inducing
+        model._recompute_hp_dependent()
+
+    title = "GP potential U(x) \u00b12\u03c3 \u2014 all backtest months"
+    if backtest_start is not None and backtest_end is not None:
+        title += (
+            f"  |  {pd.Timestamp(backtest_start).date()}"
+            f" \u2013 {pd.Timestamp(backtest_end).date()}"
+        )
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def plot_monthly_overview(
+    daily_df: pd.DataFrame,
+    events_df: pd.DataFrame,
+    month_start: pd.Timestamp,
+    month_end: pd.Timestamp,
+    out_path: str,
+    stable_days: int = 4,
+    stable_thr: float = 0.05,
+) -> None:
+    """Three-panel monthly overview: price USD + p_multiwell + barrier_snr.
+
+    Green shading marks calm (low-volatility) days identified by a rolling
+    log-price range below *stable_thr*.  Vertical red lines mark jump_start
+    dates from *events_df* that fall within the month.
+    """
+    # Compute rolling range on the full series for correct lookback at month edges
+    lp_full = daily_df["log_price"].sort_index()
+    roll_range = lp_full.rolling(stable_days, min_periods=stable_days).apply(
+        lambda w: w.max() - w.min(), raw=True
+    )
+    calm_all = roll_range < stable_thr
+
+    mask = (daily_df.index >= month_start) & (daily_df.index <= month_end)
+    df_m = daily_df[mask].copy()
+    if df_m.empty:
+        return
+    calm_m = calm_all[mask]
+
+    # Derive barrier_snr if not already present
+    if "barrier_snr" not in df_m.columns:
+        bstd = df_m["barrier_std"].replace(0, np.nan)
+        df_m["barrier_snr"] = df_m["barrier_mean"] / bstd
+
+    # Jump dates inside this month
+    jump_dates = []
+    if (
+        events_df is not None
+        and not events_df.empty
+        and "jump_start" in events_df.columns
+    ):
+        for jt in pd.to_datetime(events_df["jump_start"]).dt.normalize():
+            if month_start <= jt <= month_end:
+                jump_dates.append(jt)
+
+    def _shade_calm(ax):
+        calm_idx = sorted(calm_m[calm_m].index)
+        if not calm_idx:
+            return
+        runs, lo = [], calm_idx[0]
+        for i in range(1, len(calm_idx)):
+            if (calm_idx[i] - calm_idx[i - 1]).days > 1:
+                runs.append((lo, calm_idx[i - 1]))
+                lo = calm_idx[i]
+        runs.append((lo, calm_idx[-1]))
+        for s, e in runs:
+            ax.axvspan(
+                s,
+                e + pd.Timedelta(hours=23),
+                color="green",
+                alpha=0.10,
+                linewidth=0,
+            )
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(11, 7), sharex=True, constrained_layout=True
+    )
+    ax_price, ax_pm, ax_snr = axes
+    panels = [
+        (ax_price, "price_usd", "ETH/USD [$]"),
+        (ax_pm, "p_multiwell", "p_multiwell"),
+        (ax_snr, "barrier_snr", "barrier_snr"),
+    ]
+    for ax, col, ylabel in panels:
+        if col in df_m.columns:
+            ax.step(
+                df_m.index,
+                df_m[col],
+                where="post",
+                color="#1f4e79",
+                lw=1.0,
+                zorder=3,
+            )
+            ax.scatter(
+                df_m.index,
+                df_m[col],
+                s=12,
+                color="#1f4e79",
+                zorder=4,
+                linewidths=0,
+            )
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.grid(alpha=0.25, zorder=1)
+        _shade_calm(ax)
+        for jt in jump_dates:
+            ax.axvline(jt, color="crimson", lw=1.2, alpha=0.85, zorder=5)
+
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+    axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=8))
+    plt.setp(axes[-1].xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=8)
+
+    fig.suptitle(
+        f"Backtest  {month_start.strftime('%Y-%m')}  "
+        f"({month_start.date()} – {month_end.date()})  "
+        f"|  {len(jump_dates)} jump(s)  |  green = calm days",
+        fontsize=10,
+    )
     fig.savefig(out_path, dpi=130)
     plt.close(fig)
     print(f"Saved: {out_path}")
@@ -576,10 +969,10 @@ def plot_backtest_boxes(
     burn_in_start,
     backtest_start,
     backtest_end,
-    phase_gp_si: int,
+    gp_si: int,
     kernel_hw: int,
-    phase_a_si: int,
-    kernel_hw_phase_a: int,
+    km_si: int,
+    km_kernel_hw: int,
 ) -> None:
     n_events = pre["event_id"].nunique() if "event_id" in pre.columns else len(pre)
     offsets_str = ", ".join(f"{o:+d}d" for o in offsets)
@@ -613,7 +1006,7 @@ def plot_backtest_boxes(
         f"null draws/offset: {null_sample_size}   trend window: {trend_window}d\n"
         f"burn-in: {burn_in_start.date()} -> {backtest_start.date()}   "
         f"backtest: {backtest_start.date()} -> {backtest_end.date()}   "
-        f"GP si: {phase_gp_si}s k={kernel_hw}   KM si: {phase_a_si}s k={kernel_hw_phase_a}",
+        f"GP si: {gp_si}s k={kernel_hw}   KM si: {km_si}s k={km_kernel_hw}",
         fontsize=8,
     )
     fig.tight_layout()
@@ -632,10 +1025,10 @@ def plot_backtest_overview(
     backtest_start,
     backtest_end,
     burn_in_start,
-    phase_gp_si: int,
+    gp_si: int,
     kernel_hw: int,
-    phase_a_si: int,
-    kernel_hw_phase_a: int,
+    km_si: int,
+    km_kernel_hw: int,
 ) -> None:
     """Price + signal panels with jump markers."""
     daily = daily.copy()
@@ -675,7 +1068,7 @@ def plot_backtest_overview(
         f"Kalman-GP topology   backtest: {backtest_start.date()} -> {backtest_end.date()}   "
         f"({n_events} jumps, red lines = jump_start)\n"
         f"burn-in: {burn_in_start.date()} -> {backtest_start.date()}   "
-        f"GP si: {phase_gp_si}s k={kernel_hw}   KM si: {phase_a_si}s k={kernel_hw_phase_a}   "
+        f"GP si: {gp_si}s k={kernel_hw}   KM si: {km_si}s k={km_kernel_hw}   "
         f"offsets: {offsets_str}   trend window: {trend_window}d",
         fontsize=9,
     )

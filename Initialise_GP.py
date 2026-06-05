@@ -1,25 +1,20 @@
 """
-RunGP — stationary Kalman-GP pipeline.
+Initialise_GP — sequential Kalman-GP pipeline.
 
-Main execution script for the sequential GP pipeline.
 All configuration is in the CONFIGURATION block below.  Run with:
 
-    $env:PYTHONIOENCODING='utf-8'; & ".venv/Scripts/python.exe" RunGP.py
+    $env:PYTHONIOENCODING='utf-8'; & ".venv/Scripts/python.exe" Initialise_GP.py
 
 Pipeline steps
 --------------
     1  Download raw data
     2  Aggregate log-returns
-    3  Phase A (KM estimation)
-    4  Load Phase GP series
+    3  KM estimation
+    4  Load GP series
     5  Determine spatial_var from KM or fixed value
     6  Initialise Kalman-GP model
     7  Sequential Kalman updates + topology per window
-         For each window: optional reproject_to_range Kalman update topology_from_gp
-    8  GP potential U(x) topology snapshots
-    9  Log-price vs topology plot
-   10  GP drift + KM overlay plot
-   11  Persist model state
+    8  Persist model state
 """
 
 import os
@@ -32,19 +27,13 @@ from rich.console import Console
 
 import data_collection as dc
 from data_collection import load_series
-from regime_estimation import (
+from kramers_moyal import (
     iter_windows,
     normalize_window_boundaries,
-    run_phase_a,
+    run_km_estimation,
 )
-from phase_GP import KalmanGPDriftModel, topology_from_gp, _SEC_PER_YEAR
+from gaussian_process import KalmanGPDriftModel, topology_from_gp, _SEC_PER_YEAR
 from paths import gp_output_dir
-from plots import (
-    detect_price_jumps,
-    plot_topology_snapshots,
-    plot_logprice_topology,
-    plot_drift_with_km,
-)
 
 
 # =============================================================================
@@ -56,13 +45,13 @@ start_date = datetime(2024, 1, 1)
 end_date = datetime(2025, 12, 31)
 
 # --- Data aggregation ---------------------------------------------------------
-phase_a_seconds_interval = 30
-phase_gp_seconds_interval = 900
+km_seconds_interval = 30
+gp_seconds_interval = 900
 kernel_half_width = 50
-kernel_half_width_phase_a = 3
+km_kernel_half_width = 3
 trim_quantile = 0.01
 
-# --- Phase A ------------------------------------------------------------------
+# --- KM configuration ---------------------------------------------------------
 window_type = "monthly"
 n_bins = 200
 weight_threshold = 5
@@ -74,10 +63,10 @@ min_barrier_fraction = 0.1
 # =============================================================================
 
 # --- Spatial variance source --------------------------------------------------
-# 'km'    — compute var(Kramers-Moyal annualised drift bins) from Phase A output
+# 'km'    — compute var(KM annualised drift bins)
 # 'fixed' — use SPATIAL_VAR_FIXED directly
 SPATIAL_VAR_SOURCE = "fixed"
-SPATIAL_VAR_FIXED = 2000.0  # used when SPATIAL_VAR_SOURCE='fixed' or as fallback
+SPATIAL_VAR_FIXED = 1000.0  # used when SPATIAL_VAR_SOURCE='fixed' or as fallback
 
 # --- Reprojection (move inducing points into each window's observed x-range) --
 USE_REPROJECT = True
@@ -87,10 +76,7 @@ REPROJECT_MARGIN = 0.1  # fraction of window x-width added on each side
 REPROJECT_WINDOW_DAYS = 30
 
 # --- Lengthscales (initial values) -------------------------------------------
-# spatial_ls: None -> (x_hi - x_lo) / (3 * N_INDUCING)  — smaller than the
-#   inducing spacing so the posterior can capture sharper well/barrier
-#   features in drift.
-SPATIAL_LENGTHSCALE_INIT = None  # None -> (x_hi - x_lo) / (N_INDUCING)
+SPATIAL_LENGTHSCALE_INIT = None  # None -> (x_hi - x_lo) / (3 * N_INDUCING)
 TEMPORAL_LENGTHSCALE_DAYS_INIT = 10.0  # days
 
 # --- EMA demeaning -----------------------------------------------------------
@@ -101,9 +87,10 @@ EMA_HALFLIFE_DAYS = 30  # e.g. 30.0 to enable
 
 # --- Observation noise -------------------------------------------------------
 SIGMA2 = None  # None -> estimated from calm periods (rolling-range filter)
-# Calm-period filter for sigma2 calibration (same geometric criterion as jump detection)
-SIGMA2_STABLE_DAYS = 4  # rolling window size (days) to assess price stability
-SIGMA2_STABLE_THR = 0.05  # log-price range < this -> day counted as calm
+STABLE_DAYS = 4  # rolling window size (days) to assess price stability
+STABLE_THR = 0.05  # log-price range < this -> day counted as calm
+JUMP_THR = 0.1  # displacement from stable anchor > this -> jumping
+SETTLE_DAYS = 4  # consecutive stable days needed to declare new well
 
 # --- Model size --------------------------------------------------------------
 N_INDUCING = 10
@@ -117,9 +104,7 @@ MIN_CROSSING_SEP = 10
 SEED = 42
 
 # --- Daily topology look-back for RunGP_update bootstrap ---------------------
-# Number of trailing calendar days for which daily topology is pre-computed
-# and stored in the pickle so RunGP_update can immediately produce slope
-# signals on its first run without a full 90-day state replay.
+# Pre-computed trailing days stored in the pickle for RunGP_update slope signals.
 RECENT_DAILY_DAYS = 14
 
 # --- Output ------------------------------------------------------------------
@@ -176,7 +161,7 @@ def _estimate_calm_sigma2(
 def compute_km_spatial_var(
     km_dir,
     window_list,
-    phase_a_si,
+    km_si,
     x_range=None,
     drift_trim_pct=0.02,
     kernel_half_width=0,
@@ -201,12 +186,11 @@ def compute_km_spatial_var(
     """
     console = console or Console()
     kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
-    trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
     frames = []
     for w_idx, (w_start, w_end) in enumerate(window_list):
         fname = (
             f"km_{w_start.strftime('%Y-%m-%d')}_to_"
-            f"{w_end.strftime('%Y-%m-%d')}_{phase_a_si}s{kernel_tag}{trim_tag}.csv"
+            f"{w_end.strftime('%Y-%m-%d')}_{km_si}s{kernel_tag}.csv"
         )
         path = os.path.join(km_dir, fname)
         if os.path.exists(path):
@@ -281,9 +265,9 @@ def init_gp_pipeline(
     end_date,
     km_init_months=0,
     km_ema_halflife_windows=None,
-    phase_a_si=30,
-    kernel_hw_phase_a=3,
-    phase_gp_si=900,
+    km_si=30,
+    km_kernel_hw=3,
+    gp_si=900,
     kernel_hw=50,
     trim_quantile=0.01,
     n_bins=200,
@@ -297,7 +281,7 @@ def init_gp_pipeline(
     sigma2_stable_days=4,
     sigma2_stable_thr=0.05,
     ema_halflife_days=0.0,
-    regime_output_dir="regime_results",
+    km_output_dir="regime_results",
     console=None,
 ) -> dict:
     """Steps 1–6: download, aggregate, KM estimation, GP series load,
@@ -306,18 +290,16 @@ def init_gp_pipeline(
     Parameters
     ----------
     km_init_months : int
-        Months of history before ``start_date`` to use for KM estimation.
-        0 (default) uses the same ``[start_date, end_date]`` period as the GP
-        run — identical to the old ``prepare_phase_a`` behaviour.
-        When > 0, raw data for the pre-period is downloaded and aggregated,
-        KM estimation covers the pre-period only, and the GP series is loaded
-        strictly from ``[start_date, end_date]``.
+        Months of history before ``start_date`` for KM estimation.
+        0 uses the same [start_date, end_date] period as the GP run.
+        When > 0, KM covers the pre-period only and the GP series is loaded
+        strictly from [start_date, end_date].
 
     Returns
     -------
     dict with keys: model, x_all, dx_all, r_hat_all, dt_step, dt_t, dt_t_pd,
         x_range_global, sp_var, sigma2, raw_sigma2, snapped_start, snapped_end,
-        gp_windows, km_windows, regime_output_dir, n_inducing, sl_init.
+        gp_windows, km_windows, km_output_dir, n_inducing, sl_init.
     """
     console = console or Console()
 
@@ -355,8 +337,8 @@ def init_gp_pipeline(
         dc.aggregate_log_returns_range(
             w_start,
             w_end,
-            phase_a_si,
-            kernel_half_width=kernel_hw_phase_a,
+            km_si,
+            kernel_half_width=km_kernel_hw,
             trim_quantile=trim_quantile,
             ema_halflife_days=0.0,
         )
@@ -364,34 +346,34 @@ def init_gp_pipeline(
         dc.aggregate_log_returns_range(
             w_start,
             w_end,
-            phase_gp_si,
+            gp_si,
             kernel_half_width=kernel_hw,
             trim_quantile=trim_quantile,
             ema_halflife_days=ema_halflife_days,
         )
 
-    # --- Step 3: Phase A KM estimation ---
-    console.rule("[bold cyan]Step 3 — Phase A (KM estimation)")
-    run_phase_a(
+    # --- Step 3: KM estimation ---
+    console.rule("[bold cyan]Step 3 — KM estimation")
+    run_km_estimation(
         km_start,
         km_end,
-        phase_a_si,
-        kernel_half_width=kernel_hw_phase_a,
+        km_si,
+        kernel_half_width=km_kernel_hw,
         trim_quantile=trim_quantile,
         ema_halflife_days=0.0,
         n_bins=n_bins,
         weight_threshold=weight_threshold,
         window_type="monthly",
-        output_dir=regime_output_dir,
+        output_dir=km_output_dir,
         console=console,
     )
 
-    # --- Step 4: Load Phase GP series ---
-    console.rule("[bold cyan]Step 4 — Load Phase GP series")
+    # --- Step 4: Load GP series ---
+    console.rule("[bold cyan]Step 4 — Load GP series")
     x_all, dx_all, dt_step, dt_t = load_series(
         snapped_start,
         snapped_end,
-        phase_gp_si,
+        gp_si,
         kernel_half_width=kernel_hw,
         trim_quantile=trim_quantile,
         ema_halflife_days=ema_halflife_days,
@@ -427,18 +409,17 @@ def init_gp_pipeline(
     # --- Step 5: Determine spatial_var ---
     console.rule("[bold cyan]Step 5 — Determine spatial_var")
     if spatial_var_mode == "km":
-        km_dir = os.path.join(regime_output_dir, "km")
+        km_dir = os.path.join(km_output_dir, "km")
         # When km_init_months > 0 the KM pre-period covers a different price
-        # range than the GP period, so the GP x_range filter would incorrectly
-        # cut out most KM bins.  Only apply x_range filtering when both periods
-        # are the same (km_init_months == 0 → km_windows == gp_windows).
+        # range than the GP period; only apply x_range filtering when both
+        # periods are the same (km_init_months == 0 → km_windows == gp_windows).
         km_x_range = x_range_global if km_init_months == 0 else None
         sp_var = compute_km_spatial_var(
             km_dir,
             km_windows,
-            phase_a_si,
+            km_si,
             x_range=km_x_range,
-            kernel_half_width=kernel_hw_phase_a,
+            kernel_half_width=km_kernel_hw,
             trim_quantile=trim_quantile,
             ema_halflife_windows=km_ema_halflife_windows,
             console=console,
@@ -522,54 +503,10 @@ def init_gp_pipeline(
         "snapped_end": snapped_end,
         "gp_windows": gp_windows,
         "km_windows": km_windows,
-        "regime_output_dir": regime_output_dir,
+        "km_output_dir": km_output_dir,
         "n_inducing": n_inducing,
         "sl_init": sl_init,
     }
-
-
-# =============================================================================
-# PIPELINE HELPERS
-# =============================================================================
-
-
-def prepare_phase_a(snapped_start, snapped_end, window_list, console):
-    """Steps 1–3: download, aggregate, and run Phase A KM estimation.
-
-    Uses the module-level config variables so callers don't need to thread
-    every parameter through.
-    """
-    console.rule("[bold cyan]Step 1 — Download raw data")
-    dc.ensure_data(snapped_start, snapped_end)
-
-    console.rule("[bold cyan]Step 2 — Aggregate log-returns")
-    for si in sorted({phase_a_seconds_interval, phase_gp_seconds_interval}):
-        for w_start, w_end in window_list:
-            dc.aggregate_log_returns_range(
-                w_start,
-                w_end,
-                si,
-                kernel_half_width=kernel_half_width,
-                trim_quantile=trim_quantile,
-                ema_halflife_days=EMA_HALFLIFE_DAYS
-                if si == phase_gp_seconds_interval
-                else 0.0,
-            )
-
-    console.rule("[bold cyan]Step 3 — Phase A (KM estimation)")
-    run_phase_a(
-        snapped_start,
-        snapped_end,
-        phase_a_seconds_interval,
-        kernel_half_width=kernel_half_width_phase_a,
-        trim_quantile=trim_quantile,
-        ema_halflife_days=0.0,
-        n_bins=n_bins,
-        weight_threshold=weight_threshold,
-        window_type="monthly",
-        output_dir=OUTPUT_DIR,
-        console=console,
-    )
 
 
 # =============================================================================
@@ -592,9 +529,9 @@ def main() -> None:
         start_date,
         end_date,
         km_init_months=0,
-        phase_a_si=phase_a_seconds_interval,
-        kernel_hw_phase_a=kernel_half_width_phase_a,
-        phase_gp_si=phase_gp_seconds_interval,
+        km_si=km_seconds_interval,
+        km_kernel_hw=km_kernel_half_width,
+        gp_si=gp_seconds_interval,
         kernel_hw=kernel_half_width,
         trim_quantile=trim_quantile,
         n_bins=n_bins,
@@ -605,10 +542,10 @@ def main() -> None:
         spatial_var_mode=SPATIAL_VAR_SOURCE,
         spatial_var_fixed=SPATIAL_VAR_FIXED,
         sigma2_override=SIGMA2,
-        sigma2_stable_days=SIGMA2_STABLE_DAYS,
-        sigma2_stable_thr=SIGMA2_STABLE_THR,
+        sigma2_stable_days=STABLE_DAYS,
+        sigma2_stable_thr=STABLE_THR,
         ema_halflife_days=EMA_HALFLIFE_DAYS,
-        regime_output_dir=OUTPUT_DIR,
+        km_output_dir=OUTPUT_DIR,
         console=console,
     )
     model = _init["model"]
@@ -626,7 +563,7 @@ def main() -> None:
     stage_tag = (
         f"{SPATIAL_VAR_SOURCE}var_{'reproject' if USE_REPROJECT else 'noreproject'}"
     )
-    gp_dir = gp_output_dir(phase_gp_seconds_interval, root=GP_OUTPUT_DIR_ROOT)
+    gp_dir = gp_output_dir(gp_seconds_interval, root=GP_OUTPUT_DIR_ROOT)
     os.makedirs(gp_dir, exist_ok=True)
 
     N = len(dx)
@@ -787,7 +724,7 @@ def main() -> None:
         x_rd, dx_rd, dt_rd, dt_t_rd = load_series(
             rd_replay_start,
             pd.Timestamp(snapped_end).to_pydatetime(),
-            phase_gp_seconds_interval,
+            gp_seconds_interval,
             kernel_half_width=kernel_half_width,
             trim_quantile=trim_quantile,
             ema_halflife_days=EMA_HALFLIFE_DAYS,
@@ -860,74 +797,13 @@ def main() -> None:
     stem = (
         f"gp_{pd.Timestamp(snapped_start).strftime('%Y-%m-%d')}_to_"
         f"{pd.Timestamp(snapped_end).strftime('%Y-%m-%d')}"
-        f"_{phase_gp_seconds_interval}s_{stage_tag}"
+        f"_{gp_seconds_interval}s_{stage_tag}"
     )
     df_topology.to_csv(os.path.join(gp_dir, f"{stem}_topology.csv"), index=False)
     df_params.to_csv(os.path.join(gp_dir, f"{stem}_params.csv"), index=False)
     console.print(f"[green]Wrote[/green] {gp_dir}/{stem}_topology.csv")
 
-    # -------------------------------------------------------------------------
-    console.rule("[bold cyan]Step 8 — GP potential U(x) topology snapshots")
-    plot_topology_snapshots(
-        model,
-        x_range_global,
-        snapshots,
-        snapped_start,
-        snapped_end,
-        phase_gp_seconds_interval,
-        os.path.join(gp_dir, f"{stem}_topology_snapshots.png"),
-        n_grid=N_GRID,
-        n_samples=N_SAMPLES,
-        rng=rng,
-    )
-
-    console.rule("[bold cyan]Step 9 \u2014 log-price vs topology plot")
-    # Build a daily log-price series over the full GP period and detect jumps.
-    _daily_lp = (
-        pd.Series(x_prev, index=dt_t_pd).groupby(pd.Grouper(freq="D")).median().dropna()
-    )
-    events_df = detect_price_jumps(
-        _daily_lp,
-        stable_days=SIGMA2_STABLE_DAYS,
-        stable_thr=SIGMA2_STABLE_THR,
-        jump_thr=0.1,
-        settle_days=SIGMA2_STABLE_DAYS,
-    )
-    console.print(f"  {len(events_df)} jump events detected for plot")
-    plot_logprice_topology(
-        model,
-        snapshots,
-        x_prev,
-        dt_t,
-        snapped_start,
-        snapped_end,
-        phase_gp_seconds_interval,
-        os.path.join(gp_dir, f"{stem}_logprice_topology.png"),
-        spatial_var_source=SPATIAL_VAR_SOURCE,
-        use_reproject=USE_REPROJECT,
-        n_grid=N_GRID,
-        events_df=events_df,
-    )
-
-    console.rule("[bold cyan]Step 10 \u2014 GP drift + KM overlay plot")
-    plot_drift_with_km(
-        model,
-        snapshots,
-        snapped_start,
-        snapped_end,
-        phase_a_seconds_interval,
-        phase_gp_seconds_interval,
-        OUTPUT_DIR,
-        os.path.join(gp_dir, f"{stem}_drift_km.png"),
-        spatial_var_source=SPATIAL_VAR_SOURCE,
-        use_reproject=USE_REPROJECT,
-        n_grid=N_GRID,
-        rng=rng,
-        kernel_hw_phase_a=kernel_half_width_phase_a,
-        trim_quantile=trim_quantile,
-    )
-
-    console.rule("[bold cyan]Step 11 — Persist model state")
+    console.rule("[bold cyan]Step 8 — Persist model state")
     state_path = os.path.join(gp_dir, f"{stem}_state.pkl")
     state_blob = {
         "schema_version": 1,
@@ -936,10 +812,10 @@ def main() -> None:
         "config": {
             "start_date": pd.Timestamp(snapped_start),
             "end_date": pd.Timestamp(snapped_end),
-            "phase_a_seconds_interval": phase_a_seconds_interval,
-            "phase_gp_seconds_interval": phase_gp_seconds_interval,
+            "km_seconds_interval": km_seconds_interval,
+            "gp_seconds_interval": gp_seconds_interval,
             "kernel_half_width": kernel_half_width,
-            "kernel_half_width_phase_a": kernel_half_width_phase_a,
+            "km_kernel_half_width": km_kernel_half_width,
             "trim_quantile": trim_quantile,
             "ema_halflife_days": EMA_HALFLIFE_DAYS,
             "window_type": "monthly",

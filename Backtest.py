@@ -1,5 +1,5 @@
 """
-backtest_jumps.py — self-contained backtest of Kalman-GP topology signals as
+Backtest.py — self-contained backtest of Kalman-GP topology signals as
 predictors of ETH price well-jumps.
 
 STRUCTURE
@@ -13,10 +13,10 @@ There is a single continuous GP run from BURN_IN_START to BACKTEST_END:
 
 GP INITIALISATION
 -----------------
-  • Uses init_gp_pipeline() from RunGP.py — identical initialisation logic
-    for both RunGP and backtest (KM pre-period, spatial_var, sigma2, model).
-  • Burn-in uses daily_replay() from phase_GP.py (daily updates + topology).
-  • Backtest uses a direct daily update loop (no blob serialisation).
+  • Uses init_gp_pipeline() from Initialise_GP.py for KM pre-period, spatial_var,
+    sigma2, and model initialisation.
+  • Burn-in uses daily_replay() from gaussian_process.py.
+  • Backtest uses a direct daily update loop.
 
 DATA-LEAKAGE GUARANTEE
 -----------------------
@@ -57,9 +57,9 @@ from scipy.stats import mannwhitneyu
 
 import data_collection as dc
 from data_collection import load_series
-from phase_GP import daily_replay, topology_from_gp, _SEC_PER_YEAR
-from regime_estimation import iter_windows, estimate_km
-from RunGP import init_gp_pipeline
+from gaussian_process import daily_replay, topology_from_gp, _SEC_PER_YEAR
+from kramers_moyal import iter_windows, estimate_km
+from Initialise_GP import init_gp_pipeline
 import plots
 
 
@@ -76,12 +76,11 @@ def _recalibrate_km_backtest(model, month_start, month_end, console, regime_outp
     """
     km_dir = os.path.join(regime_output_dir, "km")
     os.makedirs(km_dir, exist_ok=True)
-    kernel_tag = f"_k{KERNEL_HW_PHASE_A}" if KERNEL_HW_PHASE_A > 0 else ""
-    trim_tag = f"_trim{TRIM_QUANTILE}" if TRIM_QUANTILE > 0 else ""
+    kernel_tag = f"_k{KM_KERNEL_HW}" if KM_KERNEL_HW > 0 else ""
     km_csv = os.path.join(
         km_dir,
         f"km_{month_start.strftime('%Y-%m-%d')}_to_"
-        f"{month_end.strftime('%Y-%m-%d')}_{PHASE_A_SI}s{kernel_tag}{trim_tag}.csv",
+        f"{month_end.strftime('%Y-%m-%d')}_{KM_SI}s{kernel_tag}.csv",
     )
 
     if os.path.exists(km_csv):
@@ -93,8 +92,8 @@ def _recalibrate_km_backtest(model, month_start, month_end, console, regime_outp
         x_a, dx_a, _, _ = load_series(
             month_start,
             month_end,
-            PHASE_A_SI,
-            kernel_half_width=KERNEL_HW_PHASE_A,
+            KM_SI,
+            kernel_half_width=KM_KERNEL_HW,
             trim_quantile=TRIM_QUANTILE,
             ema_halflife_days=0.0,
             window_type="monthly",
@@ -107,7 +106,7 @@ def _recalibrate_km_backtest(model, month_start, month_end, console, regime_outp
         log_prices_a = np.concatenate([x_a, x_a[-1:] + dx_a[-1:]]) if len(dx_a) else x_a
         km_df = estimate_km(
             log_prices_a,
-            PHASE_A_SI,
+            KM_SI,
             n_bins=N_BINS,
             weight_threshold=WEIGHT_THRESHOLD,
         )
@@ -161,15 +160,15 @@ KM_INIT_MONTHS = 0  # 0 = use burn-in period itself; >0 = causal pre-period
 # Newer windows get higher weight; None = uniform (same as RunGP default).
 KM_SPATIAL_VAR_EMA_HALFLIFE = None  # e.g. 6 → 6-month half-life
 
-# --- Phase A (KM) ------------------------------------------------------------
-PHASE_A_SI = 30  # aggregation interval for KM estimation (seconds)
-KERNEL_HW_PHASE_A = 3  # kernel half-width for Phase A
+# --- KM configuration -------------------------------------------------------
+KM_SI = 30  # aggregation interval for KM estimation (seconds)
+KM_KERNEL_HW = 3  # kernel half-width for KM aggregation
 N_BINS = 200  # KM histogram bins
 WEIGHT_THRESHOLD = 5  # min weight for KM bin to be included
 MIN_BARRIER_FRACTION = 0.1  # min barrier / well-depth fraction
 
-# --- GP config ---------------------------------------------------------------
-PHASE_GP_SI = 900  # aggregation interval for the GP (seconds)
+# --- GP configuration --------------------------------------------------------
+GP_SI = 900  # aggregation interval for the GP (seconds)
 KERNEL_HW = 100  # kernel half-width for 900 s aggregation
 TRIM_QUANTILE = 0.01  # trim extreme micro-returns
 N_INDUCING = 10  # inducing points
@@ -235,7 +234,7 @@ ALT_HYPOTHESIS = {
 def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
     """Run the Kalman-GP over [BURN_IN_START, BACKTEST_END] as a single loop.
 
-    Uses init_gp_pipeline from RunGP.py for model initialisation (Steps 1-6),
+    Uses init_gp_pipeline from Initialise_GP.py for model initialisation (Steps 1-6),
     then daily_replay for burn-in, and a direct daily update loop for the
     backtest period (no blob serialisation overhead).
 
@@ -257,28 +256,26 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
     # ---- Pre-fetch: ensure all raw data + 900s aggregation is on disk -------
     # Do this before burn-in so there is no pause between burn-in and backtest.
     burnin_end = (pd.Timestamp(BACKTEST_START) - pd.Timedelta(days=1)).to_pydatetime()
-    console.rule(
-        f"[bold cyan]Pre-fetch — Ensure raw data + aggregate {PHASE_GP_SI} s series"
-    )
+    console.rule(f"[bold cyan]Pre-fetch — Ensure raw data + aggregate {GP_SI} s series")
     dc.ensure_data(BURN_IN_START, BACKTEST_END)
     for _w_start, _w_end in iter_windows(BURN_IN_START, BACKTEST_END, "monthly"):
         dc.aggregate_log_returns_range(
             _w_start,
             _w_end,
-            PHASE_GP_SI,
+            GP_SI,
             kernel_half_width=KERNEL_HW,
             trim_quantile=TRIM_QUANTILE,
             ema_halflife_days=EMA_HALFLIFE_DAYS,
         )
-    # Pre-aggregate 30s Phase A data for the full period so that
+    # Pre-aggregate 30s KM data for the full period so that
     # _recalibrate_km_backtest can read each backtest month on demand.
     if SPATIAL_VAR_MODE == "km":
         for _w_start, _w_end in iter_windows(BURN_IN_START, BACKTEST_END, "monthly"):
             dc.aggregate_log_returns_range(
                 _w_start,
                 _w_end,
-                PHASE_A_SI,
-                kernel_half_width=KERNEL_HW_PHASE_A,
+                KM_SI,
+                kernel_half_width=KM_KERNEL_HW,
                 trim_quantile=TRIM_QUANTILE,
                 ema_halflife_days=0.0,
             )
@@ -289,9 +286,9 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
         burnin_end,
         km_init_months=KM_INIT_MONTHS,
         km_ema_halflife_windows=KM_SPATIAL_VAR_EMA_HALFLIFE,
-        phase_a_si=PHASE_A_SI,
-        kernel_hw_phase_a=KERNEL_HW_PHASE_A,
-        phase_gp_si=PHASE_GP_SI,
+        km_si=KM_SI,
+        km_kernel_hw=KM_KERNEL_HW,
+        gp_si=GP_SI,
         kernel_hw=KERNEL_HW,
         trim_quantile=TRIM_QUANTILE,
         n_bins=N_BINS,
@@ -305,7 +302,7 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
         sigma2_stable_days=STABLE_DAYS,
         sigma2_stable_thr=STABLE_THR,
         ema_halflife_days=EMA_HALFLIFE_DAYS,
-        regime_output_dir=regime_output_dir,
+        km_output_dir=regime_output_dir,
         console=console,
     )
     model = result["model"]
@@ -346,6 +343,9 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
                 "p_multiwell": topo_d["p_multiwell"],
                 "barrier_mean": topo_d["barrier_mean"],
                 "barrier_std": topo_d["barrier_std"],
+                "barrier_snr": topo_d["barrier_mean"] / topo_d["barrier_std"]
+                if topo_d["barrier_std"] > 0
+                else 0.0,
             }
         )
         console.print(
@@ -358,12 +358,8 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
     # window may extend into the burn-in period for the first few weeks.
     gc.collect()
 
-    # ---- Step 8: backtest day-by-day (direct loop, no blob) -----------------
-    # This replaces the previous gp_update()-based loop.  The model object
-    # stays alive across days — no serialisation, no history concat, no disk
-    # I/O per day.  Dramatically faster than the blob approach.
     console.rule(
-        f"[bold cyan]Step 8 — Backtest day-by-day  "
+        "[bold cyan]Step 8 — Backtest day-by-day  "
         f"[{BACKTEST_START.date()}, {BACKTEST_END.date()}]"
     )
 
@@ -371,7 +367,7 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
     x_bt, dx_bt, dt_bt, dt_t_bt = load_series(
         BACKTEST_START,
         BACKTEST_END,
-        PHASE_GP_SI,
+        GP_SI,
         kernel_half_width=KERNEL_HW,
         ema_halflife_days=EMA_HALFLIFE_DAYS,
         window_type="monthly",
@@ -415,6 +411,7 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
     last_reproject_wk = None
 
     backtest_rows: list[dict] = []
+    backtest_monthly_snaps: list[tuple] = []
     for wk in sorted(set(week_labels_bt)):
         wk_days = sorted(d for d, w in zip(all_bt_days, week_labels_bt) if w == wk)
 
@@ -450,13 +447,25 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
 
             model.update(x_d, r_hat_d, t_d)
 
-            # Month-end KM recalibration (uses 30s data, not 900s)
+            # Month-end KM recalibration (uses 30s data, not 900s) and snapshot.
             # Use .date() for lookup to avoid pd.Timestamp hash/type issues.
             d_ts = pd.Timestamp(d).normalize()
-            if SPATIAL_VAR_MODE == "km" and d_ts.date() in recalib_day_map:
-                m_start, m_end = recalib_day_map[d_ts.date()]
-                _recalibrate_km_backtest(
-                    model, m_start, m_end, console, regime_output_dir
+            if d_ts.date() in recalib_day_map:
+                m_start_r, m_end_r = recalib_day_map[d_ts.date()]
+                if SPATIAL_VAR_MODE == "km":
+                    _recalibrate_km_backtest(
+                        model, m_start_r, m_end_r, console, regime_output_dir
+                    )
+                backtest_monthly_snaps.append(
+                    (
+                        d_ts,
+                        model.state_mean.copy(),
+                        model.state_cov.copy(),
+                        topo_range,
+                        model.inducing_x.copy(),
+                        pd.Timestamp(m_start_r),
+                        pd.Timestamp(m_end_r),
+                    )
                 )
 
             topo_d = topology_from_gp(
@@ -476,6 +485,9 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
                     "p_multiwell": topo_d["p_multiwell"],
                     "barrier_mean": topo_d["barrier_mean"],
                     "barrier_std": topo_d["barrier_std"],
+                    "barrier_snr": topo_d["barrier_mean"] / topo_d["barrier_std"]
+                    if topo_d["barrier_std"] > 0
+                    else 0.0,
                 }
             )
             console.print(
@@ -483,13 +495,11 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
                 f"  p_multi={topo_d['p_multiwell']:.2f}"
                 f"  barrier={topo_d['barrier_mean']:.3f}\u00b1{topo_d['barrier_std']:.3f}"
             )
-    del model, x_bt, dx_bt, r_hat_bt, x_burnin, dt_t_pd
+    del x_bt, dx_bt, r_hat_bt, x_burnin, dt_t_pd
     gc.collect()
 
     # ---- Detect well-jumps on backtest period only --------------------------
-    console.rule(
-        "[bold cyan]Phase — Well-jump detection (price-geometric, backtest period)"
-    )
+    console.rule("[bold cyan]Well-jump detection (price-geometric, backtest period)")
     all_rows = burn_in_rows + backtest_rows
     daily_df = pd.DataFrame(all_rows).set_index("date")
     daily_df.index = pd.to_datetime(daily_df.index)
@@ -511,7 +521,7 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
     del all_rows, daily_df, events_df
     gc.collect()
 
-    return daily_path, events_path
+    return daily_path, events_path, model, backtest_monthly_snaps, regime_output_dir
 
 
 # =============================================================================
@@ -602,7 +612,7 @@ def _detect_jumps(daily_df: pd.DataFrame, console: Console) -> pd.DataFrame:
 
 
 # =============================================================================
-# PHASE 2 — backtest analysis (reads CSV only; no model state in scope)
+# BACKTEST ANALYSIS (reads CSV only; no model state in scope)
 # =============================================================================
 
 
@@ -673,7 +683,7 @@ def _run_backtest(
     events_path: str,
 ) -> None:
     """Statistical backtest: are signals elevated before detected jumps?"""
-    console.rule("[bold cyan]Phase 6 — Load topology + events from CSV")
+    console.rule("[bold cyan]Load topology + events from CSV")
     daily = pd.read_csv(daily_path, parse_dates=["date"]).set_index("date").sort_index()
     daily.index = daily.index.normalize()  # ensure midnight for offset lookups
     events = pd.read_csv(events_path, parse_dates=["jump_start"])
@@ -688,7 +698,7 @@ def _run_backtest(
         return
 
     # ---- Pre-jump samples ---------------------------------------------------
-    console.rule("[bold cyan]Phase 7 — Pre-jump signal samples")
+    console.rule("[bold cyan]Pre-jump signal samples")
     pre_rows = []
     for _, ev in events.iterrows():
         jstart = pd.Timestamp(ev["jump_start"]).normalize()
@@ -711,7 +721,7 @@ def _run_backtest(
     console.print(f"  {len(per_event)} pre-jump sample rows")
 
     # ---- Null samples --------------------------------------------------------
-    console.rule("[bold cyan]Phase 8 — Null (calm) samples")
+    console.rule("[bold cyan]Null (calm) samples")
     jump_dates = pd.to_datetime(events["jump_start"]).dt.normalize().values
     min_abs = np.min(
         np.abs(np.array([(daily.index - jd).days.astype(int) for jd in jump_dates])),
@@ -744,7 +754,7 @@ def _run_backtest(
     null_df.to_csv(os.path.join(out_dir, "null_samples.csv"), index=False)
 
     # ---- Summary statistics -------------------------------------------------
-    console.rule("[bold cyan]Phase 9 — Mann-Whitney tests")
+    console.rule("[bold cyan]Mann-Whitney tests")
     summary_rows = []
     for sig in SIGNALS:
         alt = ALT_HYPOTHESIS[sig]
@@ -832,9 +842,12 @@ def _run_backtest(
         table.add_row(*row)
     console.print(table)
     console.print("  * p_raw<0.05  ** p_raw<0.01  \u2020 p_bh<0.10  \u2021 p_bh<0.05")
+    console.print(
+        "  p_bh: p value adjusted with Benjamini-Hochberg FDR correction.  IC: information coefficient (rank-biserial correlation)."
+    )
 
     # ---- Plots ---------------------------------------------------------------
-    console.rule("[bold cyan]Phase 10 — Plots")
+    console.rule("[bold cyan]Plots")
     plots.plot_backtest_boxes(
         per_event,
         null_df,
@@ -847,10 +860,10 @@ def _run_backtest(
         burn_in_start=BURN_IN_START,
         backtest_start=BACKTEST_START,
         backtest_end=BACKTEST_END,
-        phase_gp_si=PHASE_GP_SI,
+        gp_si=GP_SI,
         kernel_hw=KERNEL_HW,
-        phase_a_si=PHASE_A_SI,
-        kernel_hw_phase_a=KERNEL_HW_PHASE_A,
+        km_si=KM_SI,
+        km_kernel_hw=KM_KERNEL_HW,
     )
     plots.plot_backtest_overview(
         daily,
@@ -862,12 +875,97 @@ def _run_backtest(
         backtest_start=BACKTEST_START,
         backtest_end=BACKTEST_END,
         burn_in_start=BURN_IN_START,
-        phase_gp_si=PHASE_GP_SI,
+        gp_si=GP_SI,
         kernel_hw=KERNEL_HW,
-        phase_a_si=PHASE_A_SI,
-        kernel_hw_phase_a=KERNEL_HW_PHASE_A,
+        km_si=KM_SI,
+        km_kernel_hw=KM_KERNEL_HW,
     )
     console.print(f"[green]All outputs written to {out_dir}/[/green]")
+
+
+# =============================================================================
+# MONTHLY PLOT GENERATION
+# =============================================================================
+
+
+def _generate_monthly_plots(
+    console: Console,
+    model,
+    backtest_monthly_snaps: list,
+    regime_output_dir: str,
+    daily_path: str,
+    events_path: str,
+    out_dir: str,
+    rng,
+) -> None:
+    """Drift grid, potential grid (one file each), plus per-month overview plots."""
+    plots_dir = os.path.join(out_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    if not backtest_monthly_snaps:
+        console.print(
+            "[yellow]No monthly snapshots available; skipping monthly plots.[/yellow]"
+        )
+        return
+
+    daily = pd.read_csv(daily_path, parse_dates=["date"]).set_index("date").sort_index()
+    daily.index = daily.index.normalize()
+    events = pd.read_csv(events_path, parse_dates=["jump_start"])
+
+    km_dir = os.path.join(regime_output_dir, "km")
+    y_lo_drift, y_hi_drift = plots.km_drift_ylim(km_dir, KM_SI, KM_KERNEL_HW)
+
+    console.rule("[bold cyan]Monthly plots")
+
+    # --- Single grid: all months drift ---
+    plots.plot_all_months_drift(
+        model,
+        backtest_monthly_snaps,
+        os.path.join(plots_dir, "all_months_drift.png"),
+        km_dir=km_dir,
+        km_si=KM_SI,
+        km_kernel_hw=KM_KERNEL_HW,
+        n_grid=N_GRID,
+        y_lo=y_lo_drift,
+        y_hi=y_hi_drift,
+        backtest_start=BACKTEST_START,
+        backtest_end=BACKTEST_END,
+    )
+
+    # --- Single grid: all months potential ---
+    plots.plot_all_months_potential(
+        model,
+        backtest_monthly_snaps,
+        os.path.join(plots_dir, "all_months_potential.png"),
+        n_grid=N_GRID,
+        n_samples=N_SAMPLES,
+        rng=rng,
+        backtest_start=BACKTEST_START,
+        backtest_end=BACKTEST_END,
+    )
+
+    # --- Per-month overview: price + p_multiwell + barrier_snr ---
+    for snap in backtest_monthly_snaps:
+        m_start = (
+            pd.Timestamp(snap[5])
+            if len(snap) > 5
+            else pd.Timestamp(snap[0]).replace(day=1)
+        )
+        m_end = pd.Timestamp(snap[6]) if len(snap) > 6 else pd.Timestamp(snap[0])
+        month_label = m_start.strftime("%Y-%m")
+
+        ov_path = os.path.join(plots_dir, f"{month_label}_overview.png")
+        plots.plot_monthly_overview(
+            daily,
+            events,
+            m_start,
+            m_end,
+            ov_path,
+            stable_days=STABLE_DAYS,
+            stable_thr=STABLE_THR,
+        )
+
+    console.print(f"[green]Plots written to {plots_dir}/[/green]")
 
 
 # =============================================================================
@@ -878,7 +976,7 @@ def _run_backtest(
 def main() -> None:
     console = Console()
     ss = np.random.SeedSequence(SEED)
-    gp_rng, analysis_rng = [np.random.default_rng(s) for s in ss.spawn(2)]
+    gp_rng, analysis_rng, plot_rng = [np.random.default_rng(s) for s in ss.spawn(3)]
 
     backtest_tag = (
         f"{BACKTEST_START.strftime('%Y-%m-%d')}_{BACKTEST_END.strftime('%Y-%m-%d')}"
@@ -886,11 +984,26 @@ def main() -> None:
     out_dir = os.path.join(BACKTEST_DIR, backtest_tag)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Phase 1: run the GP (burn-in + backtest) and detect jumps.
-    daily_path, events_path = _run_gp_and_record(console, gp_rng, out_dir)
+    # Step 1: run the GP (burn-in + backtest) and detect jumps.
+    daily_path, events_path, model, backtest_monthly_snaps, regime_output_dir = (
+        _run_gp_and_record(console, gp_rng, out_dir)
+    )
 
-    # Phase 2: pure CSV-based signal analysis.
+    # Step 2: pure CSV-based signal analysis.
     _run_backtest(console, analysis_rng, out_dir, daily_path, events_path)
+
+    # Step 3: per-month visualisations.
+    _generate_monthly_plots(
+        console,
+        model,
+        backtest_monthly_snaps,
+        regime_output_dir,
+        daily_path,
+        events_path,
+        out_dir,
+        plot_rng,
+    )
+    del model
 
 
 if __name__ == "__main__":
