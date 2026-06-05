@@ -74,7 +74,7 @@ def _recalibrate_km_backtest(model, month_start, month_end, console, regime_outp
     The KM CSV is cached: if it already exists from a previous run it is read
     directly without re-aggregating 30 s data or re-running estimate_km.
     """
-    km_dir = os.path.join(regime_output_dir, "km")
+    km_dir = regime_output_dir
     os.makedirs(km_dir, exist_ok=True)
     kernel_tag = f"_k{KM_KERNEL_HW}" if KM_KERNEL_HW > 0 else ""
     km_csv = os.path.join(
@@ -244,7 +244,7 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
 
     Returns (daily_path, events_path).
     """
-    regime_output_dir = os.path.join(out_dir, "regime_results")
+    regime_output_dir = os.path.join(out_dir, "km")
 
     console.print(
         f"[bold]Backtest run[/bold]  "
@@ -912,7 +912,7 @@ def _generate_monthly_plots(
     daily.index = daily.index.normalize()
     events = pd.read_csv(events_path, parse_dates=["jump_start"])
 
-    km_dir = os.path.join(regime_output_dir, "km")
+    km_dir = regime_output_dir
     y_lo_drift, y_hi_drift = plots.km_drift_ylim(km_dir, KM_SI, KM_KERNEL_HW)
 
     console.rule("[bold cyan]Monthly plots")

@@ -108,7 +108,7 @@ SEED = 42
 RECENT_DAILY_DAYS = 14
 
 # --- Output ------------------------------------------------------------------
-OUTPUT_DIR = "regime_results"
+OUTPUT_DIR = "km"
 GP_OUTPUT_DIR_ROOT = "gp_results"
 
 
@@ -281,7 +281,7 @@ def init_gp_pipeline(
     sigma2_stable_days=4,
     sigma2_stable_thr=0.05,
     ema_halflife_days=0.0,
-    km_output_dir="regime_results",
+    km_output_dir="km",
     console=None,
 ) -> dict:
     """Steps 1–6: download, aggregate, KM estimation, GP series load,

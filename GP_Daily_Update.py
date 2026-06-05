@@ -137,7 +137,6 @@ from update.daily_cache import (
 from update.plots_update import (
     _plot_drift_snapshot,
     _plot_potential_snapshot,
-    _plot_innovations,
     _plot_fragility,
 )
 
@@ -808,12 +807,6 @@ def main() -> None:
         os.path.join(out_dir, "potential_snapshot.png"),
         dt_query,
         plot_rng,
-    )
-    _plot_innovations(
-        pd.to_datetime(dt_t),
-        z_innov,
-        os.path.join(out_dir, "innovations.png"),
-        dt_query,
     )
     _plot_fragility(
         daily_cache_plot,

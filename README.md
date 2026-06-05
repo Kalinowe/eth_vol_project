@@ -183,8 +183,7 @@ Outputs are written to `backtests/{start}_{end}/`:
 - `plots/all_months_drift.png` — GP drift ±2σ with KM overlay, one panel per backtest month
 - `plots/all_months_potential.png` — integrated potential U(x) ±2σ, one panel per backtest month
 - `plots/YYYY-MM_overview.png` — per-month: ETH/USD price + p_multiwell + barrier_snr, with red jump lines and green calm-day shading
-- `plots/per_signal_boxes.png` — pre-jump vs null signal distributions
-- `plots/events_overview.png` — full-period price + signal panels with jump markers
+- `plots/events_overview.png` — full-period price + barrier_snr panel with jump markers
 
 ---
 
@@ -205,53 +204,47 @@ Outputs are written to `backtests/{start}_{end}/`:
 
 ## Output Gallery
 
-### Backtest — All Months Drift
-
-Grid of GP posterior drift ±2σ panels with KM estimates (red dots) overlaid — one panel per backtest calendar month. Consistent y-axis limits across all panels.
-
-### Backtest — All Months Potential
-
-Grid of integrated potential U(x) ±2σ panels — one per backtest month. Wells appear as valleys; barriers as peaks.
-
-### Backtest — Monthly Overview
-
-Per-month three-panel figure: ETH/USD price (top), p_multiwell (middle), barrier_snr (bottom). Green shading marks calm (low-volatility) days; red vertical lines mark detected jump_start dates. Data plotted as daily steps to show discrete resolution.
-
 ### Backtest — Events Overview
 
-Full backtest period: price with topology signal panels and markers at detected well-jump events.
+Full backtest period: ETH/USDT price (top) and barrier_snr (bottom) with red vertical markers at detected well-jump events.
 
-![Backtest events overview](backtests/2024-07-01_2025-12-31/plots/events_overview.png)
+![Backtest events overview](assets/events_overview.png)
 
-### Backtest — Signal Distributions
+### Monthly — Drift Comparison
 
-Box plots comparing signal values at look-back offsets before well-jump events (red) vs. null/calm periods (blue). Significant separation confirms predictive value.
+GP posterior drift ±2σ overlaid with KM non-parametric estimates (red dots) for a single calendar month. Confirms the GP has learned a plausible drift shape and highlights where the two estimators agree or diverge.
 
-![Per-signal box plots](backtests/2024-07-01_2025-12-31/plots/per_signal_boxes.png)
+![Drift comparison](assets/drift_comparison.png)
+
+### Monthly — Combined Potentials
+
+Integrated potential $U(x)$ ±2σ for a calendar month. Wells appear as valleys; barriers as peaks between them. The shaded band reflects posterior uncertainty — a narrow band means the landscape is confidently multi-well.
+
+![Combined potentials](assets/combined_potentials.png)
 
 ### Daily Update — Drift Snapshot
 
 A single day's incremental update showing the GP drift posterior updated with new observations, overlaid with KM estimates.
 
-![Daily drift snapshot](GP_updates/2026-01-01/drift_snapshot.png)
+![Daily drift snapshot](assets/drift_snapshot.png)
 
 ### Daily Update — Potential Snapshot
 
 The potential $U(x)$ on the update day. Well positions and barrier heights are directly readable.
 
-![Daily potential snapshot](GP_updates/2026-01-01/potential_snapshot.png)
-
-### Daily Update — Innovation Diagnostics
-
-Per-observation z-scores for the new data. A running mean $|z|$ near $\sqrt{2/\pi} \approx 0.80$ indicates well-calibrated observation noise.
-
-![Innovation diagnostics](GP_updates/2026-01-01/innovations.png)
+![Daily potential snapshot](assets/potential_snapshot.png)
 
 ### Daily Update — Fragility Monitor
 
 Barrier mean ± std over time, with the SNR (barrier_mean / barrier_std). Declining SNR signals weakening regime structure — a potential precursor to a regime change.
 
-![Fragility monitor](GP_updates/2026-01-01/fragility.png)
+![Fragility monitor](assets/fragility.png)
+
+### Fragility History
+
+Distribution of barrier_snr values over a historical period, showing how often the market has been in a robustly multi-well regime vs. a fragile or single-well state.
+
+![Fragility histogram](assets/fragility_hist.png)
 
 ---
 

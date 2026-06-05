@@ -1019,37 +1019,29 @@ def plot_backtest_overview(
     events: pd.DataFrame,
     out_path: str,
     *,
-    slope_z_fn,
-    trend_window: int,
-    offsets: list,
-    backtest_start,
-    backtest_end,
-    burn_in_start,
-    gp_si: int,
-    kernel_hw: int,
-    km_si: int,
-    km_kernel_hw: int,
+    slope_z_fn=None,
+    trend_window: int = 0,
+    offsets: list = None,
+    backtest_start=None,
+    backtest_end=None,
+    burn_in_start=None,
+    gp_si: int = 0,
+    kernel_hw: int = 0,
+    km_si: int = 0,
+    km_kernel_hw: int = 0,
 ) -> None:
     """Price + signal panels with jump markers."""
     daily = daily.copy()
-    slope_z_vals = np.full(len(daily), np.nan)
-    for i in range(len(daily)):
-        lo = daily.index[i] - pd.Timedelta(days=trend_window - 1)
-        tail_pm = np.asarray(
-            daily.loc[
-                (daily.index >= lo) & (daily.index <= daily.index[i]), "p_multiwell"
-            ],
-            dtype=float,
-        )
-        _, z = slope_z_fn(tail_pm)
-        slope_z_vals[i] = z
-    daily["slope_z_p_multiwell"] = slope_z_vals
+    if backtest_start is not None:
+        daily = daily[daily.index >= pd.Timestamp(backtest_start)]
+    if "barrier_snr" not in daily.columns:
+        bstd = daily["barrier_std"].replace(0, np.nan)
+        daily["barrier_snr"] = daily["barrier_mean"] / bstd
     panels = [
         ("price_usd", "ETH/USDT [$]", "log"),
-        ("p_multiwell", "p_multiwell", None),
-        ("slope_z_p_multiwell", "slope_z_p_multiwell", None),
+        ("barrier_snr", "barrier_snr", None),
     ]
-    fig, axes = plt.subplots(len(panels), 1, figsize=(13, 8), sharex=True)
+    fig, axes = plt.subplots(len(panels), 1, figsize=(13, 6), sharex=True)
     for ax, (col, ylab, yscale) in zip(axes, panels):
         if col in daily.columns:
             ax.plot(daily.index, daily[col], color="#1f4e79", lw=0.9)
@@ -1062,18 +1054,12 @@ def plot_backtest_overview(
                 pd.Timestamp(ev["jump_start"]), color="crimson", lw=0.6, alpha=0.7
             )
     axes[-1].set_xlabel("date")
-    n_events = len(events)
-    offsets_str = ", ".join(f"{o:+d}d" for o in offsets)
-    fig.suptitle(
-        f"Kalman-GP topology   backtest: {backtest_start.date()} -> {backtest_end.date()}   "
-        f"({n_events} jumps, red lines = jump_start)\n"
-        f"burn-in: {burn_in_start.date()} -> {backtest_start.date()}   "
-        f"GP si: {gp_si}s k={kernel_hw}   KM si: {km_si}s k={km_kernel_hw}   "
-        f"offsets: {offsets_str}   trend window: {trend_window}d",
-        fontsize=9,
-    )
     fig.tight_layout()
     fig.savefig(out_path, dpi=130)
+    _repo_root = os.path.dirname(os.path.abspath(__file__))
+    assets_path = os.path.join(_repo_root, "assets", "events_overview.png")
+    os.makedirs(os.path.dirname(assets_path), exist_ok=True)
+    fig.savefig(assets_path, dpi=130)
     plt.close(fig)
 
 

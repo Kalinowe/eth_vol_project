@@ -264,13 +264,13 @@ def run_km_estimation(
     ema_halflife_days=0.0,
     n_bins=200,
     weight_threshold=5,
-    output_dir="regime_results",
+    output_dir="km",
     window_type="monthly",
     console=None,
 ):
     """
     Iterate over windows, run KM estimation on each, and write per-window KM
-    CSV files to {output_dir}/km/. Windows whose KM CSV already exists on disk
+    CSV files to {output_dir}/. Windows whose KM CSV already exists on disk
     are skipped (cache hit).
 
     Returns a DataFrame with columns [window_start, window_end, n_observations].
@@ -284,7 +284,7 @@ def run_km_estimation(
     )
 
     kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
-    km_dir = os.path.join(output_dir, "km")
+    km_dir = output_dir
     os.makedirs(km_dir, exist_ok=True)
 
     all_windows = list(iter_windows(start_date, end_date, window_type))
@@ -346,11 +346,86 @@ def run_km_estimation(
 
 
 # ---------------------------------------------------------------------------
-# Standalone entry point
+# Standalone entry point – KM drift & potential plots for a single interval
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    Console().print(
-        "[yellow]kramers_moyal.py is a library module; import it from RunGP.py.[/yellow]"
+
+def _plot_km_drift_and_potential(
+    start_str: str = "2025-02-01",
+    end_str: str = "2025-02-28",
+    seconds_interval: int = 30,
+    kernel_half_width: int = 3,
+    km_dir: str = "km",
+    assets_dir: str = "assets",
+):
+    """
+    Load the KM CSV for the given period / interval, then produce two plots:
+
+      1. Annualized KM drift  D₁(x) vs log-price bin centre.
+      2. KM potential  U_KM(x) = −∫ drift_KM dx  (trapezoidal rule).
+
+    Both figures are saved to *assets_dir*.
+    """
+    import matplotlib.pyplot as plt
+
+    SEC_PER_YEAR = 365.25 * 24 * 3600
+    period_tag = f"{start_str}_to_{end_str}"
+    kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
+
+    km_path = os.path.join(
+        km_dir,
+        f"km_{start_str}_to_{end_str}_{seconds_interval}s{kernel_tag}.csv",
     )
-    raise SystemExit(0)
+    if not os.path.exists(km_path):
+        raise FileNotFoundError(
+            f"KM file not found: {km_path}\n"
+            "Run run_km_estimation() first to generate it."
+        )
+
+    km_df = pd.read_csv(km_path).dropna(subset=["drift"])
+
+    x = km_df["bin_center"].values
+    drift_raw = km_df["drift"].values  # per-second units
+    drift_ann = drift_raw * SEC_PER_YEAR  # annualised
+
+    # Potential: U(x) = -∫ drift_raw dx  (cumulative trapezoidal)
+    dx = np.diff(x)
+    increments = -0.5 * (drift_raw[:-1] + drift_raw[1:]) * dx
+    potential = np.concatenate([[0.0], np.cumsum(increments)])
+
+    os.makedirs(assets_dir, exist_ok=True)
+
+    # ---- Plot 1: annualised drift ----------------------------------------
+    fig1, ax1 = plt.subplots(figsize=(12, 6))
+    ax1.plot(
+        x, drift_ann, color="C0", linewidth=1.2, label=f"{seconds_interval}s interval"
+    )
+    ax1.axhline(0, color="black", linewidth=0.6, linestyle="--", alpha=0.4)
+    ax1.set_xlabel("Log price bin center")
+    ax1.set_ylabel("Annualized Expected Return")
+    ax1.set_title(rf"Annualized Drift ($D_1$) – {period_tag.replace('_', ' ')}")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    drift_out = os.path.join(assets_dir, f"drift_km_{period_tag}.png")
+    fig1.savefig(drift_out, dpi=150, bbox_inches="tight")
+    plt.close(fig1)
+    print(f"Saved: {drift_out}")
+
+    # ---- Plot 2: potential -----------------------------------------------
+    fig2, ax2 = plt.subplots(figsize=(12, 6))
+    ax2.plot(
+        x, potential, color="C0", linewidth=1.2, label=f"{seconds_interval}s interval"
+    )
+    ax2.set_xlabel("Log price bin center")
+    ax2.set_ylabel(r"$U_{KM}(x) = -\int \mathrm{drift}_{KM}\, dx$")
+    ax2.set_title(f"KM Potential – {period_tag.replace('_', ' ')}")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    pot_out = os.path.join(assets_dir, f"potential_km_{period_tag}.png")
+    fig2.savefig(pot_out, dpi=150, bbox_inches="tight")
+    plt.close(fig2)
+    print(f"Saved: {pot_out}")
+
+
+if __name__ == "__main__":
+    _plot_km_drift_and_potential()
