@@ -191,6 +191,7 @@ def analyze_window(
     seconds_interval,
     kernel_half_width=5,
     trim_quantile=0.01,
+    ema_halflife_days=0.0,
     n_bins=200,
     weight_threshold=5,
     min_observations=100,
@@ -205,13 +206,13 @@ def analyze_window(
     # If the aggregated CSV for this (window, interval) already exists we can
     # skip the download and unzip entirely — aggregate_log_returns_range will
     # load it from disk.
-    trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
     kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
+    ema_tag = f"_emahlf{int(ema_halflife_days)}d"
     agg_file = os.path.join(
         "data",
         f"ETHUSDT-aggReturns-{window_start.strftime('%Y-%m-%d')}"
         f"_to_{window_end.strftime('%Y-%m-%d')}"
-        f"-{seconds_interval}sec{kernel_tag}{trim_tag}.csv",
+        f"-{seconds_interval}sec{kernel_tag}{ema_tag}.csv",
     )
     if not os.path.exists(agg_file):
         try:
@@ -227,6 +228,7 @@ def analyze_window(
             seconds_interval,
             kernel_half_width=kernel_half_width,
             trim_quantile=trim_quantile,
+            ema_halflife_days=ema_halflife_days,
         )
     except Exception as exc:
         print(
@@ -264,6 +266,7 @@ def run_phase_a(
     seconds_interval,
     kernel_half_width=5,
     trim_quantile=0.01,
+    ema_halflife_days=0.0,
     n_bins=200,
     weight_threshold=5,
     output_dir="regime_results",
@@ -317,6 +320,7 @@ def run_phase_a(
             seconds_interval,
             kernel_half_width=kernel_half_width,
             trim_quantile=trim_quantile,
+            ema_halflife_days=ema_halflife_days,
             n_bins=n_bins,
             weight_threshold=weight_threshold,
         )

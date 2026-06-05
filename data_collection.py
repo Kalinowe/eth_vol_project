@@ -188,6 +188,7 @@ def aggregate_log_returns_range(
     output_dir="data",
     kernel_half_width=0,
     trim_quantile=0.0,
+    ema_halflife_days=0.0,
 ):
     """
     Aggregate log returns for each CSV in a date range and export the combined results.
@@ -219,12 +220,12 @@ def aggregate_log_returns_range(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
     kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
+    ema_tag = f"_emahlf{int(ema_halflife_days)}d" if ema_halflife_days else "_emahlf0d"
     output_file = os.path.join(
         output_dir,
         f"ETHUSDT-aggReturns-{start_dt.strftime('%Y-%m-%d')}_to_{end_dt.strftime('%Y-%m-%d')}"
-        f"-{x_seconds}sec{kernel_tag}{trim_tag}.csv",
+        f"-{x_seconds}sec{kernel_tag}{ema_tag}.csv",
     )
     if os.path.exists(output_file):
         cached = pd.read_csv(output_file, parse_dates=["datetime"])
@@ -284,6 +285,22 @@ def aggregate_log_returns_range(
                 & (combined_df["log_first_price"] <= upper_q)
             ].copy()
 
+        # EMA-demean log_return so demeaning is baked into the cached file.
+        # log_first_price stays raw (used for x_prev / KM price levels).
+        _SEC_PER_YEAR_DC = 365.25 * 24 * 3600
+        if (
+            ema_halflife_days
+            and ema_halflife_days > 0
+            and not combined_df.empty
+            and "log_return" in combined_df.columns
+        ):
+            _r = combined_df["log_return"].values / x_seconds * _SEC_PER_YEAR_DC
+            _r_hat, _ = ema_demean_drift(
+                _r, combined_df["datetime"], halflife_days=ema_halflife_days
+            )
+            combined_df = combined_df.copy()
+            combined_df["log_return"] = _r_hat * x_seconds / _SEC_PER_YEAR_DC
+
         combined_df.to_csv(output_file, index=False)
         return combined_df
 
@@ -298,7 +315,7 @@ def _aggregated_returns_path(
     end_date,
     seconds_interval,
     kernel_half_width,
-    trim_quantile,
+    ema_halflife_days=0.0,
     data_dir="data",
 ):
     """Path of the cached aggregated-returns CSV per data_collection naming."""
@@ -311,12 +328,12 @@ def _aggregated_returns_path(
     start_dt = _to_dt(start_date)
     end_dt = _to_dt(end_date)
     kernel_tag = f"_k{kernel_half_width}" if kernel_half_width > 0 else ""
-    trim_tag = f"_trim{trim_quantile}" if trim_quantile > 0 else ""
+    ema_tag = f"_emahlf{int(ema_halflife_days)}d" if ema_halflife_days else "_emahlf0d"
     return os.path.join(
         data_dir,
         f"ETHUSDT-aggReturns-{start_dt.strftime('%Y-%m-%d')}_to_"
         f"{end_dt.strftime('%Y-%m-%d')}-{seconds_interval}sec"
-        f"{kernel_tag}{trim_tag}.csv",
+        f"{kernel_tag}{ema_tag}.csv",
     )
 
 
@@ -326,6 +343,7 @@ def load_series(
     seconds_interval,
     kernel_half_width=5,
     trim_quantile=0.01,
+    ema_halflife_days=0.0,
     window_type=None,
 ):
     """
@@ -356,7 +374,7 @@ def load_series(
             end_date,
             seconds_interval,
             kernel_half_width,
-            trim_quantile,
+            ema_halflife_days,
         )
         if os.path.exists(cached_path):
             df = pd.read_csv(cached_path, parse_dates=["datetime"])
@@ -367,6 +385,7 @@ def load_series(
                     seconds_interval,
                     kernel_half_width=kernel_half_width,
                     trim_quantile=trim_quantile,
+                    ema_halflife_days=ema_halflife_days,
                 )
         else:
             df = aggregate_log_returns_range(
@@ -375,6 +394,7 @@ def load_series(
                 seconds_interval,
                 kernel_half_width=kernel_half_width,
                 trim_quantile=trim_quantile,
+                ema_halflife_days=ema_halflife_days,
             )
         if df.empty:
             raise ValueError("Empty aggregated returns dataframe.")
@@ -392,7 +412,7 @@ def load_series(
                 window_end,
                 seconds_interval,
                 kernel_half_width,
-                trim_quantile,
+                ema_halflife_days,
             )
             if os.path.exists(cached_path):
                 df_w = pd.read_csv(cached_path, parse_dates=["datetime"])
@@ -403,6 +423,7 @@ def load_series(
                         seconds_interval,
                         kernel_half_width=kernel_half_width,
                         trim_quantile=trim_quantile,
+                        ema_halflife_days=ema_halflife_days,
                     )
             else:
                 df_w = aggregate_log_returns_range(
@@ -411,6 +432,7 @@ def load_series(
                     seconds_interval,
                     kernel_half_width=kernel_half_width,
                     trim_quantile=trim_quantile,
+                    ema_halflife_days=ema_halflife_days,
                 )
             if df_w is None or df_w.empty:
                 continue
@@ -430,13 +452,18 @@ def load_series(
     ts = pd.to_datetime(df["datetime"]).values
     win_idx = df["__window_idx"].values.astype(int)
 
+    # Use the stored log_return for dx — it contains EMA-demeaned values when
+    # the file was produced with ema_halflife_days > 0.  For ema_halflife_days=0
+    # log_return == np.diff(log_first_price) for consecutive valid bars.
+    lr = df["log_return"].values.astype(float)
+
     dt_arr = (np.diff(ts) / np.timedelta64(1, "s")).astype(float)
-    finite = np.isfinite(np.diff(x)) & np.isfinite(x[:-1])
+    finite = np.isfinite(lr[:-1]) & np.isfinite(x[:-1])
     same_window = win_idx[:-1] == win_idx[1:]
     valid = (dt_arr > 0) & (dt_arr <= 1.5 * seconds_interval) & finite & same_window
 
     x_prev = x[:-1][valid]
-    dx = np.diff(x)[valid]
+    dx = lr[:-1][valid]
     dt_t = ts[1:][valid]
 
     return x_prev, dx, float(seconds_interval), dt_t

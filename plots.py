@@ -9,6 +9,89 @@ from phase_GP import topology_from_gp, _SEC_PER_YEAR
 
 
 # ---------------------------------------------------------------------------
+# Geometric well-jump detection  (price-only; no topology used)
+# ---------------------------------------------------------------------------
+
+
+def detect_price_jumps(
+    log_price: pd.Series,
+    stable_days: int = 4,
+    stable_thr: float = 0.05,
+    jump_thr: float = 0.1,
+    settle_days: int = 4,
+) -> pd.DataFrame:
+    """Detect well-jump events from a daily log-price series.
+
+    Identical logic to ``_detect_jumps`` in backtest_jumps.py.  Returns a
+    DataFrame with columns: event_id, pre_stable_start, pre_stable_end,
+    jump_start, post_stable_start, pre_log_price, post_log_price,
+    log_price_change, direction.  Returns an empty DataFrame if no events.
+    """
+    lp = log_price.sort_index()
+    roll_range = lp.rolling(stable_days, min_periods=stable_days).apply(
+        lambda w: w.max() - w.min(), raw=True
+    )
+    dates = lp.index.tolist()
+    n = len(dates)
+    events = []
+    i = 0
+    while i < n:
+        if pd.isna(roll_range.iloc[i]) or roll_range.iloc[i] >= stable_thr:
+            i += 1
+            continue
+        stable_end_idx = i
+        anchor_lp = lp.iloc[i]
+
+        j = i + 1
+        while j < n and abs(lp.iloc[j] - anchor_lp) < jump_thr:
+            j += 1
+        if j >= n:
+            break
+        jump_start_date = dates[j]
+
+        k = j + 1
+        settled = False
+        while k + settle_days <= n:
+            window = lp.iloc[k : k + settle_days]
+            if window.max() - window.min() < stable_thr:
+                settled = True
+                break
+            k += 1
+        if not settled:
+            i = j + 1
+            continue
+
+        post_stable_start = dates[k]
+        post_lp_median = float(lp.iloc[k : k + settle_days].median())
+
+        pre_start_idx = stable_end_idx
+        while pre_start_idx > 0:
+            c = pre_start_idx - 1
+            if not pd.isna(roll_range.iloc[c]) and roll_range.iloc[c] < stable_thr:
+                pre_start_idx = c
+            else:
+                break
+        pre_stable_start = dates[pre_start_idx]
+        pre_lp_median = float(lp.iloc[pre_start_idx : stable_end_idx + 1].median())
+        log_change = post_lp_median - pre_lp_median
+        events.append(
+            {
+                "event_id": len(events) + 1,
+                "pre_stable_start": pd.Timestamp(pre_stable_start),
+                "pre_stable_end": pd.Timestamp(dates[stable_end_idx]),
+                "jump_start": pd.Timestamp(jump_start_date),
+                "post_stable_start": pd.Timestamp(post_stable_start),
+                "pre_log_price": pre_lp_median,
+                "post_log_price": post_lp_median,
+                "log_price_change": log_change,
+                "direction": "up" if log_change > 0 else "down",
+            }
+        )
+        i = k + settle_days
+    return pd.DataFrame(events)
+
+
+# ---------------------------------------------------------------------------
 # Sequential Kalman-GP snapshots and overlays
 # ---------------------------------------------------------------------------
 
@@ -335,6 +418,7 @@ def plot_logprice_topology(
     spatial_var_source,
     use_reproject,
     n_grid=200,
+    events_df=None,
 ):
     """
     Grid of panels (one per snapshot) showing:
@@ -342,6 +426,7 @@ def plot_logprice_topology(
       - GP posterior mean zero-crossings as horizontal lines:
           green dashed  = stable well  (drift: + → −, price attracted here)
           red dotted    = unstable fix (drift: − → +, price repelled)
+      - vertical orange lines at jump_start dates (from events_df, if provided)
       - p_multiwell and well count in the panel title.
     """
     if not snapshots:
@@ -420,6 +505,25 @@ def plot_logprice_topology(
                 if ci == cross_idx[0]
                 else "_",
             )
+
+        # Draw vertical lines at jump_start dates that fall in this window.
+        if events_df is not None and not events_df.empty and len(times_w):
+            t_lo, t_hi = times_w.min(), times_w.max()
+            jump_col = "jump_start" if "jump_start" in events_df.columns else None
+            if jump_col:
+                for _, ev in events_df.iterrows():
+                    jt = pd.Timestamp(ev[jump_col])
+                    if t_lo <= jt <= t_hi:
+                        ax.axvline(
+                            jt,
+                            color="darkorange",
+                            linewidth=1.2,
+                            linestyle="-",
+                            alpha=0.85,
+                            label="jump"
+                            if "jump" not in [h.get_label() for h in ax.get_lines()]
+                            else "_",
+                        )
 
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
         ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=3, maxticks=5))

@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import gc
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -56,11 +56,94 @@ from rich.table import Table
 from scipy.stats import mannwhitneyu
 
 import data_collection as dc
-from data_collection import load_series, ema_demean_drift
+from data_collection import load_series
 from phase_GP import daily_replay, topology_from_gp, _SEC_PER_YEAR
-from regime_estimation import iter_windows
+from regime_estimation import iter_windows, estimate_km
 from RunGP import init_gp_pipeline
 import plots
+
+
+# =============================================================================
+# KM MONTHLY RECALIBRATION (backtest)
+# =============================================================================
+
+
+def _recalibrate_km_backtest(model, month_start, month_end, console, regime_output_dir):
+    """Run KM on one completed backtest month and update model.spatial_var.
+
+    The KM CSV is cached: if it already exists from a previous run it is read
+    directly without re-aggregating 30 s data or re-running estimate_km.
+    """
+    km_dir = os.path.join(regime_output_dir, "km")
+    os.makedirs(km_dir, exist_ok=True)
+    kernel_tag = f"_k{KERNEL_HW_PHASE_A}" if KERNEL_HW_PHASE_A > 0 else ""
+    trim_tag = f"_trim{TRIM_QUANTILE}" if TRIM_QUANTILE > 0 else ""
+    km_csv = os.path.join(
+        km_dir,
+        f"km_{month_start.strftime('%Y-%m-%d')}_to_"
+        f"{month_end.strftime('%Y-%m-%d')}_{PHASE_A_SI}s{kernel_tag}{trim_tag}.csv",
+    )
+
+    if os.path.exists(km_csv):
+        km_df = pd.read_csv(km_csv)
+        console.print(
+            f"  KM recalib {month_start.strftime('%Y-%m')}: loaded cached CSV"
+        )
+    else:
+        x_a, dx_a, _, _ = load_series(
+            month_start,
+            month_end,
+            PHASE_A_SI,
+            kernel_half_width=KERNEL_HW_PHASE_A,
+            trim_quantile=TRIM_QUANTILE,
+            ema_halflife_days=0.0,
+            window_type="monthly",
+        )
+        if len(x_a) == 0:
+            console.print(
+                f"[yellow]  KM recalib {month_start.strftime('%Y-%m')}: no data; skipping[/yellow]"
+            )
+            return
+        log_prices_a = np.concatenate([x_a, x_a[-1:] + dx_a[-1:]]) if len(dx_a) else x_a
+        km_df = estimate_km(
+            log_prices_a,
+            PHASE_A_SI,
+            n_bins=N_BINS,
+            weight_threshold=WEIGHT_THRESHOLD,
+        )
+        km_df.to_csv(km_csv, index=False)
+
+    km_valid = km_df.dropna(subset=["drift"])
+    if km_valid.empty:
+        console.print(
+            f"[yellow]  KM recalib {month_start.strftime('%Y-%m')}: "
+            "all bins below threshold; skipping[/yellow]"
+        )
+        return
+
+    d_ann = km_valid["drift"].values * _SEC_PER_YEAR
+    if len(d_ann) >= 10:
+        lo = float(np.quantile(d_ann, 0.02))
+        hi = float(np.quantile(d_ann, 0.98))
+        d_trim = d_ann[(d_ann >= lo) & (d_ann <= hi)]
+        if len(d_trim) >= 3:
+            d_ann = d_trim
+    new_sp_var = float(np.var(d_ann))
+
+    if new_sp_var < 1.0:
+        console.print(
+            f"[yellow]  KM recalib {month_start.strftime('%Y-%m')}: "
+            f"spatial_var={new_sp_var:.4g} too small; skipping[/yellow]"
+        )
+        return
+
+    old_sp_var = float(model.spatial_var)
+    model.spatial_var = new_sp_var
+    model._recompute_hp_dependent()
+    console.print(
+        f"  [green]KM recalib[/green] {month_start.strftime('%Y-%m')}: "
+        f"spatial_var {old_sp_var:.4g} \u2192 {new_sp_var:.4g} /yr\u00b2"
+    )
 
 
 # =============================================================================
@@ -73,7 +156,10 @@ BACKTEST_START = datetime(2024, 7, 1)  # first day topology is recorded
 BACKTEST_END = datetime(2025, 12, 31)  # last day
 
 # --- KM initialisation data --------------------------------------------------
-KM_INIT_MONTHS = 12  # months of history to use for KM
+KM_INIT_MONTHS = 0  # 0 = use burn-in period itself; >0 = causal pre-period
+# EMA half-life in monthly windows for KM spatial-var weighting.
+# Newer windows get higher weight; None = uniform (same as RunGP default).
+KM_SPATIAL_VAR_EMA_HALFLIFE = None  # e.g. 6 → 6-month half-life
 
 # --- Phase A (KM) ------------------------------------------------------------
 PHASE_A_SI = 30  # aggregation interval for KM estimation (seconds)
@@ -87,16 +173,18 @@ PHASE_GP_SI = 900  # aggregation interval for the GP (seconds)
 KERNEL_HW = 100  # kernel half-width for 900 s aggregation
 TRIM_QUANTILE = 0.01  # trim extreme micro-returns
 N_INDUCING = 10  # inducing points
-TEMPORAL_LS_DAYS = 6.0  # Matern temporal lengthscale (days)
+TEMPORAL_LS_DAYS = 10.0  # Matern temporal lengthscale (days)
 SPATIAL_LENGTHSCALE_INIT = None  # None -> (x_hi-x_lo)/N_INDUCING
-SPATIAL_VAR_MODE = "km"
-SPATIAL_VAR_FIXED = 2000.0  # used only when SPATIAL_VAR_MODE == "fixed"
-SIGMA2 = None  # None -> var(r_hat*dt)/dt from data
+SPATIAL_VAR_MODE = (
+    "km"  # "fixed" or "km" (recalibrate from KM each month; more responsive)
+)
+SPATIAL_VAR_FIXED = 1500.0  # used only when SPATIAL_VAR_MODE == "fixed"
+SIGMA2 = None  # None -> var(r_hat*dt)/dt from calm periods data
 USE_REPROJECT = True
 REPROJECT_WINDOW_DAYS = 30  # trailing days for rolling x-range reproject
 
 # --- EMA demeaning -----------------------------------------------------------
-EMA_HALFLIFE_DAYS = 30  # None -> no demeaning; set e.g. 14.0 to enable
+EMA_HALFLIFE_DAYS = None  # None -> no demeaning; set e.g. 14.0 to enable
 
 # --- Topology ----------------------------------------------------------------
 N_GRID = 200
@@ -166,12 +254,41 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
         f"-> {out_dir}/"
     )
 
-    # ---- Steps 1-6: initialise model via shared pipeline --------------------
+    # ---- Pre-fetch: ensure all raw data + 900s aggregation is on disk -------
+    # Do this before burn-in so there is no pause between burn-in and backtest.
     burnin_end = (pd.Timestamp(BACKTEST_START) - pd.Timedelta(days=1)).to_pydatetime()
+    console.rule(
+        f"[bold cyan]Pre-fetch — Ensure raw data + aggregate {PHASE_GP_SI} s series"
+    )
+    dc.ensure_data(BURN_IN_START, BACKTEST_END)
+    for _w_start, _w_end in iter_windows(BURN_IN_START, BACKTEST_END, "monthly"):
+        dc.aggregate_log_returns_range(
+            _w_start,
+            _w_end,
+            PHASE_GP_SI,
+            kernel_half_width=KERNEL_HW,
+            trim_quantile=TRIM_QUANTILE,
+            ema_halflife_days=EMA_HALFLIFE_DAYS,
+        )
+    # Pre-aggregate 30s Phase A data for the full period so that
+    # _recalibrate_km_backtest can read each backtest month on demand.
+    if SPATIAL_VAR_MODE == "km":
+        for _w_start, _w_end in iter_windows(BURN_IN_START, BACKTEST_END, "monthly"):
+            dc.aggregate_log_returns_range(
+                _w_start,
+                _w_end,
+                PHASE_A_SI,
+                kernel_half_width=KERNEL_HW_PHASE_A,
+                trim_quantile=TRIM_QUANTILE,
+                ema_halflife_days=0.0,
+            )
+
+    # ---- Steps 1-6: initialise model via shared pipeline --------------------
     result = init_gp_pipeline(
         BURN_IN_START,
         burnin_end,
         km_init_months=KM_INIT_MONTHS,
+        km_ema_halflife_windows=KM_SPATIAL_VAR_EMA_HALFLIFE,
         phase_a_si=PHASE_A_SI,
         kernel_hw_phase_a=KERNEL_HW_PHASE_A,
         phase_gp_si=PHASE_GP_SI,
@@ -185,6 +302,8 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
         spatial_var_mode=SPATIAL_VAR_MODE,
         spatial_var_fixed=SPATIAL_VAR_FIXED,
         sigma2_override=SIGMA2,
+        sigma2_stable_days=STABLE_DAYS,
+        sigma2_stable_thr=STABLE_THR,
         ema_halflife_days=EMA_HALFLIFE_DAYS,
         regime_output_dir=regime_output_dir,
         console=console,
@@ -234,7 +353,9 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
             f"  p_multi={topo_d['p_multiwell']:.2f}"
             f"  barrier={topo_d['barrier_mean']:.3f}\u00b1{topo_d['barrier_std']:.3f}"
         )
-    del x_burnin, dx_burnin, r_hat_burnin, dt_t_pd
+    del dx_burnin, r_hat_burnin
+    # Keep x_burnin and dt_t_pd alive — the Step 8 reprojection look-back
+    # window may extend into the burn-in period for the first few weeks.
     gc.collect()
 
     # ---- Step 8: backtest day-by-day (direct loop, no blob) -----------------
@@ -246,32 +367,17 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
         f"[{BACKTEST_START.date()}, {BACKTEST_END.date()}]"
     )
 
-    # Aggregate backtest data
-    dc.ensure_data(BACKTEST_START, BACKTEST_END)
-    for _w_start, _w_end in iter_windows(BACKTEST_START, BACKTEST_END, "monthly"):
-        dc.aggregate_log_returns_range(
-            _w_start,
-            _w_end,
-            PHASE_GP_SI,
-            kernel_half_width=KERNEL_HW,
-            trim_quantile=TRIM_QUANTILE,
-        )
-
     # Load full backtest series
     x_bt, dx_bt, dt_bt, dt_t_bt = load_series(
         BACKTEST_START,
         BACKTEST_END,
         PHASE_GP_SI,
         kernel_half_width=KERNEL_HW,
-        trim_quantile=TRIM_QUANTILE,
+        ema_halflife_days=EMA_HALFLIFE_DAYS,
         window_type="monthly",
     )
     dt_t_bt_pd = pd.to_datetime(dt_t_bt)
     r_hat_bt = (dx_bt / dt_bt) * _SEC_PER_YEAR
-    if EMA_HALFLIFE_DAYS is not None:
-        r_hat_bt, _ = ema_demean_drift(
-            r_hat_bt, dt_t_bt_pd, halflife_days=EMA_HALFLIFE_DAYS
-        )
 
     dt_norm_bt = dt_t_bt_pd.normalize()
     all_bt_days = sorted(dt_norm_bt.unique())
@@ -279,6 +385,30 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
     # Group by ISO week for reprojection
     day_series_bt = pd.Series(all_bt_days)
     week_labels_bt = day_series_bt.dt.to_period("W").values
+
+    # Month-end lookup for KM recalibration
+    # Build recalibration trigger from the actual last data day of each
+    # calendar month in the backtest series.  Avoids mismatch between
+    # calendar month-ends and the real last 900 s bar of the month.
+    # Keys stored as datetime.date to avoid pd.Timestamp hash/type issues.
+    _month_to_last: dict[tuple, pd.Timestamp] = {}
+    for _d in all_bt_days:
+        _ym = (_d.year, _d.month)
+        if _ym not in _month_to_last or _d > _month_to_last[_ym]:
+            _month_to_last[_ym] = _d
+    recalib_day_map: dict[object, tuple] = {}
+    for (_yr, _mo), _last_d in _month_to_last.items():
+        _m_start = datetime(_yr, _mo, 1)
+        _m_end = (
+            datetime(_yr + 1, 1, 1) - timedelta(days=1)
+            if _mo == 12
+            else datetime(_yr, _mo + 1, 1) - timedelta(days=1)
+        )
+        recalib_day_map[_last_d.date()] = (_m_start, _m_end)  # .date() for safe lookup
+    console.print(
+        f"  KM recalibration scheduled on: "
+        + ", ".join(str(k) for k in sorted(recalib_day_map))
+    )
 
     # Current topo_range from model's inducing grid
     topo_range = (float(model.inducing_x.min()), float(model.inducing_x.max()))
@@ -296,6 +426,13 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
                 dt_t_bt_pd.normalize() <= wk_cutoff
             )
             x_roll = x_bt[roll_mask]
+            # If the look-back window extends into the burn-in period, prepend
+            # burn-in observations so early backtest weeks get a full window.
+            if roll_lo < pd.Timestamp(BACKTEST_START):
+                bi_mask = (dt_t_pd.normalize() >= roll_lo) & (
+                    dt_t_pd.normalize() <= wk_cutoff
+                )
+                x_roll = np.concatenate([x_burnin[bi_mask], x_roll])
             if len(x_roll) >= 2:
                 topo_range = model.reproject_to_range(
                     float(x_roll.min()), float(x_roll.max()), n_inducing=N_INDUCING
@@ -312,6 +449,15 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
                 continue
 
             model.update(x_d, r_hat_d, t_d)
+
+            # Month-end KM recalibration (uses 30s data, not 900s)
+            # Use .date() for lookup to avoid pd.Timestamp hash/type issues.
+            d_ts = pd.Timestamp(d).normalize()
+            if SPATIAL_VAR_MODE == "km" and d_ts.date() in recalib_day_map:
+                m_start, m_end = recalib_day_map[d_ts.date()]
+                _recalibrate_km_backtest(
+                    model, m_start, m_end, console, regime_output_dir
+                )
 
             topo_d = topology_from_gp(
                 model,
@@ -337,7 +483,7 @@ def _run_gp_and_record(console: Console, rng, out_dir: str) -> tuple[str, str]:
                 f"  p_multi={topo_d['p_multiwell']:.2f}"
                 f"  barrier={topo_d['barrier_mean']:.3f}\u00b1{topo_d['barrier_std']:.3f}"
             )
-    del model, x_bt, dx_bt, r_hat_bt
+    del model, x_bt, dx_bt, r_hat_bt, x_burnin, dt_t_pd
     gc.collect()
 
     # ---- Detect well-jumps on backtest period only --------------------------

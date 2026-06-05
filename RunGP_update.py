@@ -91,11 +91,11 @@ KM_N_BINS = 80
 KM_WEIGHT_THRESHOLD = 5
 
 # Forecast horizons in days.
-FORECAST_HORIZONS = [1, 3, 7, 14]
+FORECAST_HORIZONS = [1, 2, 3]
 
 # Trend window: number of trailing *daily* topology rows used for slope signals.
 # Must match TREND_WINDOW in backtest_jumps.py so the signals are comparable.
-SIGNAL_TREND_DAYS = 10
+SIGNAL_TREND_DAYS = 5
 
 # If True, scale model.sigma2 (and obs_noise) after each run based on the
 # empirical mean |z| of innovations.  Keeps the Kalman gain well-calibrated
@@ -251,6 +251,7 @@ def gp_update(
     si_a = int(cfg["phase_a_seconds_interval"])
     khw = int(cfg["kernel_half_width"])
     trim = float(cfg["trim_quantile"])
+    ema_halflife = float(cfg.get("ema_halflife_days", 0.0))
     n_ind = int(cfg["n_inducing"])
 
     model = _restore_model(blob)
@@ -273,6 +274,7 @@ def gp_update(
             s,
             kernel_half_width=khw,
             trim_quantile=trim,
+            ema_halflife_days=ema_halflife if s == si else 0.0,
         )
 
     # ---- Step 4: load Phase GP series ---------------------------------------
@@ -284,6 +286,7 @@ def gp_update(
         si,
         kernel_half_width=khw,
         trim_quantile=trim,
+        ema_halflife_days=ema_halflife,
         window_type=None,
     )
     N = len(dx)
@@ -328,6 +331,7 @@ def gp_update(
                 si,
                 kernel_half_width=khw,
                 trim_quantile=trim,
+                ema_halflife_days=ema_halflife,
                 window_type=None,
             )
             if len(x_roll) < 2:
@@ -378,7 +382,7 @@ def gp_update(
             new_end_date,
             si_a=si_a,
             khw=khw,
-            trim=trim,
+            ema_halflife=ema_halflife,
             cfg=cfg,
             console=console,
         )
@@ -502,7 +506,7 @@ def gp_update(
         new_topo=new_row,
         si=si,
         khw=khw,
-        trim=trim,
+        ema_halflife_days=ema_halflife,
         n_ind=n_ind,
         rng=np.random.default_rng(seed),
         console=console,
@@ -524,6 +528,7 @@ def gp_update(
         si_a,
         kernel_half_width=khw,
         trim_quantile=trim,
+        ema_halflife_days=0.0,
         window_type=None,
     )
     log_prices_km = (
