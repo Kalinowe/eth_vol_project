@@ -66,7 +66,7 @@ min_barrier_fraction = 0.1
 # 'km'    — compute var(KM annualised drift bins)
 # 'fixed' — use SPATIAL_VAR_FIXED directly
 SPATIAL_VAR_SOURCE = "fixed"
-SPATIAL_VAR_FIXED = 1000.0  # used when SPATIAL_VAR_SOURCE='fixed' or as fallback
+SPATIAL_VAR_FIXED = 1500.0  # used when SPATIAL_VAR_SOURCE='fixed' or as fallback
 
 # --- Reprojection (move inducing points into each window's observed x-range) --
 USE_REPROJECT = True
@@ -131,8 +131,10 @@ def _estimate_calm_sigma2(
 
     A day is 'calm' if its ``stable_days``-day rolling log-price range is
     below ``stable_thr`` — the same geometric criterion used for jump
-    detection.  Falls back to all observations if fewer than ``min_calm_obs``
-    calm observations are found.
+    detection.  Additionally excludes jump-transit periods using the same
+    anchor-based algorithm as _detect_jumps in Backtest.py (JUMP_THR,
+    SETTLE_DAYS module constants).  Falls back to all observations if fewer
+    than ``min_calm_obs`` calm observations are found.
     """
     _daily_lp = (
         pd.Series(x_all, index=dt_t_pd).groupby(pd.Grouper(freq="D")).median().dropna()
@@ -141,6 +143,43 @@ def _estimate_calm_sigma2(
         lambda w: float(w.max() - w.min()), raw=True
     )
     _calm_day_set = set(_roll_range[_roll_range < stable_thr].index.normalize())
+
+    # Jump-period exclusion — mirrors _detect_jumps logic from Backtest.py.
+    _dates_arr = list(_daily_lp.index)
+    _lp_arr = _daily_lp.values
+    _rr_arr = _roll_range.values
+    _n_d = len(_dates_arr)
+    _jump_exclude: set = set()
+    _i = 0
+    while _i < _n_d:
+        if np.isnan(_rr_arr[_i]) or _rr_arr[_i] >= stable_thr:
+            _i += 1
+            continue
+        _anchor = _lp_arr[_i]
+        _j = _i + 1
+        while _j < _n_d and abs(_lp_arr[_j] - _anchor) < JUMP_THR:
+            _j += 1
+        if _j >= _n_d:
+            break
+        _k = _j + 1
+        _settled = False
+        while _k + SETTLE_DAYS <= _n_d:
+            _w = _lp_arr[_k : _k + SETTLE_DAYS]
+            if _w.max() - _w.min() < stable_thr:
+                _settled = True
+                break
+            _k += 1
+        if not _settled:
+            _i = _j + 1
+            continue
+        for _d_idx in range(_j, min(_k + SETTLE_DAYS, _n_d)):
+            _jump_exclude.add(_dates_arr[_d_idx].normalize())
+        _i = _k + SETTLE_DAYS
+    _calm_day_set -= _jump_exclude
+    if console is not None and _jump_exclude:
+        console.print(
+            f"  sigma2 jump filter: excluded {len(_jump_exclude)} jump/settle days"
+        )
     _calm_mask = dt_t_pd.normalize().isin(_calm_day_set)
     r_hat_calm = r_hat_all[_calm_mask]
 
@@ -689,8 +728,9 @@ def main() -> None:
     # Replay the last RECENT_DAILY_DAYS calendar days day-by-day using a
     # separate model restored from the nearest preceding monthly snapshot.
     # This gives RunGP_update daily p_multiwell/barrier rows immediately so
-    # slope signals (slope_p_multiwell, slope_z_p_multiwell) are available
-    # without an expensive 90-day state rebuild on the first update run.
+    # slope signals (slope_p_multiwell, slope_z_p_multiwell, slope_barrier_snr)
+    # are available without an expensive 90-day state rebuild on the first
+    # update run.
     recent_start_dt = (
         pd.Timestamp(snapped_end) - pd.Timedelta(days=RECENT_DAILY_DAYS - 1)
     ).normalize()

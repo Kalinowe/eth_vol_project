@@ -31,6 +31,7 @@ SIGNALS TESTED
   barrier_snr           — level: barrier_mean / barrier_std (uncertainty-adj.)
   slope_p_multiwell     — trend: OLS slope of p_multiwell over TREND_WINDOW days
   slope_z_p_multiwell   — trend: OLS z-stat of p_multiwell over TREND_WINDOW days
+  slope_barrier_snr     — trend: OLS z-stat of barrier_snr over TREND_WINDOW days
 
 OUTPUTS  (all under BACKTEST_DIR / {backtest_tag}/)
 -------
@@ -216,6 +217,7 @@ SIGNALS = [
     "barrier_snr",
     "slope_p_multiwell",
     "slope_z_p_multiwell",
+    "slope_barrier_snr",
 ]
 
 ALT_HYPOTHESIS = {
@@ -223,6 +225,7 @@ ALT_HYPOTHESIS = {
     "barrier_snr": "lower",
     "slope_p_multiwell": "higher",
     "slope_z_p_multiwell": "higher",
+    "slope_barrier_snr": "lower",
 }
 
 
@@ -649,12 +652,14 @@ def _sample_signals(daily: pd.DataFrame, date: pd.Timestamp) -> dict | None:
     lo = date - pd.Timedelta(days=TREND_WINDOW - 1)
     tail = daily.loc[(daily.index >= lo) & (daily.index <= date)]
     sl_pm, z_pm = _slope_z(tail["p_multiwell"].values)
+    _sl_snr, z_snr = _slope_z(tail["barrier_snr"].values)
     return {
         "date": date,
         "p_multiwell": float(row["p_multiwell"]),
         "barrier_snr": snr,
         "slope_p_multiwell": sl_pm,
         "slope_z_p_multiwell": z_pm,
+        "slope_barrier_snr": z_snr,
     }
 
 

@@ -210,17 +210,57 @@ Full backtest period: ETH/USDT price (top) and barrier_snr (bottom) with red ver
 
 ![Backtest events overview](assets/events_overview.png)
 
-### Monthly — Drift Comparison
+### Backtest — Signal Analysis Results
 
-GP posterior drift ±2σ overlaid with KM non-parametric estimates (red dots) for a single calendar month. Confirms the GP has learned a plausible drift shape and highlights where the two estimators agree or diverge.
+Results from the backtest run over **2024-07-01 → 2025-12-31** (25 detected well-jump events). BH correction over 8 finite tests (4 signals × 2 offsets).
 
-![Drift comparison](assets/drift_comparison.png)
+**Pre-jump vs null — one-sided Mann-Whitney**
 
-### Monthly — Combined Potentials
+| Signal | Alt | d=−2 &nbsp; p_raw / p_bh / IC | d=−1 &nbsp; p_raw / p_bh / IC |
+|--------|-----|-------------------------------|-------------------------------|
+| `p_multiwell` | higher | 0.989 / 0.997 / −0.282 | 0.997 / 0.997 / −0.333 |
+| `barrier_snr` | lower | 0.006\*\* / 0.024‡ / −0.309 | 0.001\*\* / 0.009‡ / −0.374 |
+| `slope_p_multiwell` | higher | 0.344 / 0.687 / +0.050 | 0.812 / 0.997 / −0.109 |
+| `slope_z_p_multiwell` | higher | 0.242 / 0.645 / +0.086 | 0.506 / 0.809 / −0.002 |
+| `slope_barrier_snr` | lower | — | — |
 
-Integrated potential $U(x)$ ±2σ for a calendar month. Wells appear as valleys; barriers as peaks between them. The shaded band reflects posterior uncertainty — a narrow band means the landscape is confidently multi-well.
+\* p_raw < 0.05 &nbsp; \*\* p_raw < 0.01 &nbsp; † p_bh < 0.10 &nbsp; ‡ p_bh < 0.05
 
-![Combined potentials](assets/combined_potentials.png)
+p_bh: p-value adjusted with Benjamini-Hochberg FDR correction. IC: information coefficient (rank-biserial correlation).
+
+**Interpretation:** `barrier_snr` is the only signal to clear a conventional significance threshold: the barrier SNR is significantly *lower* one day before well-jumps (mean 0.934 vs null 1.086, MW p = 0.001, p_bh = 0.009), consistent with the hypothesis that uncertain, fragile multi-well structure precedes regime transitions. `p_multiwell` shows no predictive power and trends in the opposite direction to the hypothesis. The trend signals `slope_p_multiwell` and `slope_z_p_multiwell` are also non-significant. `slope_barrier_snr` measures the z-statistic of the OLS slope of barrier_snr over the trailing trend window; a significantly negative value indicates that barrier strength is actively deteriorating, reinforcing the fragility hypothesis from a dynamic perspective. These results suggest that structural fragility (low barrier SNR) is a more informative pre-jump indicator than the mere presence of multiple wells.
+
+### Single-Well Market Structure — Potential Example (November 2025)
+
+Integrated potential $U(x)$ during a single-well regime. A single dominant valley is visible across the price axis — the price has a wide price range to move around, but it will not escape the outer barriers, so strong price jumps are unlikely. This is a trending or momentum regime: once the price moves away from the well, the restoring force steadily pulls it back rather than trapping it in a secondary basin.
+
+![Potential singlewell example](assets/potential_singlewell_example.png)
+
+### Multi-Well Market Structure — Drift Example (June 2025)
+
+Kramers-Moyal drift for June 2025. The drift crosses the zero line **several times** across the price axis, indicating multiple stable equilibria (wells) in the potential landscape. The drift is stronger for higher price values on the right side of the plots: this is the result of underlying secular drift during the showcased month. This is the deterministic force in the Langevin equation in action, tilting the drift field it uniformly upward — weakening the restoring force on the right (high-price) side and reinforcing it on the left (low-price) side. 
+
+![Drift multiwell example](assets/drift_multiwell_example.png)
+
+### Multi-Well Market Structure — Potential Example (April 2025)
+
+Integrated potential $U(x)$ for April 2025. Multiple valleys (wells) are clearly visible, confirming a genuinely multi-well regime.  The barrier arround 7.75 (USD 2321) is very hard to cross and the price is likely to stay in one of the wells to either side of this barrier once it falls into it.
+
+![Potential multiwell example](assets/potential_multiwell_example.png)
+
+### Backtest — All-Months Drift Grid (2024-07 → 2025-12)
+
+One panel per calendar month of the backtest. Each panel shows the GP posterior mean drift $\mu(x)$ ±2σ evaluated on the inducing grid at the **end of that month**, immediately after the month-end Kramers-Moyal recalibration. Crimson dots are empirical KM bin estimates for that month, serving as a non-parametric sanity check against the GP posterior. A drift that crosses zero multiple times indicates multiple stable equilibria in the potential landscape. In some months, the GP posterior is genuinely unsure of the shape of the drift structure. This is reflected in very wide uncertainty bands. At the end of each month both the spatial lenghtscale of the GP prios and the expected observation noise are recalibrated. What this means is that our belief about the smoothness of the drift field and the size of non-jump price variation is updated based on the last month of data. That means that in some periods, market volatility makes it hard for the pipeline to pinpoint a single topology with certainty. The noise drows out the signal.  This points to an advantage of the Gaussian Process: the programme honestly reports its uncertainty, instead of providing a falsely confident point (or line) maximum likelihood estimate. This decrease in certainty is itself a signal for the model.
+
+The shared y-axis limits are set from a weighted 2nd–98th percentile of all KM drift values across the full backtest period, so panels are directly comparable in scale.
+
+![Backtest all months drift](assets/all_months_drift.png)
+
+### Backtest — All-Months Potential Grid (2024-07 → 2025-12)
+
+One panel per calendar month of the backtest. Each panel shows the integrated potential $U(x) = -\int \mu(x)\,dx$ from the GP posterior mean drift at the **end of that month**. The ±2σ band is computed by drawing $N_\text{samples}$ drift curves from the posterior, integrating each to a potential, baseline-shifting to zero, and taking the pointwise standard deviation. A single smooth valley indicates a single-well (trending) regime; multiple valleys separated by a visible barrier indicate a multi-well regime with elevated jump risk. This study concludes that in case of ETH-USDT we rarely observe genuine double wells separated by strong barriers: it would be more accurate to speak of shifts between mean-reverting states and free floating states. Mean-reverting states refer to price topologies with a clear distinct well. Floating states would be the other topology type, where the drift gradient punishes only very strong deviations from an otherwise flat drift surface. In this structure micro wells may be found but it does not take much for the price to leave them and for most price levels there is no strong drift pulling toward any particular well.
+
+![Backtest all months potential](assets/all_months_potential.png)
 
 ### Daily Update — Drift Snapshot
 
@@ -236,15 +276,9 @@ The potential $U(x)$ on the update day. Well positions and barrier heights are d
 
 ### Daily Update — Fragility Monitor
 
-Barrier mean ± std over time, with the SNR (barrier_mean / barrier_std). Declining SNR signals weakening regime structure — a potential precursor to a regime change.
+Three panels: (1) `p_multiwell` over time — the fraction of posterior drift samples that exhibit ≥ 2 stable wells; (2) distribution of `barrier_snr` values over the historical period; (3) `barrier_snr` time series. **Barrier SNR** is defined as `barrier_mean / barrier_std` — the mean potential-barrier height between adjacent wells divided by its posterior standard deviation. A high SNR means the multi-well structure is statistically robust (the GP is confident the barrier is real); a low or declining SNR signals that the landscape is becoming fragile, with the barrier shrinking relative to its own uncertainty, which is often a precursor to a regime transition.
 
-![Fragility monitor](assets/fragility.png)
-
-### Fragility History
-
-Distribution of barrier_snr values over a historical period, showing how often the market has been in a robustly multi-well regime vs. a fragile or single-well state.
-
-![Fragility histogram](assets/fragility_hist.png)
+![Fragility monitor](assets/fragility_hist.png)
 
 ---
 
@@ -258,6 +292,7 @@ Distribution of barrier_snr values over a historical period, showing how often t
 | `barrier_snr` | `barrier_mean / barrier_std` — uncertainty-adjusted barrier strength |
 | `slope_p_multiwell` | OLS slope of $p_\text{multiwell}$ over trailing window (trend) |
 | `slope_z_p_multiwell` | t-statistic of the slope (trend significance) |
+| `slope_barrier_snr` | t-statistic of the OLS slope of barrier_snr over trailing window (barrier trend significance) |
 
 ---
 
@@ -297,5 +332,5 @@ Key libraries: `numpy`, `scipy`, `pandas`, `matplotlib`, `kramersmoyal`, `rich`.
 
 ## References
 
-- Halperin, I. (2020). *"Non-equilibrium skewness, market crises, and option pricing: Non-linear Langevin model of markets with variable liquidity and non-linear feedback."* — Introduces the potential-field analogy for asset prices and the use of Kramers-Moyal coefficients for empirical drift/diffusion estimation.
+- Halperin, I. (2025). *"Non-Linear and Meta-Stable Dynamics in Financial Markets: Evidence from High Frequency Crypto Currency Market Makers."* — Introduces the potential-field analogy for asset prices and the use of Kramers-Moyal coefficients for empirical drift/diffusion estimation.
 - Hartikainen, J. & Särkkä, S. (2010). *"Kalman filtering and smoothing solutions to temporal Gaussian process regression models."* — State-space GP inference via Matérn SDE representations.

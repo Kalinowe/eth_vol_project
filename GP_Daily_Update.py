@@ -39,7 +39,7 @@ import os
 import json
 import pickle
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -112,10 +112,6 @@ SEED = 42
 # Output root.
 OUTPUT_ROOT = "GP_updates"
 
-DAILY_TOPO_LOOKBACK_DAYS = 90  # calendar days shown in the fragility plot
-DAILY_TOPO_N_SAMPLES = 100  # fewer samples than main run — speed
-DAILY_TOPO_CACHE_FNAME = "daily_topology_cache.csv"
-
 
 # =============================================================================
 # HELPERS AND PLOTS (imported from update/ sub-package)
@@ -129,15 +125,10 @@ from update.state_io import (
     _is_last_day_of_month,
     _recalibrate_from_km,
 )
-from update.daily_cache import (
-    _build_daily_topo_cache,
-    _load_or_update_daily_cache,
-    _trend_slope,
-)
+from update.daily_cache import _trend_slope
 from update.plots_update import (
     _plot_drift_snapshot,
     _plot_potential_snapshot,
-    _plot_fragility,
 )
 
 
@@ -162,9 +153,6 @@ def gp_update(
     min_barrier_fraction: float = MIN_BARRIER_FRACTION,
     km_n_bins: int = KM_N_BINS,
     km_weight_threshold: int = KM_WEIGHT_THRESHOLD,
-    daily_topo_lookback_days: int = DAILY_TOPO_LOOKBACK_DAYS,
-    daily_topo_n_samples: int = DAILY_TOPO_N_SAMPLES,
-    daily_topo_cache_fname: str = DAILY_TOPO_CACHE_FNAME,
     signal_trend_days: int = SIGNAL_TREND_DAYS,
     seed: int = SEED,
     console: Console | None = None,
@@ -190,7 +178,7 @@ def gp_update(
     -------
     dict or {}
         Empty dict if no usable observations.  Otherwise keys:
-        diagnostics, new_blob, chained_path, topo, daily_cache_plot,
+        diagnostics, new_blob, chained_path, topo,
         km_df, model, x_prev, dt_t, z_innov, dt_query, topo_range.
     """
     # Shallow-copy so internal mutations (sigma2_base, last_reproject_date,
@@ -199,9 +187,12 @@ def gp_update(
     rng = np.random.default_rng(seed)
 
     cfg = blob["config"]
-    si = int(cfg["gp_seconds_interval"])
-    km_si = int(cfg["km_seconds_interval"])
-    khw = int(cfg["kernel_half_width"])
+    si = int(cfg.get("gp_seconds_interval", cfg.get("phase_gp_seconds_interval", 900)))
+    km_si = int(cfg.get("km_seconds_interval", cfg.get("phase_a_seconds_interval", 30)))
+    khw = int(cfg.get("kernel_half_width", 0))
+    km_khw = int(
+        cfg.get("km_kernel_half_width", cfg.get("kernel_half_width_phase_a", khw))
+    )
     trim = float(cfg["trim_quantile"])
     ema_halflife = float(cfg.get("ema_halflife_days", 0.0))
     n_ind = int(cfg["n_inducing"])
@@ -224,7 +215,7 @@ def gp_update(
             new_start_date,
             new_end_date,
             s,
-            kernel_half_width=khw,
+            kernel_half_width=km_khw if s == km_si else khw,
             trim_quantile=trim,
             ema_halflife_days=ema_halflife if s == si else 0.0,
         )
@@ -332,7 +323,7 @@ def gp_update(
             new_start_date,
             new_end_date,
             km_si=km_si,
-            khw=khw,
+            khw=km_khw,
             ema_halflife=ema_halflife,
             cfg=cfg,
             console=console,
@@ -361,25 +352,7 @@ def gp_update(
     frac_z_gt2 = float(np.mean(np.abs(z_innov) > 2.0))
     _E0 = float(np.sqrt(2.0 / np.pi))  # ≈ 0.798 under H0
     sigma2_factor = float(np.clip((mean_abs_z / _E0) ** 2, 0.25, 4.0))
-    if console:
-        console.print(
-            f"  mean|z|={mean_abs_z:.2f}  (E[|z|]≈{_E0:.2f} under H0)  "
-            f"frac|z|>2={frac_z_gt2:.2f}  sigma2_factor={sigma2_factor:.3f}"
-        )
     if autoadjust_sigma2 and abs(sigma2_factor - 1.0) > 0.05:
-        _calib_msg = (
-            f"  [yellow]sigma2 over-estimated ({sigma2_factor:.3f}x); "
-            f"reducing obs_noise[/yellow]"
-            if sigma2_factor < 0.90
-            else (
-                f"  [yellow]sigma2 under-estimated ({sigma2_factor:.3f}x); "
-                f"increasing obs_noise[/yellow]"
-                if sigma2_factor > 1.10
-                else f"  sigma2 well-calibrated (factor={sigma2_factor:.3f})"
-            )
-        )
-        if console:
-            console.print(_calib_msg)
         old_ewma = float(blob.get("sigma2_ewma_factor", 1.0))
         new_ewma = (
             sigma2_ewma_alpha * sigma2_factor + (1.0 - sigma2_ewma_alpha) * old_ewma
@@ -387,12 +360,6 @@ def gp_update(
         blob["sigma2_ewma_factor"] = new_ewma
         model.sigma2 = float(blob["sigma2_base"]) * new_ewma
         model.obs_noise = model.sigma2 / model.dt
-        if console:
-            console.print(
-                f"  sigma2_ewma_factor: {old_ewma:.3f} → {new_ewma:.3f}  "
-                f"sigma2: {blob['sigma2_base']:.4e} × {new_ewma:.3f} = "
-                f"{model.sigma2:.4e}"
-            )
 
     # ---- Step 6: topology ---------------------------------------------------
     if console:
@@ -444,32 +411,6 @@ def gp_update(
             f"σ/μ(full-range)={topo['mu_std_to_mean']:.2f}"
         )
 
-    # ---- Step 6b: daily cache -----------------------------------------------
-    if console:
-        console.rule("[bold cyan]Step 6b — Daily barrier cache")
-    cache_path = os.path.join(
-        cfg.get("gp_dir", cfg.get("gp_output_dir", ".")), daily_topo_cache_fname
-    )
-    daily_cache_plot = _load_or_update_daily_cache(
-        blob,
-        cache_path,
-        new_date=dt_query.strftime("%Y-%m-%d"),
-        new_topo=new_row,
-        si=si,
-        khw=khw,
-        ema_halflife_days=ema_halflife,
-        n_ind=n_ind,
-        rng=np.random.default_rng(seed),
-        console=console,
-        daily_topo_lookback_days=daily_topo_lookback_days,
-        reproject_cadence_days=reproject_cadence_days,
-        reproject_window_days=reproject_window_days,
-        n_grid=n_grid,
-        daily_topo_n_samples=daily_topo_n_samples,
-        min_crossing_sep=min_crossing_sep,
-        min_barrier_fraction=min_barrier_fraction,
-    )
-
     # ---- Step 7: KM bins for red-dot overlay --------------------------------
     if console:
         console.rule("[bold cyan]Step 7 — Empirical KM bins (red-dot overlay)")
@@ -477,7 +418,7 @@ def gp_update(
         new_start_date,
         new_end_date,
         km_si,
-        kernel_half_width=khw,
+        kernel_half_width=km_khw,
         trim_quantile=trim,
         ema_halflife_days=0.0,
         window_type=None,
@@ -498,42 +439,69 @@ def gp_update(
         console.print(f"  KM bins kept: {len(km_df)}")
 
     # ---- Signal computation -------------------------------------------------
-    # Use the daily cache so signal windows are in calendar days — identical
-    # to backtest_jumps.py: lo = today - (signal_trend_days - 1) days.
+    # Build daily-granularity history from three sources (oldest to newest):
+    #   1. recent_daily_topo from Initialise_GP Step 7b (bootstrap rows)
+    #   2. topology_history entries from this and previous update runs
+    #   3. today's new_row
+    # Later entries win on duplicate dates (drop_duplicates keep='last').
     history = blob["topology_history"].copy()
-    if not daily_cache_plot.empty and "p_multiwell" in daily_cache_plot.columns:
-        daily_sig = daily_cache_plot.copy()
-        if "date" in daily_sig.columns:
-            daily_sig["date"] = pd.to_datetime(daily_sig["date"])
-            daily_sig = daily_sig.sort_values("date").set_index("date")
-        # Use dt_query's date as "today" so that a cache seeded with future
-        # rows (e.g. by RunGP Step 7b) doesn't make every run read the same
-        # last row regardless of which day is being processed.
-        target_date = pd.Timestamp(dt_query.date())
-        if target_date in daily_sig.index:
-            today_date = target_date
-        else:
-            today_date = (
-                daily_sig.index[daily_sig.index <= target_date].max()
-                if any(daily_sig.index <= target_date)
-                else daily_sig.index[-1]
-            )
-        today_row = daily_sig.loc[today_date]
-        p_multi_now = float(today_row["p_multiwell"])
-        bm_now = float(today_row["barrier_mean"])
-        bst_now = float(today_row["barrier_std"])
-        snr_now = bm_now / bst_now if bst_now > 0 else float("nan")
-        lo = today_date - pd.Timedelta(days=signal_trend_days - 1)
-        sig_window = daily_sig.loc[
-            (daily_sig.index >= lo) & (daily_sig.index <= today_date)
+    _hist = history[
+        [
+            c
+            for c in ["datetime", "p_multiwell_gp", "barrier_mean", "barrier_std"]
+            if c in history.columns
         ]
-        slope_pm, z_pm = _trend_slope(sig_window["p_multiwell"].values)
+    ].copy()
+    _hist["datetime"] = pd.to_datetime(_hist["datetime"])
+
+    _seed_rows = blob.get("recent_daily_topo", [])
+    if _seed_rows:
+        _seed_df = pd.DataFrame(_seed_rows)
+        _seed_df["datetime"] = pd.to_datetime(_seed_df["date"])
+        if "p_multiwell" in _seed_df.columns:
+            _seed_df = _seed_df.rename(columns={"p_multiwell": "p_multiwell_gp"})
+        _seed_df = _seed_df[
+            [
+                c
+                for c in ["datetime", "p_multiwell_gp", "barrier_mean", "barrier_std"]
+                if c in _seed_df.columns
+            ]
+        ]
+        _hist = pd.concat([_seed_df, _hist], ignore_index=True)
+
+    _new_entry = pd.DataFrame(
+        [
+            {
+                "datetime": dt_query,
+                "p_multiwell_gp": new_row["p_multiwell_gp"],
+                "barrier_mean": new_row["barrier_mean"],
+                "barrier_std": new_row["barrier_std"],
+            }
+        ]
+    )
+    _combined = pd.concat([_hist, _new_entry], ignore_index=True)
+    _combined["date"] = pd.to_datetime(_combined["datetime"]).dt.normalize()
+    _combined = (
+        _combined.drop_duplicates("date", keep="last").set_index("date").sort_index()
+    )
+    p_multi_now = float(new_row["p_multiwell_gp"])
+    bm_now = float(new_row["barrier_mean"])
+    bst_now = float(new_row["barrier_std"])
+    snr_now = bm_now / bst_now if bst_now > 0 else 0.0
+    lo = pd.Timestamp(dt_query.date()) - pd.Timedelta(days=signal_trend_days - 1)
+    sig_window = _combined.loc[
+        (_combined.index >= lo) & (_combined.index <= pd.Timestamp(dt_query.date()))
+    ]
+    if len(sig_window) >= 2:
+        slope_pm, z_pm = _trend_slope(sig_window["p_multiwell_gp"].values)
+        _snr_series = np.where(
+            sig_window["barrier_std"] > 0,
+            sig_window["barrier_mean"] / sig_window["barrier_std"],
+            0.0,
+        )
+        _sl_snr, z_snr = _trend_slope(_snr_series)
     else:
-        p_multi_now = topo["p_multiwell"]
-        bm_now = topo["barrier_mean"]
-        bst_now = topo["barrier_std"]
-        snr_now = bm_now / bst_now if bst_now > 0 else float("nan")
-        slope_pm = z_pm = float("nan")
+        slope_pm = z_pm = z_snr = float("nan")
 
     diagnostics = {
         "new_window_start": str(new_start_date.date()),
@@ -546,6 +514,7 @@ def gp_update(
         "barrier_snr": snr_now,
         "slope_p_multiwell": slope_pm,
         "slope_z_p_multiwell": z_pm,
+        "slope_barrier_snr": z_snr,
         # supporting fields
         "barrier_mean": bm_now,
         "barrier_std": bst_now,
@@ -623,7 +592,6 @@ def gp_update(
         "new_blob": new_blob,
         "chained_path": chained_path,
         "topo": topo,
-        "daily_cache_plot": daily_cache_plot,
         "km_df": km_df,
         "model": model,
         "x_prev": x_prev,
@@ -655,7 +623,7 @@ def main() -> None:
     with open(state_path, "rb") as fh:
         blob = pickle.load(fh)
     cfg = blob["config"]
-    si = int(cfg["gp_seconds_interval"])
+    si = int(cfg.get("gp_seconds_interval", cfg.get("phase_gp_seconds_interval", 900)))
     last_dt = pd.Timestamp(blob["last_dt"])
     console.print(
         f"  pipeline={blob['pipeline']}  si={si}s  last_dt={last_dt}  "
@@ -671,8 +639,8 @@ def main() -> None:
             f"{new_start_date.date()} (chain last_dt={last_dt.date()})[/yellow]"
         )
     # Binance data lags ~1 day → hard cap at yesterday.
-    yesterday = (datetime.utcnow() - timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
+    yesterday = (datetime.now(tz=timezone.utc) - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
     )
     end_arg = NEW_END_DATE if NEW_END_DATE is not None else new_start_date
     new_end_date = min(end_arg, yesterday)
@@ -708,6 +676,7 @@ def main() -> None:
     snr_now = diag["barrier_snr"]
     slope_pm = diag["slope_p_multiwell"]
     z_pm = diag["slope_z_p_multiwell"]
+    z_snr = diag["slope_barrier_snr"]
 
     # --- Backtest reference thresholds (2025-07-01 → 2026-03-31, offset −1d) -
     # Each entry: (null_mean, pre_jump_mean, direction)
@@ -718,11 +687,20 @@ def main() -> None:
         "barrier_snr": (0.4553, 0.2880, "lower"),
         "slope_p_multiwell": (-0.00143, 0.00426, "higher"),
         "slope_z_p_multiwell": (-0.2082, 1.0016, "higher"),
+        "slope_barrier_snr": (0.0, -1.0, "lower"),
+    }
+
+    _NA_MSG = {
+        "barrier_snr": "no barrier, jump unlikely",
+        "slope_z_p_multiwell": "multiwell structure not detected",
+        "slope_barrier_snr": "no barrier trend available",
     }
 
     def _criticality(value: float, signal: str) -> str:
         if not np.isfinite(value) or signal not in _BT_REF:
-            return ""
+            return _NA_MSG.get(signal, "")
+        if signal == "barrier_snr" and value == 0.0:
+            return "typical of calm periods"
         null_m, pre_m, direction = _BT_REF[signal]
         halfway = (null_m + pre_m) / 2.0
         if direction == "higher":
@@ -769,6 +747,11 @@ def main() -> None:
         f"{z_pm:+.3f}" if np.isfinite(z_pm) else "n/a",
         _criticality(z_pm, "slope_z_p_multiwell"),
     )
+    sig_table.add_row(
+        "slope_barrier_snr",
+        f"{z_snr:+.3f}" if np.isfinite(z_snr) else "n/a",
+        _criticality(z_snr, "slope_barrier_snr"),
+    )
     console.print(sig_table)
 
     # ---- Step 10: Plots (reporting only) ------------------------------------
@@ -780,7 +763,6 @@ def main() -> None:
     dt_t = result["dt_t"]
     z_innov = result["z_innov"]
     dt_query = result["dt_query"]
-    daily_cache_plot = result["daily_cache_plot"]
     topo_range = result["topo_range"]
 
     x_obs_w = max(float(x_prev.max() - x_prev.min()), 1e-4)
@@ -808,12 +790,6 @@ def main() -> None:
         dt_query,
         plot_rng,
     )
-    _plot_fragility(
-        daily_cache_plot,
-        os.path.join(out_dir, "fragility.png"),
-        daily_topo_lookback_days=DAILY_TOPO_LOOKBACK_DAYS,
-    )
-
     console.rule("[bold green]Done")
 
 
