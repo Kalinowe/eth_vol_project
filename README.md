@@ -69,7 +69,9 @@ The backtest uses `init_gp_pipeline()` from `Initialise_GP.py` directly, guarant
 
 Raw tick-level data (`aggTrades`) is downloaded from [Binance Vision](https://data.binance.vision/) and aggregated into fixed-interval log-return bars using a backward moving average (BMA) kernel:
 
-$$r_k = \log\!\left(\text{BMA}(t_{k+1})\right) - \log\!\left(\text{BMA}(t_k)\right)$$
+$$
+r_k = \log\left(\text{BMA}(t_{k+1})\right) - \log\left(\text{BMA}(t_k)\right)
+$$
 
 Two timescales are used:
 - **30-second bars** (KM estimation): high-frequency resolution for KM drift/diffusion estimation.
@@ -81,32 +83,49 @@ An optional **EMA demeaning** step removes slow-moving trend components so the G
 
 For each calendar-month window, the **Kramers-Moyal expansion** is applied to the 30-second log-price series to estimate the first two coefficients:
 
-$$D^{(1)}(x) = \lim_{\Delta t \to 0} \frac{1}{\Delta t} \langle x_{t+\Delta t} - x_t \mid x_t = x \rangle \quad \text{(drift)}$$
+$$
+D^{(1)}(x) = \lim_{\Delta t \to 0} \frac{1}{\Delta t} \langle x_{t+\Delta t} - x_t \mid x_t = x \rangle \quad \text{(drift)}
+$$
 
-$$D^{(2)}(x) = \lim_{\Delta t \to 0} \frac{1}{2\Delta t} \langle (x_{t+\Delta t} - x_t)^2 \mid x_t = x \rangle \quad \text{(diffusion)}$$
+$$
+D^{(2)}(x) = \lim_{\Delta t \to 0} \frac{1}{2\Delta t} \langle (x_{t+\Delta t} - x_t)^2 \mid x_t = x \rangle \quad \text{(diffusion)}
+$$
 
 The implementation uses the `kramersmoyal` library with histogram binning (200 bins by default) and a minimum weight threshold to suppress noisy tail estimates.
 
 KM outputs serve two purposes:
 1. **Calibration** — the variance of KM drift bins sets `spatial_var`, the prior amplitude of the GP.
 2. **Validation overlay** — KM "red dots" are plotted alongside the GP posterior as a non-parametric sanity check.
+3. **Paper reproduction** — KM estimates are what was shown in the original Halperin paper. They are needed to confirm the whole premise of topological regime identification.
 
 ### 3. Sequential Kalman-GP
 
 The core model places a **separable spatio-temporal GP prior** over the drift field:
 
-$$\mu(x, t) \sim \mathcal{GP}\!\left(0,\; k_\text{RBF}(x, x') \times k_{\text{Matérn}_{3/2}}(t, t')\right)$$
+$$
+\mu(x, t) \sim \mathcal{GP}\left(0,\; k_\text{RBF}(x, x') \times k_{\text{Matérn}_{3/2}}(t, t')\right)
+$$
 
 **Why this factorisation?**
 
 - The **RBF kernel in log-price space** $x$ captures smooth spatial structure — wells, barriers, slopes — in the drift field.
-- The **Matérn 3/2 kernel in time** allows the landscape to evolve (wells appear, deepen, disappear) while maintaining temporal continuity. Its state-space SDE representation enables exact $O(N)$ Kalman filtering:
+- The **Matérn 3/2 kernel in time** allows the landscape to evolve (wells appear, deepen, disappear) while maintaining temporal continuity. Its state-space SDE representation enables exact $O(N)$ Kalman filtering.
 
-$$\frac{d}{dt}\begin{pmatrix} f \\ f' \end{pmatrix} = \begin{pmatrix} 0 & 1 \\ -\lambda^2 & -2\lambda \end{pmatrix}\begin{pmatrix} f \\ f' \end{pmatrix} + \begin{pmatrix} 0 \\ 1 \end{pmatrix} w(t), \quad \lambda = \frac{\sqrt{3}}{\ell_t}$$
+The Matérn 3/2 state-space SDE is:
+
+$$
+\frac{d}{dt}\begin{pmatrix} f \\\\ f' \end{pmatrix}
+= \begin{pmatrix} 0 & 1 \\\\ -\lambda^2 & -2\lambda \end{pmatrix}
+\begin{pmatrix} f \\\\ f' \end{pmatrix} +
+\begin{pmatrix} 0 \\\\ 1 \end{pmatrix} w(t),
+\quad \lambda = \frac{\sqrt{3}}{\ell_t}
+$$
 
 The full state vector has dimension $2M$ (position + velocity per inducing point):
 
-$$\mathbf{s} = [f_1, f'_1, \ldots, f_M, f'_M]^T$$
+$$
+\mathbf{s} = [f_1, f'_1, \ldots, f_M, f'_M]^T
+$$
 
 **Inducing-point reprojection**: as the price drifts over weeks and months, the inducing grid is periodically relocated to cover the current price range (with a margin), preserving the accumulated posterior via GP interpolation.
 
@@ -114,7 +133,9 @@ $$\mathbf{s} = [f_1, f'_1, \ldots, f_M, f'_M]^T$$
 
 At each time step, the posterior $\mu(x \mid \text{data})$ is integrated into a potential:
 
-$$U(x) = -\int \mu(x)\, dx$$
+$$
+U(x) = -\int \mu(x)\, dx
+$$
 
 The posterior uncertainty is propagated by drawing $N_\text{samples}$ from the GP, integrating each sample, and scanning for local minima. The **topology signal** summarises the landscape:
 
@@ -261,12 +282,6 @@ The shared y-axis limits are set from a weighted 2nd–98th percentile of all KM
 One panel per calendar month of the backtest. Each panel shows the integrated potential $U(x) = -\int \mu(x)\,dx$ from the GP posterior mean drift at the **end of that month**. The ±2σ band is computed by drawing $N_\text{samples}$ drift curves from the posterior, integrating each to a potential, baseline-shifting to zero, and taking the pointwise standard deviation. A single smooth valley indicates a single-well (trending) regime; multiple valleys separated by a visible barrier indicate a multi-well regime with elevated jump risk. This study concludes that in case of ETH-USDT we rarely observe genuine double wells separated by strong barriers: it would be more accurate to speak of shifts between mean-reverting states and free floating states. Mean-reverting states refer to price topologies with a clear distinct well. Floating states would be the other topology type, where the drift gradient punishes only very strong deviations from an otherwise flat drift surface. In this structure micro wells may be found but it does not take much for the price to leave them and for most price levels there is no strong drift pulling toward any particular well.
 
 ![Backtest all months potential](assets/all_months_potential.png)
-
-### Daily Update — Drift Snapshot
-
-A single day's incremental update showing the GP drift posterior updated with new observations, overlaid with KM estimates.
-
-![Daily drift snapshot](assets/drift_snapshot.png)
 
 ### Daily Update — Potential Snapshot
 
